@@ -1065,15 +1065,17 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             query_start_loc_cpu = query_start_loc_cpu()
 
         pooler_output: list[dict[str, object]] | None = None
+        delivery = None
         if needs_pooler_payload:
             combined_hidden_states = None
             combined_multimodal_outputs = None
+            cache_outputs = None
             mm_cpu = None
             if _omni_cache_on:
-                (
-                    combined_hidden_states,
-                    combined_multimodal_outputs,
-                ) = self._prefix_cache_materialize(prefix_cache_step_id, list(req_ids_output_copy))
+                cache_outputs = self._prefix_cache_materialize(prefix_cache_step_id, list(req_ids_output_copy))
+                if cache_outputs is not None:
+                    combined_hidden_states = cache_outputs.hidden_states
+                    combined_multimodal_outputs = cache_outputs.mm_outputs or None
             if not _omni_cache_on or combined_multimodal_outputs is None:
                 mm_cpu = build_mm_cpu(
                     flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
@@ -1089,6 +1091,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 req_ids_filter=downstream_req_id_set,
             )
 
+            if cache_outputs is not None and (not audio_sparse_output or cache_outputs.token_mm_keys):
+                assert self.omni_prefix_cache is not None
+                delivery = self.omni_prefix_cache.delivery_view(
+                    cache_outputs, downstream_req_ids, consumer="output_builder"
+                )
+                combined_hidden_states = delivery.hidden_states
+                combined_multimodal_outputs = delivery.mm_outputs or None
+
             if req_hidden_states_cpu is not None and combined_hidden_states is None:
                 for rid in downstream_req_ids:
                     idx = req_id_to_index_output_copy[rid]
@@ -1102,14 +1112,25 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 if rid not in downstream_req_id_set:
                     pooler_output.append({})
                     continue
+                if delivery is not None and delivery.token_ranges[rid][0] == delivery.token_ranges[rid][1]:
+                    pooler_output.append({})
+                    continue
                 idx = req_id_to_index_output_copy[rid]
                 start = int(query_start_loc_cpu[idx])
                 sched = int(num_scheduled_tokens_np[idx])
                 end = start + sched
+                if delivery is not None:
+                    start += max(0, delivery.token_ranges[rid][0] - delivery.scheduled_token_ranges[rid][0])
                 payload: dict[str, object] = {}
                 if not audio_sparse_output:
                     if req_hidden_states_cpu is not None and combined_hidden_states is None:
                         req_hidden_states = req_hidden_states_cpu[rid]
+                        if delivery is not None:
+                            offset = max(
+                                0,
+                                delivery.token_ranges[rid][0] - delivery.scheduled_token_ranges[rid][0],
+                            )
+                            req_hidden_states = req_hidden_states[offset:]
                     else:
                         req_hidden_states = self._resolve_req_hidden_states(
                             hidden_states_cpu,
@@ -1239,6 +1260,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
         if not self.use_async_scheduling:
+            if delivery is not None:
+                assert self.omni_prefix_cache is not None
+                self.omni_prefix_cache.ack_delivery(delivery)
             return model_runner_output
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
@@ -1253,6 +1277,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
         )
+        if delivery is not None:
+            assert self.omni_prefix_cache is not None
+            self.omni_prefix_cache.ack_delivery(delivery)
         return async_output
 
     #  -------------------------------------- Omni-new -------------------------------------------------

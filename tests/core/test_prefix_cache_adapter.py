@@ -18,6 +18,10 @@ class FakeView:
     def batch_req_ids(self):
         return ["b", "a"]
 
+    def token_range(self, req_id, num_scheduled):
+        start = {"b": 12, "a": 7}[req_id]
+        return start, start + num_scheduled
+
     def step_slots_cpu(self, req_ids, num_scheduled):
         import torch
 
@@ -119,3 +123,17 @@ def test_write_layout_uses_post_order_batch_and_slots():
     ]
     with pytest.raises(AttributeError):
         layout.writes = ()
+
+
+def test_write_layout_keeps_request_positions_separate_from_batch_rows():
+    layout = PrefixCacheSchedulerAdapter().build_write_layout(FakeView(), num_scheduled_tokens={"b": 2, "a": 1})
+    assert [(w.token_start, w.token_end) for w in layout.writes] == [(12, 14), (7, 8)]
+    assert [(w.row_start, w.row_end) for w in layout.writes] == [(0, 2), (2, 3)]
+
+
+def test_same_id_terminal_and_new_preserves_new_observation_for_extension():
+    adapter = PrefixCacheSchedulerAdapter()
+    adapter.translate_scheduler_output(output(new=[SimpleNamespace(req_id="r")]))
+    adapter.translate_scheduler_output(output(new=[SimpleNamespace(req_id="r")], finished={"r"}))
+    events = adapter.translate_scheduler_output(output(new=[SimpleNamespace(req_id="r", num_computed_tokens=8)]))
+    assert events[0].kind is PrefixCacheEventKind.EXTENDED
