@@ -14,6 +14,8 @@ call time) so ``tests/core`` keeps loading the package without vLLM.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any
 
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter, PrefixCacheStep
@@ -22,6 +24,7 @@ from vllm_omni.core.prefix_cache.interface import (
     ModelCachePolicy,
     OmniPrefixCacheUnmatchError,
     PrefixCacheConfig,
+    StageCacheOutputs,
 )
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 from vllm_omni.data_entry_keys import flatten_payload
@@ -59,6 +62,35 @@ class PrefixCacheRunnerMixin:
     _prefix_cache_adapter: PrefixCacheSchedulerAdapter | None = None
     _prefix_cache_group_view: Any = None
     _prefix_cache_step: PrefixCacheStep | None = None
+    _prefix_cache_builder_completion: Future[None] | None = None
+
+    def _prefix_cache_order_output_builder(
+        self, builder: Callable[[], Any], *, step_id: int | None = None
+    ) -> Callable[[], Any]:
+        cache = self.omni_prefix_cache
+        if cache is None:
+            return builder
+        predecessor = self._prefix_cache_builder_completion
+        completion: Future[None] = Future()
+        self._prefix_cache_builder_completion = completion
+
+        def ordered_builder():
+            try:
+                if predecessor is not None:
+                    try:
+                        predecessor.result()
+                    except BaseException:
+                        if step_id is not None:
+                            cache.discard_step(step_id)
+                        raise
+                result = builder()
+            except BaseException as exc:
+                completion.set_exception(exc)
+                raise
+            completion.set_result(None)
+            return result
+
+        return ordered_builder
 
     def _snapshot_prefix_cache_model_policy(self, model) -> None:
         """Freeze the model's cache policy at load_model."""
@@ -151,10 +183,8 @@ class PrefixCacheRunnerMixin:
             write_layout=layout,
         )
 
-    def _prefix_cache_materialize(
-        self, step_id: int | None, req_ids: list[str]
-    ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
-        """Per-request merged outputs for a saved step.
+    def _prefix_cache_materialize(self, step_id: int | None, req_ids: list[str]) -> StageCacheOutputs | None:
+        """Per-request merged outputs with delivery metadata for a saved step.
 
         ``req_ids`` must be the save-time snapshot, never the live
         ``input_batch`` (under async output this runs a step late).
@@ -162,6 +192,5 @@ class PrefixCacheRunnerMixin:
         ``mm_outputs`` is all-or-nothing; empty only when the step had no mm.
         """
         if step_id is None or self.omni_prefix_cache is None:
-            return None, None
-        outs = self.omni_prefix_cache.materialize(step_id, list(req_ids))
-        return outs.hidden_states, (outs.mm_outputs or None)
+            return None
+        return self.omni_prefix_cache.materialize(step_id, list(req_ids))

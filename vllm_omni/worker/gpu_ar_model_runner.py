@@ -42,6 +42,7 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
+from vllm_omni.core.prefix_cache.interface import StageCacheOutputs
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
@@ -733,7 +734,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         needs_scheduled_hidden_payload: bool,
         req_ids: list[str],
         step_id: int | None,
-    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor] | None, dict | None]:
+    ) -> tuple[torch.Tensor | None, StageCacheOutputs | None]:
         """Prefix-cache payload sources for the pooler payload build.
 
         req_ids must be the step's snapshot, not ``input_batch.req_ids``: under
@@ -751,9 +752,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # there is no step context to consume; serve the fresh slice.
             if hidden_states_cpu is None and staged_hidden_states_cpu is not None:
                 hidden_states_cpu = staged_hidden_states_cpu
-            return hidden_states_cpu, None, None
-        combined_hidden, combined_mm = self._prefix_cache_materialize(step_id, list(req_ids))
-        return hidden_states_cpu, combined_hidden, combined_mm
+            return hidden_states_cpu, None
+        return hidden_states_cpu, self._prefix_cache_materialize(step_id, list(req_ids))
 
     def _build_omni_pooler_payload(
         self,
@@ -1748,6 +1748,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
+        cache_outputs = None
+        delivery = None
 
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         downstream_req_ids, sparse_mm_index, audio_sparse_output = resolve_sparse_mm_routing(
@@ -1801,16 +1803,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             scheduled_seq_len = int(scheduler_output.total_num_scheduled_tokens)
             mm_cpu = None
             if self.omni_prefix_cache is not None:
-                (
-                    hidden_states_cpu,
-                    combined_hidden_states,
-                    combined_multimodal_outputs,
-                ) = self._prepare_prefix_cache_pooler_payload_sources(
+                hidden_states_cpu, cache_outputs = self._prepare_prefix_cache_pooler_payload_sources(
                     staged_hidden_states_cpu=staged_hidden_states_cpu,
                     needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
                     step_id=prefix_cache_step_id,
                     req_ids=req_ids_output_copy,
                 )
+                if cache_outputs is not None:
+                    combined_hidden_states = cache_outputs.hidden_states
+                    combined_multimodal_outputs = cache_outputs.mm_outputs or None
             if combined_multimodal_outputs is None:
                 flat_mm = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
                 if defer_full_payload_d2h:
@@ -1834,16 +1835,31 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         query_start_loc_cpu=query_start_loc_cpu,
                     )
 
+            if cache_outputs is not None and (
+                (include_hidden_payload and not audio_sparse_output) or cache_outputs.token_mm_keys
+            ):
+                assert self.omni_prefix_cache is not None
+                delivery = self.omni_prefix_cache.delivery_view(
+                    cache_outputs, downstream_req_ids, consumer="output_builder"
+                )
+                combined_hidden_states = delivery.hidden_states
+                combined_multimodal_outputs = delivery.mm_outputs or None
+
             pooler_output = []
             with record_function_or_nullcontext("omni_output_builder:build_pooler_payloads"):
                 for rid in req_ids_output_copy:
                     if rid not in downstream_req_id_set:
                         pooler_output.append({})
                         continue
+                    if delivery is not None and delivery.token_ranges[rid][0] == delivery.token_ranges[rid][1]:
+                        pooler_output.append({})
+                        continue
                     idx = req_id_to_index_output_copy[rid]
                     start = int(query_start_loc_cpu[idx])
                     sched = int(num_scheduled_tokens_np[idx])
                     end = start + sched
+                    if delivery is not None:
+                        start += max(0, delivery.token_ranges[rid][0] - delivery.scheduled_token_ranges[rid][0])
                     payload = self._build_omni_pooler_payload(
                         rid=rid,
                         idx=idx,
@@ -1911,6 +1927,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
             output.routed_experts = routed_experts_lists
+        if delivery is not None:
+            assert self.omni_prefix_cache is not None
+            self.omni_prefix_cache.ack_delivery(delivery)
         return output
 
     @torch.inference_mode()
@@ -2156,6 +2175,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 )
             output.omni_connector_output = omni_connector_output
             return output
+
+        output_builder = self._prefix_cache_order_output_builder(output_builder, step_id=prefix_cache_step_id)
 
         if not use_async_omni_output:
             output = output_builder()
