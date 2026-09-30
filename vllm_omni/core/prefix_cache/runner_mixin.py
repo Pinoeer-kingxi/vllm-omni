@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     import torch
     from vllm.v1.core.sched.output import SchedulerOutput
 
+    from vllm_omni.outputs import OmniModelRunnerOutput
+
 
 class PrefixCacheRunnerMixin:
     """Prefix-cache integration for a model runner (no state machine here).
@@ -63,6 +65,45 @@ class PrefixCacheRunnerMixin:
     _prefix_cache_group_view: Any = None
     _prefix_cache_step: PrefixCacheStep | None = None
     _prefix_cache_builder_completion: Future[None] | None = None
+
+    def _prefix_cache_commit_output(
+        self,
+        output: OmniModelRunnerOutput,
+        cache_outputs: StageCacheOutputs | None,
+        delivery: StageCacheOutputs | None,
+        *,
+        handoff: Callable[[frozenset[str]], None] | None = None,
+    ) -> None:
+        """Commit prepared GPU/NPU payloads without changing scheduler accounting.
+
+        All tensor building and synchronization must precede this call. The
+        optional handoff only publishes local references (for example appends
+        prepared chunks to the full-payload accumulator), never remote I/O.
+        """
+
+        def commit(live: frozenset[str]) -> None:
+            if any(req_id not in live for req_id in output.req_ids):
+                inter_stage = output.inter_stage_outputs
+                client = output.multimodal_outputs
+                if inter_stage is not None:
+                    output.inter_stage_outputs = [
+                        payload if req_id in live else None
+                        for req_id, payload in zip(output.req_ids, inter_stage, strict=True)
+                    ]
+                if client is inter_stage:
+                    output.multimodal_outputs = output.inter_stage_outputs
+                elif client is not None:
+                    output.multimodal_outputs = [
+                        payload if req_id in live else None
+                        for req_id, payload in zip(output.req_ids, client, strict=True)
+                    ]
+            if handoff is not None:
+                handoff(live)
+
+        if cache_outputs is not None and self.omni_prefix_cache is not None:
+            self.omni_prefix_cache.commit_output(cache_outputs, commit, delivery=delivery)
+        elif handoff is not None:
+            handoff(frozenset(output.req_ids))
 
     def _prefix_cache_order_output_builder(
         self, builder: Callable[[], Any], *, step_id: int | None = None

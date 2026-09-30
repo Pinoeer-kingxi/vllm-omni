@@ -1745,6 +1745,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         query_start_loc_cpu: Any,
         postprocess_already_applied: bool = False,
         prefix_cache_step_id: int | None = None,
+        excluded_output_req_ids: frozenset[str] = frozenset(),
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
@@ -1752,6 +1753,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         delivery = None
 
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        downstream_req_ids = [rid for rid in downstream_req_ids if rid not in excluded_output_req_ids]
         downstream_req_ids, sparse_mm_index, audio_sparse_output = resolve_sparse_mm_routing(
             engine_output_type=engine_output_type,
             req_ids_output_copy=req_ids_output_copy,
@@ -1893,12 +1895,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 {key: value for key, value in payload.items() if key in allowed} for payload in pooler_output
             ]
 
-        if pooler_inter and self._should_accumulate_full_payload_output():
-            with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
-                for i, rid in enumerate(req_ids_output_copy):
-                    req_state = self.requests.get(rid)
-                    if req_state is not None and pooler_inter[i]:
-                        self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
+        accumulate = bool(pooler_inter) and self._should_accumulate_full_payload_output()
+        if accumulate:
+            # Policy resolution may import a model module; do it outside the
+            # short cache commit lock. Accumulation itself only appends refs.
+            self._resolve_full_payload_replace_keys()
 
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
             inter_stage_outputs, multimodal_outputs = self._build_omni_step_outputs(
@@ -1927,9 +1928,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
             output.routed_experts = routed_experts_lists
-        if delivery is not None:
-            assert self.omni_prefix_cache is not None
-            self.omni_prefix_cache.ack_delivery(delivery)
+
+        def handoff(live: frozenset[str]) -> None:
+            if accumulate:
+                assert pooler_inter is not None
+                for i, rid in enumerate(req_ids_output_copy):
+                    req_state = self.requests.get(rid)
+                    payload = pooler_inter[i] or {}
+                    if rid in live and rid in downstream_req_id_set and req_state is not None and payload:
+                        if cache_outputs is None:
+                            self.accumulate_full_payload_output(rid, payload, req_state)
+                        else:
+                            self.accumulate_full_payload_output(
+                                rid, payload, req_state, owner=cache_outputs._progress[rid]
+                            )
+
+        self._prefix_cache_commit_output(output, cache_outputs, delivery, handoff=handoff)
         return output
 
     @torch.inference_mode()

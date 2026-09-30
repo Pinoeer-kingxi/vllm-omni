@@ -22,9 +22,20 @@ class PrefixCacheEventKind(str, Enum):
     RESUMED = "resumed"
     FINISHED = "finished"
     ABORTED = "aborted"
-    # Reserved for the content-identity work in item 5.  This adapter does
-    # not infer replacement from a reset or a prompt mutation.
     REPLACED = "replaced"
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class PrefixCacheRequestOwner:
+    """Scheduler-local admission and content generation, not a cache key.
+
+    A new admission gets a new monotonically increasing ID even when the
+    client reuses a request ID. Only accepted replacements advance generation;
+    appending input and resuming after preemption retain the same owner.
+    """
+
+    admission_id: int
+    generation: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,12 +47,15 @@ class PrefixCacheRequestEvent:
     block_ids: tuple[tuple[int, ...], ...] = ()
     scheduled_tokens: int = 0
     num_output_tokens: int = 0
+    owner: PrefixCacheRequestOwner | None = None
+    lookup_complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
 class PrefixCacheStep:
     events: tuple[PrefixCacheRequestEvent, ...]
     scheduled_tokens: tuple[tuple[str, int], ...]
+    sequence: int | None = None
 
     def __iter__(self):
         return iter(self.events)
@@ -73,6 +87,8 @@ class PrefixCacheSchedulerAdapter:
 
     def __init__(self) -> None:
         self._observed_req_ids: set[str] = set()
+        self._observed_owners: dict[str, PrefixCacheRequestOwner] = {}
+        self._last_step_sequence = -1
 
     @staticmethod
     def _req_id(data: Any) -> str:
@@ -104,8 +120,16 @@ class PrefixCacheSchedulerAdapter:
         terminal_ids = {
             str(req_id) for req_id in (set(getattr(scheduler_output, "finished_req_ids", ()) or ()) | aborted)
         }
-
-        self._observed_req_ids.difference_update(terminal_ids)
+        owners = getattr(scheduler_output, "prefix_cache_owners", {}) or {}
+        declared_terminal_owners = getattr(scheduler_output, "prefix_cache_terminal_owners", {}) or {}
+        terminal_owners = {}
+        for req_id in terminal_ids:
+            current_owner = self._observed_owners.get(req_id)
+            terminal_owner = declared_terminal_owners.get(req_id, current_owner)
+            terminal_owners[req_id] = terminal_owner
+            if current_owner is None or terminal_owner is None or terminal_owner >= current_owner:
+                self._observed_owners.pop(req_id, None)
+                self._observed_req_ids.discard(req_id)
 
         cached_by_id: dict[str, tuple[int, Any, int]] = {}
         if cached is not None:
@@ -120,20 +144,35 @@ class PrefixCacheSchedulerAdapter:
                     int(output_tokens[index]) if index < len(output_tokens) else 0,
                 )
 
-        # Clear terminal observations before classifying new requests. A
-        # request ID may be reused in the same scheduler step.
         finished = set(getattr(scheduler_output, "finished_req_ids", ()) or ())
-        for req_id in sorted(finished | aborted):
-            self._observed_req_ids.discard(str(req_id))
+
+        # Controls are ordered before admission/lookup. A control-only step
+        # establishes the owner while explicitly leaving lookup pending.
+        for event in getattr(scheduler_output, "prefix_cache_replacements", ()) or ():
+            if event.kind is not PrefixCacheEventKind.REPLACED or event.owner is None:
+                raise ValueError("prefix-cache replacement control requires REPLACED and an owner")
+            current_owner = self._observed_owners.get(event.req_id)
+            if current_owner is not None and event.owner < current_owner:
+                continue
+            self._observed_req_ids.add(event.req_id)
+            self._observed_owners[event.req_id] = event.owner
+            events.append(event)
 
         for data in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
             req_id = self._req_id(data)
+            owner = owners.get(req_id)
+            current_owner = self._observed_owners.get(req_id)
+            if owner is not None and current_owner is not None and owner < current_owner:
+                continue
             kind: PrefixCacheEventKind = (
                 PrefixCacheEventKind.STARTED
-                if req_id in terminal_ids or req_id not in self._observed_req_ids
+                if req_id not in self._observed_req_ids
+                or (owner is not None and self._observed_owners.get(req_id) != owner)
                 else PrefixCacheEventKind.EXTENDED
             )
             self._observed_req_ids.add(req_id)
+            if owner is not None:
+                self._observed_owners[req_id] = owner
             computed_tokens = int(getattr(data, "num_computed_tokens", 0) or 0)
             blocks = self._blocks(data)
             events.append(
@@ -144,34 +183,49 @@ class PrefixCacheSchedulerAdapter:
                     computed_tokens,
                     blocks,
                     int(scheduled_tokens.get(req_id, 0)),
+                    owner=owner,
                 )
             )
 
-        for req_id in resumed:
+        for req_id in [*sorted(resumed), *(req_id for req_id in cached_by_id if req_id not in resumed)]:
             req_id = str(req_id)
+            owner = owners.get(req_id)
+            current_owner = self._observed_owners.get(req_id)
+            if owner is not None and current_owner is not None and owner < current_owner:
+                continue
             self._observed_req_ids.add(req_id)
+            if owner is not None:
+                self._observed_owners[req_id] = owner
             hit_end, resumed_blocks, num_output_tokens = cached_by_id.get(req_id, (0, None, 0))
             events.append(
                 PrefixCacheRequestEvent(
                     req_id,
-                    PrefixCacheEventKind.RESUMED,
+                    PrefixCacheEventKind.RESUMED if req_id in resumed else PrefixCacheEventKind.EXTENDED,
                     hit_end=hit_end,
                     block_ids=self._blocks_value(resumed_blocks),
                     scheduled_tokens=int(scheduled_tokens.get(req_id, 0)),
                     num_output_tokens=num_output_tokens,
+                    owner=owner,
                 )
             )
 
         for req_id in sorted(finished | aborted):
             req_id = str(req_id)
             kind = PrefixCacheEventKind.ABORTED if req_id in aborted else PrefixCacheEventKind.FINISHED
-            events.append(PrefixCacheRequestEvent(req_id, kind))
+            events.append(PrefixCacheRequestEvent(req_id, kind, owner=terminal_owners.get(req_id)))
         return tuple(events)
 
     def translate_step(self, scheduler_output: Any) -> PrefixCacheStep:
+        sequence = getattr(scheduler_output, "prefix_cache_step_sequence", None)
+        if sequence is not None:
+            if sequence <= self._last_step_sequence:
+                return PrefixCacheStep((), (), sequence)
+            self._last_step_sequence = sequence
         events = self.translate_scheduler_output(scheduler_output)
         scheduled = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
-        return PrefixCacheStep(events, tuple((str(req_id), int(count)) for req_id, count in scheduled.items()))
+        return PrefixCacheStep(
+            events, tuple((str(req_id), int(count)) for req_id, count in scheduled.items()), sequence
+        )
 
     def build_write_layout(
         self,

@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from collections.abc import Callable
 from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_omni.core.sched.input_finalization import install_request_input, prepare_request_input
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 
 logger = init_logger(__name__)
@@ -57,10 +59,12 @@ class OmniSchedulingCoordinator:
         scheduler_max_num_seqs: int = 0,
         stage_id: int = 0,
         async_chunk: bool = False,
+        conditioning_finalizer: Callable[[Request, dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self._stage_id = stage_id
         self._scheduler_max_num_seqs = scheduler_max_num_seqs
         self._async_chunk = async_chunk
+        self._conditioning_finalizer = conditioning_finalizer
 
         self.finished_requests: set[str] = set()
         self.requests_with_ready_chunks: set[str] = set()
@@ -185,6 +189,7 @@ class OmniSchedulingCoordinator:
                         request_id=request.request_id,
                         external_req_id=getattr(request, "external_req_id", None),
                         payload_sender_info=getattr(request, "payload_sender_info", None),
+                        input_owner=getattr(request, "_omni_prefix_cache_owner", None),
                     )
                 )
             elif request.status == RequestStatus.WAITING_FOR_INPUT:
@@ -199,12 +204,20 @@ class OmniSchedulingCoordinator:
                             request_id=request.request_id,
                             external_req_id=getattr(request, "external_req_id", None),
                             payload_sender_info=getattr(request, "payload_sender_info", None),
+                            input_owner=getattr(request, "_omni_prefix_cache_owner", None),
                         )
                     )
         if to_remove:
             # Use the bulk-remove helper: one O(N) sweep instead of N
             # repeated O(N) removes from a list-backed queue.
             waiting_queue.remove_requests(to_remove)
+
+    def reset_full_payload_input(self, request: Request, waiting_queue: Any) -> None:
+        """Forget retired readiness without losing a coordinator-owned waiter."""
+        was_parked = any(parked is request for parked in self._waiting_for_input)
+        self.free_finished_request(request.request_id)
+        if was_parked and request not in waiting_queue:
+            waiting_queue.add_request(request)
 
     def free_finished_request(self, request_id: str) -> None:
         """Prune all coordinator state owned by a freed request."""
@@ -340,19 +353,50 @@ class OmniSchedulingCoordinator:
             request = requests.get(req_id)
             if request is None:
                 continue
+            if self._conditioning_finalizer is not None:
+                metadata = self._conditioning_finalizer(request, metadata)
 
-            if metadata.get("input_terminal") is True:
-                self.input_terminal_req_ids.add(req_id)
-
-            # Handle next_stage_prompt_len if present (for models like Qwen3-Omni).
+            next_len = metadata.get("next_stage_prompt_len")
+            if next_len is not None and (type(next_len) is not int or next_len <= 0):
+                raise ValueError("next_stage_prompt_len must be a positive integer")
+            next_ids = metadata.get("next_stage_prompt_ids")
+            conditioning_digest = metadata.get("next_stage_conditioning_digest")
+            if conditioning_digest is not None and (model_mode != "ar" or next_ids is None or next_len is None):
+                raise ValueError("conditioning digest requires IDs and length in one AR input notice")
+            if model_mode == "ar" and next_ids is not None:
+                if (
+                    not isinstance(next_ids, list)
+                    or not next_ids
+                    or any(type(token) is not int or token < 0 for token in next_ids)
+                ):
+                    raise ValueError("next_stage_prompt_ids must be non-empty non-negative integer IDs")
+                if next_len is not None and len(next_ids) != next_len:
+                    raise ValueError("next_stage_prompt_ids must match next_stage_prompt_len")
+                if (
+                    getattr(request, "_omni_input_finalized", False)
+                    or request.num_computed_tokens > 0
+                    or request.num_output_tokens > 0
+                ):
+                    if next_ids != request.prompt_token_ids or len(next_ids) != request.num_prompt_tokens:
+                        raise ValueError(f"conflicting finalized prompt IDs for req {req_id}")
+                    if conditioning_digest != getattr(request, "_omni_conditioning_digest", None):
+                        raise ValueError(f"conflicting finalized conditioning for req {req_id}")
+                else:
+                    self._finalize_prompt(request, next_ids, conditioning_digest=conditioning_digest)
+            # Handle length-only metadata from producers without identity IDs.
             # Only apply when the request has not started decoding yet
             # (no output tokens). Resetting a mid-decode request would
             # destroy generated tokens and desync KV cache state.
-            if "next_stage_prompt_len" in metadata:
-                next_len = metadata["next_stage_prompt_len"]
-                if isinstance(next_len, int) and next_len > 0:
+            elif "next_stage_prompt_len" in metadata:
+                if next_len is not None:
                     output_token_ids = getattr(request, "_output_token_ids", None)
-                    if output_token_ids is not None and len(output_token_ids) > 0:
+                    if model_mode == "ar" and getattr(request, "_omni_input_finalized", False):
+                        if next_len != request.num_prompt_tokens:
+                            raise ValueError(
+                                f"conflicting finalized prompt length for req {req_id}: "
+                                f"{request.num_prompt_tokens} != {next_len}"
+                            )
+                    elif output_token_ids is not None and len(output_token_ids) > 0:
                         logger.debug(
                             "[Coordinator stage-%s] Skipping prompt resize for req %s: "
                             "request already has %s output tokens",
@@ -364,19 +408,15 @@ class OmniSchedulingCoordinator:
                         current_prompt_ids = getattr(request, "prompt_token_ids", []) or []
                         current_prompt_len = len(current_prompt_ids)
                         if current_prompt_len != next_len or getattr(request, "num_prompt_tokens", None) != next_len:
-                            new_prompt = [0] * next_len
-                            request.prompt_token_ids = new_prompt
-                            request.num_prompt_tokens = next_len
-                            request._all_token_ids.clear()
-                            request._all_token_ids.extend(new_prompt)
-                            request._output_token_ids.clear()
-                            request.num_computed_tokens = 0
+                            self._finalize_prompt(request, [0] * next_len)
                             logger.debug(
                                 "[Coordinator stage-%s] Updated prompt_token_ids length to %s for req %s",
                                 self._stage_id,
                                 next_len,
                                 req_id,
                             )
+                        elif not getattr(request, "_omni_input_finalized", False):
+                            self._finalize_prompt(request, current_prompt_ids)
 
             if model_mode != "ar":
                 new_ids = self._flatten_prompt_token_ids(metadata.get("code_predictor_codes"))
@@ -385,14 +425,26 @@ class OmniSchedulingCoordinator:
                     runtime_seed = {
                         "meta": {"left_context_size": metadata["left_context_size"]},
                     }
-                request._omni_initial_model_buffer = runtime_seed
                 if new_ids:
-                    request.prompt_token_ids = new_ids
-                    request.num_prompt_tokens = len(new_ids)
-                    request._all_token_ids.clear()
-                    request._all_token_ids.extend(new_ids)
-                    request._output_token_ids.clear()
-                    request.num_computed_tokens = 0
+                    self._finalize_prompt(request, new_ids)
+                request._omni_initial_model_buffer = runtime_seed
+
+            if metadata.get("input_terminal") is True:
+                self.input_terminal_req_ids.add(req_id)
+
+    @staticmethod
+    def _finalize_prompt(request: Request, token_ids: list[int], *, conditioning_digest: str | None = None) -> None:
+        candidate = prepare_request_input(
+            request,
+            prompt_token_ids=token_ids,
+            mm_features=request.mm_features,
+            cache_salt=getattr(request, "_omni_original_cache_salt", request.cache_salt),
+            conditioning_digest=conditioning_digest,
+            sampling_params=request.sampling_params,
+            prompt_embeds=request.prompt_embeds,
+            prompt_is_token_ids=request.prompt_is_token_ids,
+        )
+        install_request_input(request, candidate)
 
     def postprocess_scheduler_output(
         self,
@@ -454,6 +506,7 @@ class OmniSchedulingCoordinator:
                     OmniChunkRecvHandle(
                         request_id=request.request_id,
                         external_req_id=getattr(request, "external_req_id", None),
+                        input_owner=getattr(request, "_omni_prefix_cache_owner", None),
                     )
                 )
                 request.status = RequestStatus.WAITING_FOR_CHUNK

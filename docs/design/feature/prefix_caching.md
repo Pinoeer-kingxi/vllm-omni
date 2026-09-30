@@ -168,6 +168,32 @@ When we pass our multimodal tensors to the language model component in the same 
 
 Finally, we look up the output hidden states/multimodal tensors corresponding to the prefix cache hit `Block 1` and concatenate it with the forward pass result to get the final result, which is expected to be identical to the full hidden states when prefix caching is disabled.
 
+### Input finalization and replacement ownership
+
+Downstream full-payload requests are admitted with provisional prompt lengths.
+The scheduler finalizes token IDs, embeddings, multimodal features, cache salt,
+and block hashes together before the first native prefix-cache lookup. The
+lookup entry asserts that provisional input cannot be used. A length-only
+producer notice also finalizes input when its length matches the placeholder.
+This generic protocol does not enable Qwen3-Omni Talker content identity.
+
+The scheduler assigns an admission ID and content generation to each request.
+An accepted replacement emits `REPLACED` and increments the content generation;
+transport chunk counters and ordinary append/preemption do not increment it.
+Duplicate and stale controls cannot reset current progress.
+
+`REPLACED` retires the old consumer and resets `computed_upto`, `saved_upto`,
+and every consumer's `delivered_upto` for the new input. The first completed
+lookup initializes its new hit frontier. This differs from `RESUMED`, which
+keeps the same owner and saved/delivered progress as in #8034.
+
+Old append tasks are detached, and retired delivery/full-payload bindings are
+discarded. Already-captured producer writes may finish against their physical
+cache versions; they cannot advance the new consumer. Cancelling these shared
+producer writes would break valid A → B → A reuse. Task escalation happens
+outside the manager lock. Connector receive notices are filtered by the local
+receiving scheduler's owner, not by an owner supplied in a remote payload.
+
 ### Diffusion KV Prefix Caching
 
 HunyuanImage3's standalone DiT pipeline can reuse stable text/reference-image KV

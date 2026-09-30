@@ -17,6 +17,7 @@ from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue
 from vllm.v1.core.sched.utils import remove_all
@@ -31,6 +32,8 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheEventKind, PrefixCacheRequestEvent, PrefixCacheRequestOwner
+from vllm_omni.core.sched.input_finalization import install_request_input, prepare_request_input
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
@@ -113,6 +116,49 @@ class OmniSchedulerMixin:
     waiting: RequestQueue
     running: list[Request]
     _pending_input_timeout_outputs: dict[str, tuple[int, OmniEngineCoreOutput]]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._prefix_cache_next_admission = 0
+        self._prefix_cache_step_sequence = 0
+        self._prefix_cache_pending_replacements: list[PrefixCacheRequestEvent] = []
+        self._prefix_cache_pending_terminal_owners: dict[str, PrefixCacheRequestOwner] = {}
+
+    def _get_local_prefix_cache_hit(self, request: Request) -> tuple[KVCacheBlocks, int, int, bool]:
+        # Downstream requests initially carry length-only placeholders. Readiness
+        # alone must never allow a lookup against that provisional input.
+        assert getattr(request, "_omni_input_finalized", True), (
+            f"Prefix-cache lookup before input finalization for request {request.request_id}"
+        )
+        # The concrete scheduler supplies this method through the mixin MRO.
+        return super()._get_local_prefix_cache_hit(request)  # type: ignore[misc]
+
+    def _prefix_cache_owner(self, request: Request, *, new_admission: bool = False) -> PrefixCacheRequestOwner:
+        owner = getattr(request, "_omni_prefix_cache_owner", None)
+        if owner is None or new_admission:
+            self._prefix_cache_next_admission += 1
+            owner = PrefixCacheRequestOwner(self._prefix_cache_next_admission)
+            setattr(request, "_omni_prefix_cache_owner", owner)
+        return owner
+
+    def _accept_prefix_cache_replacement(self, request: Request) -> None:
+        """Scheduler-thread commit; transport segments use a separate counter."""
+        previous = self._prefix_cache_owner(request)
+        owner = PrefixCacheRequestOwner(previous.admission_id, previous.generation + 1)
+        setattr(request, "_omni_prefix_cache_owner", owner)
+        self._prefix_cache_pending_replacements.append(
+            PrefixCacheRequestEvent(
+                request.request_id, PrefixCacheEventKind.REPLACED, owner=owner, lookup_complete=False
+            )
+        )
+
+    def _record_prefix_cache_finished(self, request: Request) -> None:
+        self._prefix_cache_pending_terminal_owners[request.request_id] = self._prefix_cache_owner(request)
+
+    def _has_pending_prefix_cache_work(self) -> bool:
+        # Pending lifecycle work must reach execute_model even if admission
+        # cannot schedule tokens (or a replaced request has already finished).
+        return bool(self._prefix_cache_pending_replacements or self._prefix_cache_pending_terminal_owners)
 
     def _init_omni_connector_output_inbox(self) -> None:
         self._omni_connector_output_inbox: queue.SimpleQueue[OmniConnectorOutput] = queue.SimpleQueue()
@@ -236,18 +282,41 @@ class OmniSchedulerMixin:
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
 
-    def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
+    @staticmethod
+    def _prepare_streaming_session_input(session: Request, update: StreamingUpdate) -> Request:
+        return prepare_request_input(
+            session,
+            prompt_token_ids=update.prompt_token_ids or [],
+            mm_features=update.mm_features or [],
+            cache_salt=getattr(session, "_omni_original_cache_salt", session.cache_salt),
+            sampling_params=update.sampling_params,
+        )
+
+    def _replace_streaming_session(
+        self,
+        session: Request,
+        update: StreamingUpdate,
+        *,
+        candidate: Request | None = None,
+        release_cache: bool = False,
+    ) -> None:
         """Replace a downstream stage's placeholder with its next payload."""
+        if candidate is None:
+            candidate = self._prepare_streaming_session_input(session, update)
+        if release_cache:
+            self._release_replaced_streaming_prompt_cache(session)
         self._reset_streaming_session_replacement_state(session)
-        session._output_token_ids.clear()
-        session._all_token_ids.clear()
-        new_prompt = update.prompt_token_ids or ()
-        session._all_token_ids.extend(new_prompt)
-        session.num_computed_tokens = 0
-        session.prompt_token_ids = new_prompt
-        session.update_block_hashes()
-        session.num_prompt_tokens = len(new_prompt)
+        install_request_input(session, candidate)
+        coordinator = getattr(self, "input_coordinator", None)
+        if coordinator is not None and not coordinator._async_chunk:
+            # The replacement only carries admission placeholders. Old
+            # readiness cannot release it; the next full payload finalizes
+            # IDs and conditioning together before cache lookup.
+            setattr(session, "_omni_input_finalized", False)
+        self._accept_prefix_cache_replacement(session)
         self._finish_streaming_session_update(session, update)
+        if coordinator is not None and not coordinator._async_chunk:
+            coordinator.reset_full_payload_input(session, self.waiting)
 
     def _async_chunk_transport_enabled(self) -> bool:
         return getattr(self, "chunk_transfer_adapter", None) is not None or bool(
@@ -310,6 +379,7 @@ class OmniSchedulerMixin:
             request.num_output_placeholders = 0
             request.spec_token_ids = []
             self._release_replaced_streaming_prompt_cache(request)
+            self._accept_prefix_cache_replacement(request)
             watermark = getattr(adapter, "requests_num_chunks_sent", None)
             if watermark is not None:
                 watermark.pop(request.external_req_id, None)
@@ -344,17 +414,27 @@ class OmniSchedulerMixin:
         chunk_finished_req_ids: set[str] = set()
         stage_recv_req_ids: set[str] = set()
         for output in connector_outputs:
-            request_metadata.update(output.request_metadata)
-            chunk_ready_req_ids.update(output.chunk_ready_req_ids)
-            chunk_finished_req_ids.update(output.chunk_finished_req_ids)
-            stage_recv_req_ids.update(output.stage_recv_req_ids)
-        live_request_ids = self.requests.keys()
-        request_metadata = {
-            req_id: metadata for req_id, metadata in request_metadata.items() if req_id in live_request_ids
-        }
-        chunk_ready_req_ids.intersection_update(live_request_ids)
-        chunk_finished_req_ids.intersection_update(live_request_ids)
-        stage_recv_req_ids.intersection_update(live_request_ids)
+            # Filter each frame before merging: a delayed old frame must not
+            # overwrite current metadata just because the request ID is live.
+            notice_ids = (
+                output.request_metadata.keys()
+                | output.chunk_ready_req_ids
+                | output.chunk_finished_req_ids
+                | output.stage_recv_req_ids
+            )
+            owners = output.input_owners
+            current_ids = {
+                req_id
+                for req_id in notice_ids
+                if req_id in self.requests
+                and owners.get(req_id) == getattr(self.requests[req_id], "_omni_prefix_cache_owner", None)
+            }
+            request_metadata.update(
+                (req_id, metadata) for req_id, metadata in output.request_metadata.items() if req_id in current_ids
+            )
+            chunk_ready_req_ids.update(output.chunk_ready_req_ids & current_ids)
+            chunk_finished_req_ids.update(output.chunk_finished_req_ids & current_ids)
+            stage_recv_req_ids.update(output.stage_recv_req_ids & current_ids)
         if request_metadata:
             input_coordinator.update_request_metadata(
                 self.requests,
@@ -612,12 +692,39 @@ class OmniSchedulerMixin:
                     scheduled_terminal_req_ids,
                 )
             input_coordinator.postprocess_scheduler_output(base)
+        scheduled_ids = set(base.num_scheduled_tokens)
+        owners = {
+            req_id: self._prefix_cache_owner(self.requests[req_id])
+            for req_id in scheduled_ids
+            if req_id in self.requests
+        }
+        pending_replacements = self._prefix_cache_pending_replacements
+        replacements = tuple(
+            event
+            for event in pending_replacements
+            if event.req_id in self.requests
+            and not self.requests[event.req_id].is_finished()
+            and event.owner is not None
+            and event.owner.admission_id == self._prefix_cache_owner(self.requests[event.req_id]).admission_id
+        )
+        pending_replacements.clear()
+        pending_cache_terminal = self._prefix_cache_pending_terminal_owners
+        terminal_owners = {
+            req_id: pending_cache_terminal.pop(req_id)
+            for req_id in base.finished_req_ids
+            if req_id in pending_cache_terminal
+        }
+        self._prefix_cache_step_sequence += 1
         return OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
             pending_input_registrations=pending_input_registrations,
             data_plane_terminal_req_ids=data_plane_terminal_req_ids,
             input_terminal_req_ids=input_terminal_req_ids or set(),
+            prefix_cache_replacements=replacements,
+            prefix_cache_owners=owners,
+            prefix_cache_terminal_owners=terminal_owners,
+            prefix_cache_step_sequence=self._prefix_cache_step_sequence,
         )
 
     def _rewrap_scheduled_new_reqs(self, scheduler_output: SchedulerOutput) -> None:
@@ -902,6 +1009,10 @@ class OmniSchedulerMixin:
         downstream stage terminates on the payload path either way.
         """
         existing = self.requests.get(request.request_id)
+        if existing is None:
+            self._prefix_cache_owner(request, new_admission=True)
+            if self.input_coordinator is not None and not self.input_coordinator._async_chunk:
+                request._omni_input_finalized = False
         if existing is not None and existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)
             if adapter is not None:

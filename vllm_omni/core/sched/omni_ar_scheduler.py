@@ -475,9 +475,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        scheduled_owners = getattr(scheduler_output, "prefix_cache_owners", {})
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
+            scheduled_owner = scheduled_owners.get(req_id)
+            current_owner = getattr(request, "_omni_prefix_cache_owner", None)
+            owner_is_stale = False
+            output_is_stale = False
+            if scheduled_owner is not None and current_owner is not None:
+                if scheduled_owner.admission_id != current_owner.admission_id:
+                    # This ID has been admitted again. Neither its output nor
+                    # its in-flight accounting belongs to the new request.
+                    continue
+                owner_is_stale = scheduled_owner != current_owner
             if request is not None:
                 # Settle the in-flight tokens counted in schedule().
                 # Must happen before the skips below — failed-KV-load and
@@ -486,14 +497,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # max(0, computed - in_flight), so a leaked counter silently
                 # freezes sliding-window block freeing.
                 request.num_in_flight_tokens -= num_tokens_scheduled
-            # vLLM 0.27 (a0c092ee72) removed the async_tokens_to_discard
-            # handling from the upstream scheduler and replaced it with the
-            # num_stale_output_tokens/is_stale mechanism. Omni's discard
-            # sites (segment stop, streaming-session replacement) record the
-            # in-flight share here; the delayed outputs are dropped below
-            # instead of decrementing num_output_placeholders (which the
-            # discard zeroed) and underflowing the upstream assert.
-            output_is_stale = False
+            # Native preemption resets counters but normally still delivers
+            # in-flight tokens and payloads. Only explicit drop mode (including
+            # Omni segment/replacement fences) discards them. Keep this stale
+            # accounting separate from the admission/generation owner fence.
             if request is not None and request.num_stale_output_tokens > 0:
                 output_is_stale = True
                 request.num_stale_output_tokens -= num_tokens_scheduled
@@ -517,7 +524,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # domains must consume the old frame before new output passes.
                 request.async_tokens_to_discard = max(0, stale_async_tokens - len(generated_token_ids))
 
-            if output_is_stale or async_output_is_stale:
+            if owner_is_stale or async_output_is_stale or (output_is_stale and request.drop_stale_output):
                 # Output of a step scheduled before the request's in-flight
                 # tokens were discarded (segment stop / session replacement).
                 # num_computed_tokens was rolled back at the discard site, so
@@ -556,11 +563,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # tokens and rejections. If some tokens are rejected,
                 # num_computed_tokens is decreased by the number of rejected
                 # tokens.
-                if request.num_computed_tokens > 0:
+                if not output_is_stale and request.num_computed_tokens > 0:
                     request.num_computed_tokens -= num_rejected
                 # If async scheduling, num_output_placeholders also includes
                 # the scheduled spec tokens count and so is similarly adjusted.
-                if request.num_output_placeholders > 0:
+                if not output_is_stale and request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
@@ -600,7 +607,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Check for stop and update request status.
             if new_token_ids:
                 num_sampled_tokens = len(new_token_ids)
-                new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                new_token_ids, stopped = self._update_request_with_output(
+                    request, new_token_ids, is_stale=output_is_stale
+                )
                 if new_logprobs is not None and len(new_token_ids) < num_sampled_tokens:
                     # A mid-step stop (e.g. spec-decode tokens sampled past
                     # EOS) trims new_token_ids after the validation slice
@@ -705,6 +714,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     # next duplex unit's listen/speak under async scheduling.
                     if request.num_in_flight_tokens > 0:
                         request.num_stale_output_tokens = request.num_in_flight_tokens
+                        request.drop_stale_output = True
                     if outstanding_async_tokens > 0:
                         # Discard only outputs that are already in flight and
                         # roll back their optimistic computed-token accounting.
@@ -861,6 +871,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         Discards the last sampled output token from the prior input chunk at
         stage 0.
         """
+        update_infos = (
+            getattr(update, "model_intermediate_buffer", None),
+            getattr(update, "additional_information", None),
+        )
+        replace_streaming_prompt = any(
+            isinstance(info, dict)
+            and isinstance(info.get("meta"), dict)
+            and info["meta"].get("replace_streaming_prompt") is True
+            for info in update_infos
+        )
+        replacement_candidate = (
+            self._prepare_streaming_session_input(session, update) if replace_streaming_prompt else None
+        )
         req_id = session.request_id
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
@@ -885,6 +908,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         in_flight_tokens = int(getattr(session, "num_in_flight_tokens", 0) or 0)
         if in_flight_tokens > 0:
             session.num_stale_output_tokens = in_flight_tokens
+            session.drop_stale_output = True
         if outstanding_async_tokens > 0:
             # Async scheduling may already have sampled the previous
             # segment's next token. Drop that late token instead of
@@ -895,10 +919,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             session.spec_token_ids = []
         stage_id = self.vllm_config.model_config.stage_id
 
-        update_infos = (
-            getattr(update, "model_intermediate_buffer", None),
-            getattr(update, "additional_information", None),
-        )
         if self.chunk_transfer_adapter and self.chunk_transfer_adapter.receives_chunks:
             self.chunk_transfer_adapter.requests_num_chunks_sent.pop(session.external_req_id, None)
             if stage_id != 0:
@@ -934,8 +954,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
             if self._streaming_update_overflows(session, update, projected_len=plan["replacement_prompt_len"]):
                 return
-            self._release_replaced_streaming_prompt_cache(session)
-            self._replace_streaming_session(session, update)
+            self._replace_streaming_session(session, update, release_cache=True)
             return
         streaming_prompt_payload = next(
             (
@@ -977,6 +996,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     # released. The rebuilt prompt is then admitted from zero.
                     self._release_replaced_streaming_prompt_cache(session)
                     self._reset_streaming_session_replacement_state(session)
+                    self._accept_prefix_cache_replacement(session)
                 else:
                     session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
                     if update.mm_features:
@@ -991,15 +1011,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         session.mm_features.extend(update.mm_features)
                 self._finish_streaming_session_update(session, update)
                 return
-        replace_streaming_prompt = any(
-            isinstance(info, dict)
-            and isinstance(info.get("meta"), dict)
-            and info["meta"].get("replace_streaming_prompt") is True
-            for info in update_infos
-        )
         if replace_streaming_prompt:
-            self._release_replaced_streaming_prompt_cache(session)
-            self._replace_streaming_session(session, update)
+            self._replace_streaming_session(session, update, candidate=replacement_candidate, release_cache=True)
             return
         if self._streaming_update_overflows(session, update):
             return
@@ -1321,6 +1334,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
 
+        self._record_prefix_cache_finished(request)
+
         self._omits_kv_transfer_cache.pop(request.request_id, None)
 
         # [Upstream compat] Discard request from in-flight prefills set added
@@ -1517,7 +1532,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def has_requests(self) -> bool:
         """Check if there are any requests to process, including KV transfers."""
-        return self._has_pending_kv_work() or super().has_requests()
+        return self._has_pending_kv_work() or self._has_pending_prefix_cache_work() or super().has_requests()
 
     def has_finished_requests(self) -> bool:
         """Check if there are any finished requests (including those needing KV transfer)."""

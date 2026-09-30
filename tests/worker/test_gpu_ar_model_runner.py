@@ -20,6 +20,7 @@ from vllm.v1.worker import gpu_input_batch
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_omni.core.prefix_cache import ModelCachePolicy
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
 from vllm_omni.core.prefix_cache.interface import PrefixCacheRequestProgress, StageCacheOutputs
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -534,6 +535,7 @@ def _build_prefix_delivery_output(runner, *, staged_hidden=None, multimodal_outp
 def _delivery_test_manager():
     manager = object.__new__(OmniPrefixCacheManager)
     manager._state_lock = threading.Lock()
+    manager._request_progress = {}
     return manager
 
 
@@ -602,13 +604,88 @@ def test_prefix_delivery_builder_acks_only_after_success(monkeypatch):
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
     monkeypatch.setattr(
         GPUARModelRunner,
-        "get_omni_connector_output",
-        lambda self: (_ for _ in ()).throw(RuntimeError("connector failed")),
+        "_build_omni_step_outputs",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("builder failed")),
     )
 
-    with pytest.raises(RuntimeError, match="connector failed"):
+    with pytest.raises(RuntimeError, match="builder failed"):
         _build_prefix_delivery_output(runner)
     assert progress.delivered_upto == {}
+
+
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_replacement_during_builder_filters_only_retired_payload(monkeypatch, accumulate):
+    from tests.core.test_prefix_cache import make_manager
+    from vllm_omni.core.prefix_cache.adapter import (
+        PrefixCacheEventKind,
+        PrefixCacheRequestEvent,
+    )
+
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner._async_chunk = False
+    manager, _ = make_manager()
+    runner.omni_prefix_cache = manager
+    runner._pending_full_payload_send = {}
+    runner._full_payload_replace_keys_cached = frozenset()
+    progress = {
+        "r1": PrefixCacheRequestProgress(owner=PrefixCacheRequestOwner(1)),
+        "r2": PrefixCacheRequestProgress(owner=PrefixCacheRequestOwner(2)),
+    }
+    manager._request_progress = dict(progress)
+    raw = StageCacheOutputs(
+        hidden_states={"r1": torch.tensor([[1.0], [2.0]]), "r2": torch.tensor([[3.0], [4.0]])},
+        mm_outputs={},
+        token_ranges={"r1": (0, 2), "r2": (0, 2)},
+        scheduled_token_ranges={"r1": (0, 2), "r2": (0, 2)},
+        _progress=progress,
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", req_ids))
+    monkeypatch.setattr(
+        GPUARModelRunner, "_prepare_prefix_cache_pooler_payload_sources", lambda self, **kwargs: (None, raw)
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: accumulate)
+    built, release = threading.Event(), threading.Event()
+    build = runner._build_omni_step_outputs
+
+    def paused_build(*args, **kwargs):
+        assert not manager._state_lock.locked()
+        output = build(*args, **kwargs)
+        built.set()
+        assert release.wait(5)
+        return output
+
+    runner._build_omni_step_outputs = paused_build
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(_build_prefix_delivery_output, runner)
+            try:
+                assert built.wait(5)
+                manager.new_step_starts(
+                    [
+                        PrefixCacheRequestEvent(
+                            "r1",
+                            PrefixCacheEventKind.REPLACED,
+                            owner=PrefixCacheRequestOwner(1, 1),
+                            lookup_complete=False,
+                        )
+                    ]
+                )
+            finally:
+                release.set()
+            output = future.result(timeout=5)
+        assert output.req_ids == ["r1", "r2"]
+        assert output.req_id_to_index == {"r1": 0, "r2": 1}
+        assert output.sampled_token_ids == [[], []]
+        assert output.inter_stage_outputs[0] is None
+        assert output.multimodal_outputs[0] is None
+        assert output.inter_stage_outputs[1]["hidden"].flatten().tolist() == [3.0, 4.0]
+        assert progress["r1"].delivered_upto == {}
+        assert progress["r2"].delivered_upto == {"output_builder": 2}
+        assert manager._request_progress["r1"].delivered_upto == {}
+        assert set(runner._pending_full_payload_send) == ({"r2"} if accumulate else set())
+    finally:
+        manager.shutdown()
 
 
 def test_prefix_delivery_clips_scheduled_hidden_when_cached_hidden_disabled(monkeypatch):

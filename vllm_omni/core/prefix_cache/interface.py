@@ -12,6 +12,8 @@ from typing import Any, TypeAlias
 
 import torch
 
+from .adapter import PrefixCacheRequestOwner
+
 # Four identities (still str/int at runtime, not interchangeable):
 #   TensorName  which cached tensor (hidden / mm), not a prefix hash
 #   ReqId       vLLM request id
@@ -117,6 +119,10 @@ class PrefixCacheRequestProgress:
     computed_upto: int = 0
     saved_upto: int = 0
     delivered_upto: dict[str, int] = field(default_factory=dict)
+    owner: PrefixCacheRequestOwner | None = None
+    # None is pending; (0, ...) records an actual zero-hit lookup.
+    lookup: tuple[int, tuple[tuple[int, ...], ...]] | None = None
+    retired: bool = False
 
 
 @dataclass

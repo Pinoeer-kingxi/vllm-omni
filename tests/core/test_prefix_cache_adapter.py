@@ -9,6 +9,7 @@ import torch
 from vllm_omni.core.prefix_cache.adapter import (
     PrefixCacheEventKind,
     PrefixCacheRequestEvent,
+    PrefixCacheRequestOwner,
     PrefixCacheSchedulerAdapter,
 )
 
@@ -153,3 +154,74 @@ def test_same_id_terminal_and_new_preserves_new_observation_for_extension():
     adapter.translate_scheduler_output(output(new=[SimpleNamespace(req_id="r")], finished={"r"}))
     events = adapter.translate_scheduler_output(output(new=[SimpleNamespace(req_id="r", num_computed_tokens=8)]))
     assert events[0].kind is PrefixCacheEventKind.EXTENDED
+
+
+def test_replacement_control_precedes_first_delayed_lookup():
+    adapter = PrefixCacheSchedulerAdapter()
+    owner = PrefixCacheRequestOwner(1, 2)
+    control = PrefixCacheRequestEvent("a", PrefixCacheEventKind.REPLACED, owner=owner, lookup_complete=False)
+    control_only = output()
+    control_only.prefix_cache_replacements = (control,)
+    control_only.prefix_cache_step_sequence = 1
+    step = adapter.translate_step(control_only)
+    assert step.sequence == 1
+    assert step.events == (control,)
+    assert not step.scheduled_tokens
+
+    lookup = output(new=[SimpleNamespace(req_id="a", num_computed_tokens=0, block_ids=[[2]])])
+    lookup.prefix_cache_owners = {"a": owner}
+    event = adapter.translate_scheduler_output(lookup)[0]
+    assert event.kind is PrefixCacheEventKind.EXTENDED
+    assert event.owner == owner
+    assert event.lookup_complete and event.hit_end == 0
+
+
+def test_cached_extension_carries_delayed_lookup_and_owner():
+    adapter = PrefixCacheSchedulerAdapter()
+    owner = PrefixCacheRequestOwner(1, 1)
+    lookup = output(cached={"req_ids": ["a"], "num_computed_tokens": [8], "new_block_ids": [[[3, 4]]]})
+    lookup.prefix_cache_owners = {"a": owner}
+    event = adapter.translate_scheduler_output(lookup)[0]
+    assert event.kind is PrefixCacheEventKind.EXTENDED
+    assert event.owner == owner
+    assert event.hit_end == 8 and event.block_ids == ((3, 4),)
+
+
+def test_terminal_captures_old_admission_when_id_is_reused():
+    adapter = PrefixCacheSchedulerAdapter()
+    first = output(new=[SimpleNamespace(req_id="a")])
+    first.prefix_cache_owners = {"a": PrefixCacheRequestOwner(1)}
+    adapter.translate_step(first)
+    reused = output(new=[SimpleNamespace(req_id="a")], finished=["a"])
+    reused.prefix_cache_owners = {"a": PrefixCacheRequestOwner(2)}
+    events = adapter.translate_step(reused).events
+    assert events[0].owner == PrefixCacheRequestOwner(2)
+    assert events[-1].owner == PrefixCacheRequestOwner(1)
+
+
+def test_replayed_scheduler_step_does_not_rewrite_adapter_observations():
+    adapter = PrefixCacheSchedulerAdapter()
+    first = output(new=[SimpleNamespace(req_id="a")])
+    first.prefix_cache_step_sequence = 1
+    first.prefix_cache_owners = {"a": PrefixCacheRequestOwner(1)}
+    adapter.translate_step(first)
+    last = output(finished=["a"])
+    last.prefix_cache_step_sequence = 2
+    adapter.translate_step(last)
+    assert adapter.translate_step(first).events == ()
+    assert "a" not in adapter._observed_req_ids
+
+
+def test_stale_lookup_and_terminal_do_not_rewind_adapter_owner():
+    adapter = PrefixCacheSchedulerAdapter()
+    current = PrefixCacheRequestOwner(2, 1)
+    admitted = output(new=[SimpleNamespace(req_id="a")])
+    admitted.prefix_cache_owners = {"a": current}
+    adapter.translate_step(admitted)
+    stale = output(new=[SimpleNamespace(req_id="a")], finished=["a"])
+    stale.prefix_cache_owners = {"a": PrefixCacheRequestOwner(1)}
+    stale.prefix_cache_terminal_owners = {"a": PrefixCacheRequestOwner(1)}
+    events = adapter.translate_step(stale).events
+    assert all(event.kind is PrefixCacheEventKind.FINISHED for event in events)
+    assert adapter._observed_owners["a"] == current
+    assert adapter.translate_step(admitted).events[0].kind is PrefixCacheEventKind.EXTENDED

@@ -53,11 +53,12 @@ from __future__ import annotations
 import logging
 import threading
 from collections import deque
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, NamedTuple, NoReturn
+from weakref import WeakValueDictionary
 
 import torch
 
@@ -447,6 +448,11 @@ class OmniPrefixCacheManager:
             self._slot_status.init_table(hk)
         self._request_tasks = _RequestTaskTable()
         self._request_progress: dict[ReqId, PrefixCacheRequestProgress] = {}
+        # Finished snapshots may still be held by a builder or accumulator.
+        # A later admission must retire them, even if it also finishes before
+        # the old builder returns. Weak values retain no completed requests.
+        self._finished_progress: WeakValueDictionary[ReqId, PrefixCacheRequestProgress] = WeakValueDictionary()
+        self._last_step_sequence = -1
         # Join worklists — not occupancy, not the request-task table.
         self._join_next_step_tids: list[Tid] = []
         self._join_finished_tids: set[Tid] = set()  # escalated on finish/abort
@@ -500,6 +506,16 @@ class OmniPrefixCacheManager:
         """
         to_escalate: list[int] = []
         with self._state_lock:
+            if isinstance(events, PrefixCacheStep):
+                step = events
+                if step.sequence is not None:
+                    if step.sequence <= self._last_step_sequence:
+                        return
+                    self._last_step_sequence = step.sequence
+                events = step.events
+                num_scheduled_tokens = dict(step.scheduled_tokens)
+            else:
+                events = tuple(events)
             # 1. Publish writes the committer has already written into the pool.
             self._commit_drained_writes()
 
@@ -507,24 +523,21 @@ class OmniPrefixCacheManager:
             #    those block hashes are already in vLLM; dropping the write
             #    would leave future hits ABSENT. The next save waits
             #    join_host_ready. (Not leftover_mm — those are this-step reads.)
-            if isinstance(events, PrefixCacheStep):
-                step = events
-                events = step.events
-                num_scheduled_tokens = dict(step.scheduled_tokens)
-            else:
-                events = tuple(events)
             for event in events:
                 if event.kind not in (PrefixCacheEventKind.FINISHED, PrefixCacheEventKind.ABORTED):
                     continue
                 req_id = event.req_id
-                tids, dtask = self._request_tasks.finish(req_id)
-                self._request_progress.pop(req_id, None)
-                if dtask is not None:
-                    tids.add(dtask.tid)
-                pending_tasks = [tid for tid in tids if self._controller.get_task(tid) is not None]
-                if pending_tasks:
-                    to_escalate.extend(pending_tasks)
-                    self._join_finished_tids.update(pending_tasks)
+                progress = self._request_progress.get(req_id) or self._finished_progress.get(req_id)
+                retire = False
+                if event.owner is not None:
+                    if progress is None or (progress.owner is not None and progress.owner > event.owner):
+                        continue
+                    # A replacement can finish before its control is dispatched.
+                    # Its newer terminal owner still fences the old builder.
+                    retire = progress.owner is not None and progress.owner != event.owner
+                # Normal final output retains its captured progress and remains
+                # deliverable after the request leaves the active table.
+                to_escalate.extend(self._detach_request_locked(req_id, retire=retire))
 
             # 3. Copy this arrival's prefix-hit block ids. The adapter captures
             #    them before _update_states; after that point they sit
@@ -533,9 +546,7 @@ class OmniPrefixCacheManager:
             self._clear_hit_infos()
             for event in events:
                 req_id = event.req_id
-                if event.kind is PrefixCacheEventKind.STARTED:
-                    self._request_progress[req_id] = PrefixCacheRequestProgress()
-                elif event.kind is not PrefixCacheEventKind.RESUMED:
+                if not self._apply_request_event_locked(event, to_escalate):
                     continue
                 progress = self._request_progress[req_id]
                 num_computed = int(event.hit_end)
@@ -570,6 +581,61 @@ class OmniPrefixCacheManager:
                 self._prefetch_hit_spans()
         if to_escalate:
             self._controller.escalate(to_escalate)
+
+    def _detach_request_locked(self, req_id: str, *, retire: bool) -> list[int]:
+        """Detach appendable tasks; the caller escalates after dropping the lock."""
+        progress = self._request_progress.pop(req_id, None)
+        if retire:
+            finished = self._finished_progress.pop(req_id, None)
+            if finished is not None:
+                finished.retired = True
+            if progress is not None:
+                progress.retired = True
+        elif progress is not None:
+            self._finished_progress[req_id] = progress
+        tids, deferred = self._request_tasks.finish(req_id)
+        if deferred is not None:
+            tids.add(deferred.tid)
+        pending = [tid for tid in tids if self._controller.get_task(tid) is not None]
+        self._join_finished_tids.update(pending)
+        return pending
+
+    def _apply_request_event_locked(self, event: PrefixCacheRequestEvent, to_escalate: list[int]) -> bool:
+        """Apply ownership, returning whether this event installs a lookup."""
+        kind = event.kind
+        if kind in (PrefixCacheEventKind.FINISHED, PrefixCacheEventKind.ABORTED):
+            return False
+        req_id = event.req_id
+        progress = self._request_progress.get(req_id)
+        owner = event.owner
+        if kind is PrefixCacheEventKind.REPLACED and owner is None:
+            raise OmniPrefixCacheUnmatchError(f"replacement for req {req_id} has no content owner")
+        if progress is not None and progress.owner is not None:
+            if owner is None or owner < progress.owner:
+                return False
+            if owner > progress.owner:
+                if kind not in (PrefixCacheEventKind.STARTED, PrefixCacheEventKind.REPLACED):
+                    raise OmniPrefixCacheUnmatchError(f"req {req_id} changed owner without a lifecycle event")
+                if kind is PrefixCacheEventKind.STARTED and owner.admission_id == progress.owner.admission_id:
+                    raise OmniPrefixCacheUnmatchError(f"req {req_id} changed content without REPLACED")
+        starts = kind in (PrefixCacheEventKind.STARTED, PrefixCacheEventKind.REPLACED)
+        if starts and (progress is None or owner is None or owner != progress.owner):
+            to_escalate.extend(self._detach_request_locked(req_id, retire=True))
+            progress = PrefixCacheRequestProgress(owner=owner)
+            self._request_progress[req_id] = progress
+        if progress is None or not event.lookup_complete:
+            return False
+        lookup = (event.hit_end, event.block_ids)
+        if progress.lookup is None:
+            progress.lookup = lookup
+            return True
+        if kind is PrefixCacheEventKind.RESUMED:
+            return True
+        if starts and progress.lookup != lookup:
+            raise OmniPrefixCacheUnmatchError(f"conflicting initial lookup for req {req_id}, owner={owner}")
+        # EXTENDED after the first completed lookup is ordinary execution
+        # progress, not another lookup. Duplicate controls are also no-ops.
+        return False
 
     @torch.inference_mode()
     def save_outputs(
@@ -848,15 +914,63 @@ class OmniPrefixCacheManager:
     @_locked
     def ack_delivery(self, outputs: StageCacheOutputs) -> None:
         """Record successful local handoff; cache reads and writes are not delivery."""
+        for delivered, consumer, end in self._delivery_advances(outputs, outputs.token_ranges):
+            delivered[consumer] = end
+
+    @staticmethod
+    def _delivery_advances(outputs: StageCacheOutputs, req_ids: Iterable[str]) -> list[tuple[dict[str, int], str, int]]:
+        """Validate the whole handoff before committing any delivery cursor."""
         if outputs._consumer is None:
             raise ValueError("ack_delivery requires a consumer delivery view")
-        for req_id, (start, end) in outputs.token_ranges.items():
+        advances = []
+        for req_id in req_ids:
+            start, end = outputs.token_ranges[req_id]
             delivered = outputs._progress[req_id].delivered_upto
             previous = delivered.get(outputs._consumer, 0)
             if end > previous:
                 if start > previous:
                     raise OmniPrefixCacheUnmatchError(f"delivery gap for req {req_id}: {previous} -> {start}")
-                delivered[outputs._consumer] = end
+                advances.append((delivered, outputs._consumer, end))
+        return advances
+
+    @_locked
+    def commit_output(
+        self,
+        outputs: StageCacheOutputs,
+        handoff: Callable[[frozenset[str]], None],
+        *,
+        delivery: StageCacheOutputs | None = None,
+    ) -> frozenset[str]:
+        """Atomically filter retired owners, hand off prepared output, and ACK.
+
+        The caller builds tensors/payloads before entering. ``handoff`` may
+        only select already-built payloads and publish local references; it
+        must not build tensors, copy, wait, or call another manager entry.
+        Request IDs and scheduler accounting stay intact when their outgoing
+        payload is filtered. This is a local commit, not a remote receipt.
+
+        Finished requests remain eligible through their captured progress;
+        replacement marks that progress retired. A reused live admission
+        cannot receive a prior admission's output, even after normal finish.
+        Sparse metadata-only output can omit ``delivery`` and advance no
+        token cursor while using the same owner check.
+        """
+        live = frozenset(
+            req_id
+            for req_id, progress in outputs._progress.items()
+            if not progress.retired and self._request_progress.get(req_id, progress) is progress
+        )
+        advances = []
+        if delivery is not None:
+            for req_id, progress in delivery._progress.items():
+                if outputs._progress.get(req_id) is not progress:
+                    raise ValueError("delivery view does not belong to this output snapshot")
+            advances = self._delivery_advances(delivery, live.intersection(delivery.token_ranges))
+        handoff(live)
+        if delivery is not None:
+            for delivered, consumer, end in advances:
+                delivered[consumer] = end
+        return live
 
     @_locked
     def discard_step(self, step_id: int) -> None:

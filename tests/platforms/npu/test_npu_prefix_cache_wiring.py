@@ -81,7 +81,7 @@ def test_execute_model_state_keeps_prefix_cache_sid_last():
     assert gpu_fields[-1] == "prefix_cache_step_id"
 
 
-def test_npu_output_builder_views_then_acks_delivery_after_connector():
+def test_npu_output_builder_commits_current_owners_after_connector():
     tree = ast.parse(_NPU_RUNNER.read_text())
     sample = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens")
     calls = {
@@ -89,9 +89,20 @@ def test_npu_output_builder_views_then_acks_delivery_after_connector():
         for node in ast.walk(sample)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr in {"delivery_view", "ack_delivery", "get_omni_connector_output"}
+        and node.func.attr in {"delivery_view", "_prefix_cache_commit_output", "get_omni_connector_output"}
     }
-    assert calls["delivery_view"] < calls["get_omni_connector_output"] < calls["ack_delivery"]
+    assert calls["delivery_view"] < calls["get_omni_connector_output"] < calls["_prefix_cache_commit_output"]
+    handoff = next(node for node in ast.walk(sample) if isinstance(node, ast.FunctionDef) and node.name == "handoff")
+    accumulation_calls = [
+        node
+        for node in ast.walk(sample)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "accumulate_full_payload_output"
+    ]
+    assert accumulation_calls
+    assert handoff.end_lineno is not None
+    assert all(handoff.lineno < node.lineno <= handoff.end_lineno for node in accumulation_calls)
 
 
 def test_npu_partial_downstream_hidden_uses_only_unseen_scheduled_rows():

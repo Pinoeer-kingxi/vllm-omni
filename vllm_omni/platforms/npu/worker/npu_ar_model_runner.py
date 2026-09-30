@@ -1066,10 +1066,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         pooler_output: list[dict[str, object]] | None = None
         delivery = None
+        cache_outputs = None
         if needs_pooler_payload:
             combined_hidden_states = None
             combined_multimodal_outputs = None
-            cache_outputs = None
             mm_cpu = None
             if _omni_cache_on:
                 cache_outputs = self._prefix_cache_materialize(prefix_cache_step_id, list(req_ids_output_copy))
@@ -1203,13 +1203,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # accumulate). #4527's (None, pooler_output) starved it. (PR #4792)
             pooler_inter, pooler_client = pooler_output, pooler_output
 
-        # [Omni] Full-payload send-side accumulation. Mirrors gpu_ar_model_runner.py.
-        if pooler_inter and self._should_accumulate_full_payload_output():
-            with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
-                for i, rid in enumerate(req_ids_output_copy):
-                    req_state = self.requests.get(rid)
-                    if req_state is not None and pooler_inter[i]:
-                        self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
+        # Resolve imports/policy outside the short local commit lock.
+        accumulate = bool(pooler_inter) and self._should_accumulate_full_payload_output()
+        if accumulate:
+            self._resolve_full_payload_replace_keys()
 
         inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
         multimodal_outputs = (
@@ -1259,10 +1256,21 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 global_stream().wait_event(self.sampling_done_event)
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
+        def handoff(live: frozenset[str]) -> None:
+            if accumulate:
+                assert pooler_inter is not None
+                for i, rid in enumerate(req_ids_output_copy):
+                    req_state = self.requests.get(rid)
+                    if rid in live and req_state is not None and pooler_inter[i]:
+                        if cache_outputs is None:
+                            self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
+                        else:
+                            self.accumulate_full_payload_output(
+                                rid, pooler_inter[i], req_state, owner=cache_outputs._progress[rid]
+                            )
+
         if not self.use_async_scheduling:
-            if delivery is not None:
-                assert self.omni_prefix_cache is not None
-                self.omni_prefix_cache.ack_delivery(delivery)
+            self._prefix_cache_commit_output(model_runner_output, cache_outputs, delivery, handoff=handoff)
             return model_runner_output
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
@@ -1277,9 +1285,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
         )
-        if delivery is not None:
-            assert self.omni_prefix_cache is not None
-            self.omni_prefix_cache.ack_delivery(delivery)
+        self._prefix_cache_commit_output(model_runner_output, cache_outputs, delivery, handoff=handoff)
         return async_output
 
     #  -------------------------------------- Omni-new -------------------------------------------------
