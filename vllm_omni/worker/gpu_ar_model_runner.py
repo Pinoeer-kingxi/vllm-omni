@@ -1746,6 +1746,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             self._omni_payload_copy_stream = stream
         return stream
 
+    def _predict_talker_codes(self, primary: torch.Tensor, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prepare the next codec input using the same MTP path as decode."""
+        rows = primary.shape[0]
+        self.talker_mtp_input_ids.gpu[:rows].copy_(primary.reshape(-1))
+        # Qwen pending-history production uses primary IDs and last hidden
+        # state for code_predictor_forward; input-embed values are unused.
+        self.last_talker_hidden.gpu[:rows].copy_(hidden.reshape(rows, -1))
+        # Text belongs to next-step preprocessing, not codec identity.
+        self.text_step.gpu[:rows].zero_()
+        embeddings, codes = self._invoke_talker_mtp(rows)
+        if codes is None:
+            raise ValueError("Talker history production requires complete codec output")
+        return codes[:rows].unsqueeze(-1), embeddings[:rows].unsqueeze(1)
+
     def _build_omni_model_runner_output_from_snapshot(
         self,
         *,

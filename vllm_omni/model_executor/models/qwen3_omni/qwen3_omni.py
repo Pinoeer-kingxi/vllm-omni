@@ -46,6 +46,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
 from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload, OmniPayloadMeta
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
@@ -223,6 +224,14 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.use_async_omni_output = True
             self.eager_omni_postprocess_before_async_output = True
             self.omni_pooler_payload_include_hidden = False
+            if not getattr(vllm_config.model_config, "async_chunk", False):
+                # Full-payload replay reconstructs inputs from the fixed
+                # Thinker payload and accepted codec history. The sampled
+                # last hidden stays on GPU; no consumer needs a host copy of
+                # every cached Talker hidden row.
+                self.requires_full_prefix_cached_hidden_states = False
+                # Retain codec payload delivery independently of replay state.
+                self.deferred_prefix_cache_mm_keys = {"codes.audio"}
             self.set_custom_preprocess(self.talker_preprocess)
             self.set_custom_postprocess(self.talker_postprocess)
             self.thinker = None
@@ -839,6 +848,172 @@ class Qwen3OmniMoeForConditionalGeneration(
         inputs_embeds = summed_embeddings.reshape(-1, self.talker_config.text_config.hidden_size)
         inputs_embeds = (inputs_embeds + text_step).reshape(-1, self.talker_config.text_config.hidden_size)
         return inputs_embeds, code_predictor_codes.squeeze(-1)
+
+    def talker_replay_inputs(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        *,
+        row_start: int,
+        prompt_length: int,
+        owner: PrefixCacheRequestOwner,
+        codec_inputs: Sequence[torch.Tensor],
+        payload: OmniPayload,
+        restore_text: bool = True,
+        codec_embeddings: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, OmniPayload]:
+        """Reconstruct a new/resumed interval, including generated-history hits.
+
+        ``codec_inputs`` is runner-local generated history, not scheduler
+        transport or additional_information. Its primary IDs are authoritative
+        for generated rows. Validate the interval before embedding anything;
+        never sample on a replay.
+        Rebuild text state from the current fixed payload, ignoring stale decode
+        queues/hidden states. This boundary operation is not the steady-state
+        decode path and does not retain a second projected-text cache.
+
+        Calling this method does not enable prefix caching; support remains
+        gated separately until runtime qualification is complete.
+        """
+        if self.vllm_config.model_config.async_chunk:
+            raise ValueError("Talker history replay requires the full fixed payload")
+        talker = self.talker
+        if talker is None:
+            raise ValueError("Talker history replay requires a loaded Talker stage")
+        if (
+            type(row_start) is not int
+            or type(prompt_length) is not int
+            or row_start < 0
+            or prompt_length <= 0
+            or not isinstance(owner, PrefixCacheRequestOwner)
+            or input_ids.ndim != 1
+            or not input_ids.numel()
+            or input_embeds.ndim != 2
+            or input_embeds.shape != (input_ids.shape[0], self.talker_config.text_config.hidden_size)
+        ):
+            raise ValueError("Talker replay interval and input shapes must align")
+        if codec_embeddings is not None and (
+            row_start < prompt_length
+            or input_ids.shape[0] != 1
+            or codec_embeddings.shape != input_embeds.shape
+            or codec_embeddings.dtype != input_embeds.dtype
+            or codec_embeddings.device != input_embeds.device
+        ):
+            raise ValueError("Talker prepared codec embedding must match the current input row")
+        row_end = row_start + input_ids.shape[0]
+        generated_start = max(prompt_length, row_start)
+        needed = max(0, row_end - generated_start)
+        first_index = generated_start - prompt_length
+        if needed and first_index + needed > len(codec_inputs):
+            raise ValueError("Talker replay is missing an accepted codec input")
+        replay_rows = codec_inputs[first_index : first_index + needed] if needed else ()
+        for row in replay_rows:
+            if (
+                not isinstance(row, torch.Tensor)
+                or row.ndim != 1
+                or row.dtype != torch.long
+                or row.numel() != talker.num_code_groups
+            ):
+                raise ValueError("Talker replay requires complete per-row int64 codec tensors")
+        codes_for_records = (
+            torch.stack(replay_rows).to(device=input_ids.device, non_blocking=True)
+            if needed
+            else torch.empty((0, talker.num_code_groups), device=input_ids.device, dtype=torch.long)
+        )
+        if not restore_text:
+            replay_meta = payload.get("meta", {})
+            steady_cursor = (
+                bool(replay_meta.get("decode_flag"))
+                and replay_meta.get("num_processed_tokens") == 1 + row_start - prompt_length
+            )
+            first_decode_handoff = (
+                row_start == prompt_length
+                and not replay_meta.get("decode_flag")
+                and replay_meta.get("prefill_consumed_text_tokens") == 1
+                and replay_meta.get("num_processed_tokens") == prompt_length
+            )
+            if (
+                row_start < prompt_length
+                or input_ids.shape[0] != 1
+                or not (steady_cursor or first_decode_handoff)
+                or not isinstance(payload.get("embed", {}).get("tts_pad_projected"), torch.Tensor)
+                or not isinstance(payload.get("hidden_states", {}).get("trailing_text"), torch.Tensor)
+            ):
+                raise ValueError("Talker steady replay or first decode handoff requires a contiguous text cursor")
+            codes = codes_for_records[:1]
+            if codec_embeddings is None:
+                codec_embeds = talker.replay_codec_embeddings(codes, dtype=input_embeds.dtype)
+            else:
+                codec_embeds = codec_embeddings
+            _, text, decode_update = self.talker_preprocess_decode(codes[:, 0], codec_embeds, {}, payload)
+            if text is None:
+                raise ValueError("Talker steady replay is missing its restored text state")
+            decode_update.setdefault("meta", {}).update(
+                decode_flag=True, num_processed_tokens=1 + row_end - prompt_length
+            )
+            decode_update.setdefault("codes", {})["audio"] = codes
+            return codes[:, 0], codec_embeds + text, decode_update
+
+        embed = payload["embed"]
+        plan = read_talker_prefill_plan(
+            payload["meta"].get("talker_prefill_plan"),
+            sequence_length=len(payload["ids"]["all"]),
+            embedding_rows=embed["prefill"].shape[0],
+            hidden_rows=payload["hidden_states"]["output"].shape[0],
+        )
+        if sum(part.num_rows for part in plan) != prompt_length or plan[-1].kind != "assistant":
+            raise ValueError("Talker replay prompt length must match the fixed assistant plan")
+
+        def prefill_at(start: int, span: int):
+            # Local metadata only: do not rewind the live queue or mutate a
+            # captured payload while reconstructing an evicted interval.
+            fixed_payload = dict(payload)
+            fixed_payload["meta"] = {**payload["meta"], "num_processed_tokens": start}
+            return self.talker_preprocess_prefill(input_ids[:span], input_embeds[:span], fixed_payload)
+
+        prefill_rows = max(0, min(row_end, prompt_length) - row_start)
+        ids_parts, embed_parts, code_parts = [], [], []
+        update: OmniPayload = {}
+        if prefill_rows:
+            prefill_ids, prefill_embeds, update = prefill_at(row_start, prefill_rows)
+            ids_parts.append(prefill_ids)
+            embed_parts.append(prefill_embeds.to(dtype=input_embeds.dtype))
+            code_parts.append(
+                torch.zeros((prefill_rows, talker.num_code_groups), device=input_ids.device, dtype=torch.long)
+            )
+        has_generated_rows = codes_for_records.shape[0] > 0
+        if has_generated_rows:
+            # A pure history hit never runs prefill. Reconstruct only its last
+            # bootstrap row to obtain the exact original text projection/tail;
+            # no user rows are projected and no prompt tokens are replanned.
+            if not prefill_rows:
+                _, _, update = prefill_at(prompt_length - 1, 1)
+            tail = update["hidden_states"]["trailing_text"].reshape(-1, input_embeds.shape[-1])
+            pad = update["embed"]["tts_pad_projected"].reshape(-1, input_embeds.shape[-1])
+            offset = generated_start - prompt_length
+            num_generated_rows = codes_for_records.shape[0]
+            text_rows = tail[offset : offset + num_generated_rows]
+            if text_rows.shape[0] < num_generated_rows:
+                text_rows = torch.cat((text_rows, pad.expand(num_generated_rows - text_rows.shape[0], -1)))
+            codes = codes_for_records
+            codec_embeds = (
+                talker.replay_codec_embeddings(codes, dtype=input_embeds.dtype)
+                if codec_embeddings is None
+                else codec_embeddings
+            )
+            embed_parts.append(codec_embeds + text_rows.to(device=codec_embeds.device, dtype=codec_embeds.dtype))
+            ids_parts.append(codes[:, 0])
+            code_parts.append(codes)
+            next_offset = row_end - prompt_length
+            update["hidden_states"]["trailing_text"] = tail[next_offset:] if next_offset < tail.shape[0] else pad
+            update.setdefault("meta", {}).update(decode_flag=True, num_processed_tokens=1 + next_offset)
+        else:
+            update.setdefault("meta", {}).update(decode_flag=False, num_processed_tokens=row_end)
+        if len(ids_parts) == 1:
+            update.setdefault("codes", {})["audio"] = code_parts[0]
+            return ids_parts[0], embed_parts[0], update
+        update.setdefault("codes", {})["audio"] = torch.cat(code_parts)
+        return torch.cat(ids_parts), torch.cat(embed_parts), update
 
     def _get_tts_embed(self, thinker_embed, tts_bos_thinker, tts_eos_thinker, tts_pad_thinker):
         """Project thinker-side TTS embeddings into talker text space."""

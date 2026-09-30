@@ -210,6 +210,42 @@ decoding or external KV transfer, and same-worker recovery only.
 Async-chunk content identity is tracked separately in
 [#8068](https://github.com/vllm-project/vllm-omni/issues/8068).
 
+### Request-local Talker recovery and qualification
+
+Same-worker preemption retains accepted primary and residual codec decisions
+on runner-owned request state. Recompute reconstructs inputs from the current
+fixed conditioning and these decisions without resampling. Replacement clears
+that history; resume requires the same content owner and accepted frontier.
+Codec history is not carried in client metadata or scheduler IPC.
+
+The test-only worker and deploy profile are checked in under
+`tests/model_executor/models/qwen3_omni/`. They bypass only the public Talker
+support refusal, retain the KV/layout/token-accounting checks, and do not
+change the production launch defaults. This profile needs three CUDA GPUs and
+the independent Code2Wav dtype fix (#8327) for batch-invariant runs.
+
+From the repository root, with the local checkpoint in `MODEL_PATH`:
+
+```bash
+PYTHONPATH="$PWD" VLLM_BATCH_INVARIANT=1 \
+vllm serve "$MODEL_PATH" --omni --port 8090 \
+  --stage-config-path tests/model_executor/models/qwen3_omni/talker_qualification.yaml
+```
+
+For stage-local recovery qualification on one idle GPU:
+
+```bash
+VLLM_OMNI_TEST_TALKER_ENGINE=1 VLLM_OMNI_TEST_QWEN3_MODEL="$MODEL_PATH" \
+VLLM_BATCH_INVARIANT=1 VLLM_OMNI_TEST_TALKER_COMPILE=1 \
+VLLM_OMNI_TEST_TALKER_GRAPH=full \
+python -m pytest -o addopts='' \
+  tests/model_executor/models/qwen3_omni/test_checkpoint_talker_engine.py \
+  -m 'core_model and cuda and omni' --run-level=core_model
+```
+
+The one-GPU checks use controlled Thinker conditioning. They are not
+full-pipeline WER or performance measurements.
+
 ### Diffusion KV Prefix Caching
 
 HunyuanImage3's standalone DiT pipeline can reuse stable text/reference-image KV
