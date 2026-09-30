@@ -47,6 +47,7 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
+from vllm_omni.model_executor.models.qwen3_omni.talker_identity import is_qwen3_full_payload_talker
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import (
     build_mm_cpu,
@@ -1287,6 +1288,27 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         return None
 
+    def _prepare_talker_penalty_prompt_ids(self, logits_vocab: int) -> None:
+        """Keep content-identity IDs out of the codec sampler's prompt bins.
+
+        Full-payload Qwen prompts used zero placeholders before content
+        identity. Restore that sampling-only representation, including for
+        in-range text IDs, without changing scheduler/history token IDs.
+        Native InputBatch replaces sampling metadata on batch changes, so
+        prepare it once per admission/reorder rather than once per decode.
+        """
+        if not is_qwen3_full_payload_talker(getattr(self, "model_config", None)):
+            return
+        metadata = self.input_batch.sampling_metadata
+        if metadata.prompt_token_ids is None or getattr(self, "_talker_penalty_metadata", None) is metadata:
+            return
+        prompt_ids = torch.zeros_like(metadata.prompt_token_ids)
+        for row in range(prompt_ids.shape[0]):
+            # Use lengths, not ID equality: a text ID may equal codec padding.
+            prompt_ids[row, self.input_batch.num_prompt_tokens[row] :] = logits_vocab
+        metadata.prompt_token_ids = prompt_ids
+        self._talker_penalty_metadata = metadata
+
     def _sample(
         self,
         logits: torch.Tensor | None,
@@ -1990,6 +2012,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         # Correct padding values of prompt_token_ids to match the logits vocabulary size.
         if logits is not None and not self.input_batch.sampling_metadata.no_penalties:
+            self._prepare_talker_penalty_prompt_ids(logits.shape[-1])
             smd = self.input_batch.sampling_metadata
             if smd.prompt_token_ids is not None:
                 logits_vocab = logits.shape[-1]

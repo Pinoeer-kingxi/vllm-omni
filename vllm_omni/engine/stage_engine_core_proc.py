@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
 )
+from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.system_utils import (
     decorate_logs,
     set_process_title,
@@ -38,6 +39,8 @@ from vllm_omni.engine.stage_init_utils import (
     maybe_apply_cfg_scheduler_patches,
     set_death_signal,
 )
+from vllm_omni.model_executor.models.qwen3_omni.talker_history import get_talker_request_block_hasher
+from vllm_omni.model_executor.models.qwen3_omni.talker_identity import is_qwen3_full_payload_talker
 
 logger = init_logger(__name__)
 
@@ -107,8 +110,21 @@ class StageEngineCoreProc(EngineCoreProc):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self._init_talker_request_hasher()
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
+
+    def _init_talker_request_hasher(self) -> None:
+        # The runner's B4 startup guard still prevents enabled model execution.
+        # Once qualified, keep selection stage-local and use upstream's resolved
+        # hash geometry; never inspect a closure or patch the KV allocator.
+        if self.vllm_config.cache_config.enable_prefix_caching and is_qwen3_full_payload_talker(
+            self.vllm_config.model_config
+        ):
+            self.request_block_hasher = get_talker_request_block_hasher(
+                self.scheduler.hash_block_size,
+                get_hash_fn_by_name(self.vllm_config.cache_config.prefix_caching_hash_algo),
+            )
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""

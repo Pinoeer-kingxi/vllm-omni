@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.request import Request
 
 from vllm_omni.core.sched.input_finalization import install_request_input, prepare_request_input
+from vllm_omni.inputs.processed_media import ProcessedMediaProvenance
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -27,6 +28,27 @@ def _request(embeds, tokens, mask):
         block_hasher=get_request_block_hasher(2, sha256),
         cache_salt="caller",
     )
+
+
+def test_replacement_installs_current_provenance_atomically_and_clears_old_proof():
+    request = _request(None, [1, 2], None)
+    old = ProcessedMediaProvenance((1, 2), (), ())
+    request.processed_media_provenance = old
+    arguments = dict(
+        prompt_token_ids=[3, 4], mm_features=[], cache_salt="caller", sampling_params=request.sampling_params
+    )
+    with pytest.raises(ValueError, match="provenance"):
+        prepare_request_input(request, **arguments, processed_media_provenance=old)
+    assert request.prompt_token_ids == [1, 2]
+    assert request.processed_media_provenance is old
+
+    current = ProcessedMediaProvenance((3, 4), (), ())
+    candidate = prepare_request_input(request, **arguments, processed_media_provenance=current)
+    assert request.processed_media_provenance is old
+    install_request_input(request, candidate)
+    assert request.processed_media_provenance is current
+    install_request_input(request, prepare_request_input(request, **arguments))
+    assert request.processed_media_provenance is None
 
 
 @pytest.mark.parametrize(

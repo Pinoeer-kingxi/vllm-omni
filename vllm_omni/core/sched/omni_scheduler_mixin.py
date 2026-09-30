@@ -203,8 +203,15 @@ class OmniSchedulerMixin:
                 async_chunk=True,
             )
         elif uses_full_payload_input_coordinator(model_config):
+            from vllm_omni.model_executor.models.qwen3_omni.talker_identity import (
+                TalkerInputIdentity,
+                is_qwen3_full_payload_talker,
+            )
+
+            identity = TalkerInputIdentity(self.vllm_config) if is_qwen3_full_payload_talker(model_config) else None
             self.input_coordinator = OmniSchedulingCoordinator(
                 stage_id=getattr(model_config, "stage_id", 0),
+                conditioning_finalizer=identity.finalize if identity is not None else None,
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         self._init_omni_connector_output_inbox()
@@ -290,6 +297,7 @@ class OmniSchedulerMixin:
             mm_features=update.mm_features or [],
             cache_salt=getattr(session, "_omni_original_cache_salt", session.cache_salt),
             sampling_params=update.sampling_params,
+            processed_media_provenance=getattr(update, "processed_media_provenance", None),
         )
 
     def _replace_streaming_session(

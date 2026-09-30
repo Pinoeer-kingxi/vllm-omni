@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.inputs.processed_media import ProcessedMediaProvenance
 
 
 class OmniRequest(Request):
@@ -39,6 +40,7 @@ class OmniRequest(Request):
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
+        processed_media_provenance: ProcessedMediaProvenance | None = None,
         **kwargs,
     ):
         if prompt_embeds is not None:
@@ -58,6 +60,7 @@ class OmniRequest(Request):
         self.additional_information: AdditionalInformationPayload | None = additional_information
         # Runner-owned runtime payload.
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
+        self.processed_media_provenance = processed_media_provenance
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -105,6 +108,7 @@ class OmniRequest(Request):
             block_hasher=block_hasher,
             additional_information=request.additional_information,
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            processed_media_provenance=getattr(request, "processed_media_provenance", None),
             resumable=request.resumable,
             session_id=request.session_id,
             reasoning_ended=request.reasoning_ended,
@@ -130,6 +134,7 @@ class OmniStreamingUpdate:
     sampling_params: SamplingParams | None
     additional_information: AdditionalInformationPayload | None = None
     model_intermediate_buffer: dict | None = None
+    processed_media_provenance: ProcessedMediaProvenance | None = None
 
     @classmethod
     def from_request(cls, request: "Request") -> "OmniStreamingUpdate | None":
@@ -143,4 +148,5 @@ class OmniStreamingUpdate:
             sampling_params=request.sampling_params,
             additional_information=request.additional_information,
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            processed_media_provenance=getattr(request, "processed_media_provenance", None),
         )

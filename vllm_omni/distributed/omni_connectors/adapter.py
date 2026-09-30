@@ -8,6 +8,7 @@ from vllm.v1.request import Request
 
 from vllm_omni.core.sched.input_finalization import install_request_input, prepare_request_input
 from vllm_omni.metrics import OrchestratorAggregator
+from vllm_omni.model_executor.models.qwen3_omni.talker_input_plan import plan_talker_prefill
 
 from .utils.logging import get_connector_logger
 
@@ -200,28 +201,7 @@ def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
     Returns:
         The length of the talker prompt ids.
     """
-    im_start_token_id = 151644
-    system_token_id = 8948
-    user_token_id = 872
-    assistant_token_id = 77091
-    im_start_indexes = [i for i in range(len(prompt_ids)) if prompt_ids[i] == im_start_token_id]
-    im_start_indexes.append(len(prompt_ids))
-    sum_user_len = 0
-    assistant_len = 0
-    for i in range(len(im_start_indexes) - 1):
-        s = im_start_indexes[i]
-        e = im_start_indexes[i + 1]
-        role = prompt_ids[s + 1]
-        if role == system_token_id:
-            continue
-        elif role == user_token_id:
-            sum_user_len += e - s
-        elif role == assistant_token_id and i == len(im_start_indexes) - 2:
-            assistant_len += 9  # 3 + 4 + 1 + 1
-        else:
-            pass
-
-    return sum_user_len + assistant_len
+    return sum(part.num_rows for part in plan_talker_prefill(prompt_ids, len(prompt_ids)))
 
 
 def construct_next_stage_streaming_input_prompt(

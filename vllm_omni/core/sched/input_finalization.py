@@ -15,6 +15,8 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.request import Request
 from vllm.v1.utils import ConstantList
 
+from vllm_omni.inputs.processed_media import ProcessedMediaProvenance
+
 _INPUT_FIELDS = (
     "prompt_token_ids",
     "prompt_embeds",
@@ -26,6 +28,7 @@ _INPUT_FIELDS = (
     "output_token_ids",
     "num_computed_tokens",
     "mm_features",
+    "processed_media_provenance",
     "cache_salt",
     "_omni_original_cache_salt",
     "_omni_conditioning_digest",
@@ -64,6 +67,7 @@ def prepare_request_input(
     prompt_embeds: torch.Tensor | None = None,
     prompt_is_token_ids: list[bool] | None = None,
     conditioning_digest: str | None = None,
+    processed_media_provenance: ProcessedMediaProvenance | None = None,
 ) -> Request:
     """Validate and hash a candidate without mutating the admitted request.
 
@@ -87,6 +91,8 @@ def prepare_request_input(
     effective_salt = (
         cache_salt if conditioning_digest is None else compose_conditioning_cache_salt(cache_salt, conditioning_digest)
     )
+    if processed_media_provenance is not None:
+        processed_media_provenance.validate(token_ids, mm_features)
     candidate = copy(request)
     candidate.prompt_token_ids = token_ids
     candidate.prompt_embeds = prompt_embeds
@@ -103,6 +109,7 @@ def prepare_request_input(
     candidate.output_token_ids = ConstantList(candidate._output_token_ids)
     candidate.num_computed_tokens = 0
     candidate.mm_features = list(mm_features)
+    setattr(candidate, "processed_media_provenance", processed_media_provenance)
     candidate.cache_salt = effective_salt
     setattr(candidate, "_omni_original_cache_salt", cache_salt)
     setattr(candidate, "_omni_conditioning_digest", conditioning_digest)

@@ -194,6 +194,22 @@ producer writes would break valid A → B → A reuse. Task escalation happens
 outside the manager lock. Connector receive notices are filtered by the local
 receiving scheduler's owner, not by an owner supplied in a remote payload.
 
+### Qwen3-Omni Talker identity scope
+
+Talker input identity uses the same row plan as embedding assembly, including
+the nine bootstrap rows. A validated conditioning digest includes current
+Thinker conditioning, speaker and processed-media provenance, and is combined
+with the original opaque caller salt before block hashes are rebuilt.
+Complete prompt-only blocks may be shared; blocks containing generated tokens
+are private to their scheduler admission/content owner.
+
+Input identity alone does not make generated codec decisions replayable.
+The public Talker cache startup guard remains closed. The phase 1 candidate
+uses synchronous full-payload input, Talker TP/PP/PCP/DCP=1, no speculative
+decoding or external KV transfer, and same-worker recovery only.
+Async-chunk content identity is tracked separately in
+[#8068](https://github.com/vllm-project/vllm-omni/issues/8068).
+
 ### Diffusion KV Prefix Caching
 
 HunyuanImage3's standalone DiT pipeline can reuse stable text/reference-image KV

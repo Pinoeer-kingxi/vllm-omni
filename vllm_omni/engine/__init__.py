@@ -15,6 +15,8 @@ from vllm.v1.engine import (
     EngineCoreRequest,
 )
 
+from vllm_omni.inputs.processed_media import ProcessedMediaProvenance
+
 
 class PromptEmbedsPayload(msgspec.Struct):
     """Serialized prompt embeddings payload for direct transfer.
@@ -83,6 +85,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
     payload_sender_info: dict[str, Any] | None = None
+    processed_media_provenance: ProcessedMediaProvenance | None = None
 
     @classmethod
     def from_request(
@@ -93,6 +96,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict[str, Any] | None = None,
         payload_sender_info: dict[str, Any] | None = None,
+        processed_media_provenance: ProcessedMediaProvenance | None = None,
     ) -> "OmniEngineCoreRequest":
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
 
@@ -104,6 +108,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
         if payload_sender_info is None:
             payload_sender_info = getattr(request, "payload_sender_info", None)
+        if processed_media_provenance is None:
+            processed_media_provenance = getattr(request, "processed_media_provenance", None)
 
         return cls(
             request_id=request.request_id,
@@ -122,6 +128,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             priority=request.priority,
             trace_headers=request.trace_headers,
             resumable=request.resumable,
+            session_id=request.session_id,
             external_req_id=request.external_req_id,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
@@ -129,6 +136,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             additional_information=additional_information,
             model_intermediate_buffer=model_intermediate_buffer,
             payload_sender_info=payload_sender_info,
+            processed_media_provenance=processed_media_provenance,
         )
 
 

@@ -73,6 +73,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             extracted["next_stage_prompt_ids"] = meta["next_stage_prompt_ids"]
         if "next_stage_conditioning_digest" in meta:
             extracted["next_stage_conditioning_digest"] = meta["next_stage_conditioning_digest"]
+        if "next_stage_source_digest" in meta:
+            extracted["next_stage_source_digest"] = meta["next_stage_source_digest"]
+        if "next_stage_source_identity_error" in meta:
+            extracted["next_stage_source_identity_error"] = meta["next_stage_source_identity_error"]
+        if "next_stage_source_digest" in meta and "speaker" in payload:
+            extracted["next_stage_speaker"] = payload["speaker"]
         if "next_stage_prompt_len" in meta:
             extracted["next_stage_prompt_len"] = meta["next_stage_prompt_len"]
         else:
@@ -103,6 +109,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         ("meta", "next_stage_prompt_len"),
         ("meta", "next_stage_prompt_ids"),
         ("meta", "next_stage_conditioning_digest"),
+        ("meta", "next_stage_source_digest"),
+        ("meta", "next_stage_source_identity_error"),
+        ("meta", "talker_prefill_plan"),
         ("meta", "left_context_size"),
         ("ids", "output"),
         ("embed", "decode_token_start"),
