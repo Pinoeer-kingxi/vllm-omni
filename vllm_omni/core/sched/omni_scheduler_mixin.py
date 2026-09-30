@@ -115,7 +115,7 @@ class OmniSchedulerMixin:
     requests: dict[str, Request]
     waiting: RequestQueue
     running: list[Request]
-    _pending_input_timeout_outputs: dict[str, tuple[int, OmniEngineCoreOutput]]
+    _pending_input_error_outputs: dict[str, tuple[int, OmniEngineCoreOutput]]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -427,6 +427,7 @@ class OmniSchedulerMixin:
                 req_id
                 for req_id in notice_ids
                 if req_id in self.requests
+                and not self.requests[req_id].is_finished()
                 and owners.get(req_id) == getattr(self.requests[req_id], "_omni_prefix_cache_owner", None)
             }
             request_metadata.update(
@@ -435,12 +436,22 @@ class OmniSchedulerMixin:
             chunk_ready_req_ids.update(output.chunk_ready_req_ids & current_ids)
             chunk_finished_req_ids.update(output.chunk_finished_req_ids & current_ids)
             stage_recv_req_ids.update(output.stage_recv_req_ids & current_ids)
-        if request_metadata:
-            input_coordinator.update_request_metadata(
-                self.requests,
-                request_metadata,
-                model_mode=model_mode,
-            )
+        for req_id, metadata in request_metadata.items():
+            try:
+                input_coordinator.update_request_metadata(
+                    self.requests,
+                    {req_id: metadata},
+                    model_mode=model_mode,
+                )
+            except ValueError as error:
+                # Validation is request-local. Do not activate a failed input
+                # or let it prevent other requests in this frame from advancing.
+                chunk_ready_req_ids.discard(req_id)
+                chunk_finished_req_ids.discard(req_id)
+                stage_recv_req_ids.discard(req_id)
+                reason = f"Invalid connector input: {error}"
+                logger.error("Marking request %s as FINISHED_ERROR: %s", req_id, reason)
+                self._finish_input_error_requests({req_id}, reason)
         if input_coordinator._async_chunk:
             input_coordinator.process_pending_chunks(
                 self.waiting,
@@ -538,15 +549,18 @@ class OmniSchedulerMixin:
         self._finish_input_timeout_requests(present_ids)
 
     def _finish_input_timeout_requests(self, request_ids: set[str]) -> None:
+        reason = f"Timed out waiting for connector input after {DEFAULT_INPUT_WAIT_TIMEOUT_S:g}s"
+        self._finish_input_error_requests(request_ids, reason)
+
+    def _finish_input_error_requests(self, request_ids: set[str], reason: str) -> None:
         # Upstream finish_requests frees scheduler state, but does not emit
         # EngineCoreOutput. Keep an explicit ERROR for both AR and generation
         # callers, including a tick with no scheduled model work.
-        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        pending = getattr(self, "_pending_input_error_outputs", None)
         if pending is None:
-            pending = self._pending_input_timeout_outputs = {}
+            pending = self._pending_input_error_outputs = {}
         for request_id in request_ids:
             request = self.requests[request_id]
-            reason = f"Timed out waiting for connector input after {DEFAULT_INPUT_WAIT_TIMEOUT_S:g}s"
             request.stop_reason = reason
             pending[request_id] = (
                 request.client_index,
@@ -843,7 +857,7 @@ class OmniSchedulerMixin:
         synthesize_abort_outputs: bool,
     ) -> None:
         """Attach finished IDs while keeping AR's synthetic-abort policy explicit."""
-        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        pending = getattr(self, "_pending_input_error_outputs", None)
         if pending:
             for client_index, error_output in pending.values():
                 output = engine_core_outputs.setdefault(client_index, EngineCoreOutputs())

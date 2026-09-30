@@ -2,14 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Scheduler-owned content controls, including the real zero-token dispatch path."""
 
-from collections import deque
+from collections import defaultdict, deque
 from contextlib import nullcontext
 from queue import SimpleQueue
 from types import SimpleNamespace
 
 import pytest
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.outputs import ModelRunnerOutput
@@ -107,6 +109,170 @@ def scheduler_request():
     scheduler.waiting_for_transfer_free = set()
     scheduler.input_coordinator = None
     return scheduler, request
+
+
+@pytest.fixture(params=[(OmniARScheduler, "ar"), (OmniGenerationScheduler, "generation")], ids=["ar", "generation"])
+def input_failure_scheduler(request, mocker):
+    scheduler_cls, model_mode = request.param
+    scheduler = scheduler_cls.__new__(scheduler_cls)
+    scheduler.requests = {}
+    scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.running = []
+    scheduler.chunk_transfer_adapter = None
+    scheduler.input_coordinator = OmniSchedulingCoordinator(stage_id=1)
+    scheduler.num_waiting_for_streaming_input = 0
+    scheduler._prefix_cache_next_admission = 0
+    scheduler._prefix_cache_step_sequence = 0
+    scheduler._prefix_cache_pending_replacements = []
+    scheduler._prefix_cache_pending_terminal_owners = {}
+    scheduler._omits_kv_transfer_cache = {}
+    scheduler._omni_kv_config = {}
+    scheduler._new_prompt_len_snapshot = {}
+    scheduler._inflight_prefills = set()
+    scheduler.finished_req_ids = set()
+    scheduler.finished_req_ids_dict = defaultdict(set)
+    scheduler.ec_connector = None
+    # Keep native finish/free logic; replace only connector and cache I/O.
+    scheduler._connector_finished = mocker.Mock(return_value=(False, None))
+    scheduler._free_request_blocks = mocker.Mock()
+    scheduler.encoder_cache_manager = mocker.Mock()
+    return scheduler, model_mode
+
+
+@pytest.mark.parametrize("bad_first", [False, True])
+@pytest.mark.parametrize("parked", [False, True])
+@pytest.mark.parametrize("invalid_length", [True, 0, -1])
+def test_invalid_full_payload_finishes_only_its_request(input_failure_scheduler, bad_first, parked, invalid_length):
+    scheduler, model_mode = input_failure_scheduler
+    bad, healthy = _make_request(), _make_request()
+    bad.request_id, healthy.request_id = "invalid-input", "healthy-input"
+    ordered = [bad, healthy] if bad_first else [healthy, bad]
+    for req in ordered:
+        scheduler.requests[req.request_id] = req
+        scheduler._prefix_cache_owner(req)
+        scheduler.waiting.add_request(req)
+    coordinator = scheduler.input_coordinator
+    if parked:
+        scheduler._consume_pending_connector_output(model_mode)
+        assert list(scheduler.waiting) == []
+        assert list(coordinator._waiting_for_input) == ordered
+
+    metadata = {
+        req.request_id: {"next_stage_prompt_len": invalid_length if req is bad else 5, "input_terminal": True}
+        for req in ordered
+    }
+    scheduler._latest_omni_connector_output = OmniConnectorOutput(
+        request_metadata=metadata,
+        stage_recv_req_ids=set(metadata),
+        chunk_ready_req_ids=set(metadata),
+        chunk_finished_req_ids=set(metadata),
+        input_owners={req.request_id: scheduler._prefix_cache_owner(req) for req in ordered},
+    )
+    scheduler._process_pending_omni_inputs(model_mode)
+
+    assert bad.status == RequestStatus.FINISHED_ERROR
+    assert bad.request_id not in scheduler.requests
+    assert bad.prompt_token_ids == [1, 2, 3]
+    assert list(scheduler.waiting) == [healthy]
+    assert healthy.status == RequestStatus.WAITING
+    assert healthy._omni_input_finalized and healthy.num_prompt_tokens == 5
+    assert coordinator._full_payload_input_received == {healthy.request_id}
+    assert coordinator.finished_requests == {healthy.request_id}
+    assert coordinator.input_terminal_req_ids == {healthy.request_id}
+    assert not coordinator._waiting_for_input
+    assert not coordinator._waiting_since
+    assert not coordinator.pending_input_registrations
+    scheduler._free_request_blocks.assert_called_once_with(bad)
+    scheduler.encoder_cache_manager.free.assert_called_once_with(bad)
+    scheduler._connector_finished.assert_called_once_with(bad)
+    assert scheduler._prefix_cache_pending_terminal_owners == {bad.request_id: scheduler._prefix_cache_owner(bad)}
+
+    # Both schedulers must deliver ERROR even when the worker has no tokens.
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=model_mode == "ar")
+    error = outputs[bad.client_index].outputs
+    assert len(error) == 1
+    assert error[0].request_id == bad.request_id
+    assert error[0].finish_reason == FinishReason.ERROR
+    assert "positive integer" in error[0].stop_reason
+    assert outputs[bad.client_index].finished_requests == {bad.request_id}
+    subsequent_outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(subsequent_outputs, synthesize_abort_outputs=model_mode == "ar")
+    assert subsequent_outputs == {}
+
+    # The next cycle must still admit the healthy request, not re-park it.
+    scheduler._process_pending_omni_inputs(model_mode)
+    assert list(scheduler.waiting) == [healthy]
+    assert healthy.status == RequestStatus.WAITING
+
+
+@pytest.mark.parametrize("exception_type", [ValueError, RuntimeError, TypeError])
+def test_full_payload_finalizer_isolates_only_validation_errors(input_failure_scheduler, exception_type):
+    scheduler, model_mode = input_failure_scheduler
+    req = _make_request()
+    scheduler.requests[req.request_id] = req
+    scheduler.waiting.add_request(req)
+
+    def reject_conditioning(request, metadata):
+        raise exception_type("invalid conditioning")
+
+    scheduler.input_coordinator._conditioning_finalizer = reject_conditioning
+    scheduler._latest_omni_connector_output = OmniConnectorOutput(
+        request_metadata={req.request_id: {"next_stage_prompt_len": 3}},
+        stage_recv_req_ids={req.request_id},
+        input_owners={req.request_id: scheduler._prefix_cache_owner(req)},
+    )
+    if exception_type is ValueError:
+        scheduler._process_pending_omni_inputs(model_mode)
+        assert req.status == RequestStatus.FINISHED_ERROR
+        assert not scheduler.requests
+        assert not scheduler.input_coordinator._full_payload_input_received
+    else:
+        with pytest.raises(exception_type, match="invalid conditioning"):
+            scheduler._process_pending_omni_inputs(model_mode)
+        assert req.status == RequestStatus.WAITING
+        assert scheduler.requests == {req.request_id: req}
+        scheduler._free_request_blocks.assert_not_called()
+
+
+@pytest.mark.parametrize("deferred_free", [False, True])
+def test_late_invalid_notice_cannot_refinish_or_poison_reused_request(input_failure_scheduler, deferred_free):
+    scheduler, model_mode = input_failure_scheduler
+    retired = _make_request()
+    scheduler.requests[retired.request_id] = retired
+    scheduler.waiting.add_request(retired)
+    owner = scheduler._prefix_cache_owner(retired)
+    scheduler._connector_finished.return_value = (deferred_free, None)
+    notice = OmniConnectorOutput(
+        request_metadata={retired.request_id: {"next_stage_prompt_len": -1}},
+        stage_recv_req_ids={retired.request_id},
+        input_owners={retired.request_id: owner},
+    )
+    scheduler._latest_omni_connector_output = notice
+    scheduler._process_pending_omni_inputs(model_mode)
+    assert retired.status == RequestStatus.FINISHED_ERROR
+    assert bool(scheduler.requests) == deferred_free
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=model_mode == "ar")
+    assert outputs[retired.client_index].outputs[0].finish_reason == FinishReason.ERROR
+
+    if not deferred_free:
+        replacement = _make_request()
+        scheduler.requests[replacement.request_id] = replacement
+        scheduler._prefix_cache_owner(replacement)
+        scheduler.waiting.add_request(replacement)
+    scheduler._latest_omni_connector_output = notice
+    scheduler._process_pending_omni_inputs(model_mode)
+    scheduler._connector_finished.assert_called_once_with(retired)
+    assert not scheduler.input_coordinator._full_payload_input_received
+    assert not scheduler.input_coordinator.finished_requests
+    outputs = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=model_mode == "ar")
+    assert not outputs
+    if not deferred_free:
+        assert replacement.status == RequestStatus.WAITING_FOR_INPUT
+        assert scheduler.requests == {replacement.request_id: replacement}
 
 
 def test_each_accepted_replacement_advances_content_once_before_admission():
