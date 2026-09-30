@@ -1883,7 +1883,51 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
             preprocess_input_ids = input_ids if input_ids is not None else self.input_ids.gpu[:num_input_tokens]
             history_enabled = bool(getattr(self, "_talker_history_enabled", False))
-            for req_index, req_id in enumerate(self.input_batch.req_ids):
+            req_indices = list(range(len(self.input_batch.req_ids)))
+            history_req_indices: list[int] = []
+            if history_enabled:
+                fresh_req_indices: list[int] = []
+                for req_index, req_id in enumerate(self.input_batch.req_ids):
+                    req_state = self.requests.get(req_id)
+                    if req_state is None:
+                        raise ValueError("Talker history preprocessing requires a retained request state")
+                    accepted_outputs = getattr(req_state, "output_token_ids", None)
+                    if not isinstance(accepted_outputs, list):
+                        raise ValueError("Talker history preprocessing requires runner output token history")
+                    if accepted_outputs:
+                        history_req_indices.append(req_index)
+                    else:
+                        fresh_req_indices.append(req_index)
+                req_indices = fresh_req_indices + history_req_indices
+            history_req_index_set = set(history_req_indices)
+            materialized_history = not history_req_indices
+
+            def materialize_history_pending() -> None:
+                nonlocal materialized_history
+                if materialized_history:
+                    return
+                pending_talker_items: list[tuple[str, int, torch.Tensor, torch.Tensor | None, dict[str, Any]]] = []
+                for req_index in history_req_indices:
+                    req_id = self.input_batch.req_ids[req_index]
+                    req_infos = self.model_intermediate_buffer.get(req_id, {})
+                    start_offset = int(self.query_start_loc.cpu[req_index])
+                    sched_tokens = int(num_scheduled_tokens_np[req_index])
+                    s, e = start_offset, start_offset + sched_tokens
+                    num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
+                    pending_talker_items.append(
+                        (
+                            req_id,
+                            num_computed_tokens,
+                            preprocess_input_ids[s:e],
+                            inputs_embeds[s:e] if inputs_embeds is not None else None,
+                            req_infos,
+                        )
+                    )
+                self._materialize_pending_talker_history(pending_talker_items)
+                materialized_history = True
+
+            for req_index in req_indices:
+                req_id = self.input_batch.req_ids[req_index]
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
                 # mimo-audio check
@@ -1916,6 +1960,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 # Seed, so a model that samples inside forward() can be
                 # reproducible: vLLM's own sampler seeding does not reach it.
                 req_infos["_omni_seed"] = getattr(sampling_params, "seed", None)
+                has_accepted_history = history_enabled and req_index in history_req_index_set
                 if callable(batch_decode_preprocess) and span_len == 1 and not is_prefill and not history_enabled:
                     decode_batch_items.append((req_id, s, req_infos))
                     continue
@@ -1924,9 +1969,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
                 if history_enabled:
-                    self._materialize_pending_talker_history(
-                        [(req_id, num_computed_tokens, preprocess_input_ids[s:e], embed_slice, req_infos)]
-                    )
+                    if has_accepted_history:
+                        materialize_history_pending()
                     req_input_ids, req_embeds, update_dict = preprocess_talker_history(
                         self.model,
                         req_state,
@@ -1994,13 +2038,16 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self,
         items: list[tuple[str, int, torch.Tensor, torch.Tensor | None, dict[str, Any]]],
     ) -> None:
-        """Resolve each pending accepted primary before replaying its input."""
+        """Batch pending request-local Talker codec decisions for this step."""
+        pending: list[tuple[int, Any]] = []
+        primaries: list[torch.Tensor] = []
+        hidden_rows: list[torch.Tensor] = []
         for req_id, row_start, input_ids, input_embeds, payload in items:
             if input_embeds is None:
-                raise ValueError("Talker pending codec production requires model input embeddings")
+                raise ValueError("Talker pending codec batching requires model input embeddings")
             req_state = self.requests.get(req_id)
             if req_state is None:
-                raise ValueError("Talker pending codec production requires a retained request state")
+                raise ValueError("Talker pending codec batching requires a retained request state")
             collected = collect_pending_talker_primary(
                 self.model,
                 req_state,
@@ -2013,15 +2060,26 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             if collected is None:
                 continue
             pending_position, primary, hidden = collected
-            codes, embeddings = self._predict_talker_codes(primary, hidden)
-            # MTP outputs alias reusable graph storage. Both snapshots must
-            # survive another request's invocation before this input is used.
+            pending.append((pending_position, req_state))
+            primaries.append(primary)
+            hidden_rows.append(hidden)
+        if not pending:
+            return
+        primary_batch = primaries[0] if len(primaries) == 1 else torch.cat(primaries, dim=0)
+        hidden_batch = hidden_rows[0] if len(hidden_rows) == 1 else torch.cat(hidden_rows, dim=0)
+        codes, embeddings = self._predict_talker_codes(primary_batch, hidden_batch)
+        owned_codes = codes.reshape(len(pending), -1).detach().clone()
+        # Step-local graph views: preprocess_talker_history consumes and clears
+        # these before the next MTP invocation can reuse graph storage. Codes
+        # above remain durable request history and must still be cloned.
+        step_embeddings = embeddings.reshape(len(pending), -1).detach()
+        for row, (pending_position, req_state) in enumerate(pending):
             install_pending_talker_primary(
                 self.model,
                 req_state,
                 pending_position=pending_position,
-                codes=codes.reshape(-1).detach().clone(),
-                embedding=embeddings.reshape(1, -1).detach().clone(),
+                codes=owned_codes[row],
+                embedding=step_embeddings[row],
             )
 
     def _invoke_talker_mtp(

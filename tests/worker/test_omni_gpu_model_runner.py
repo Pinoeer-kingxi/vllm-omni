@@ -139,6 +139,146 @@ def test_model_forward_keeps_auxiliary_hidden_tuple(monkeypatch):
     assert runner._model_forward() is auxiliary
 
 
+def test_request_local_talker_history_batches_pending_predictor_once(mocker):
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
+    from vllm_omni.worker.talker_history import bind_talker_history
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(
+        talker=SimpleNamespace(num_code_groups=3),
+        talker_config=SimpleNamespace(text_config=SimpleNamespace(vocab_size=32)),
+    )
+    states = {}
+    payloads = {}
+    owners = {}
+    for index, req_id in enumerate(("a", "b")):
+        owner = PrefixCacheRequestOwner(index + 1)
+        state = SimpleNamespace(
+            prompt_token_ids=[100, 101],
+            output_token_ids=[7 + index],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        bind_talker_history(state, owner)
+        states[req_id] = state
+        owners[req_id] = owner
+        payloads[req_id] = {
+            "hidden_states": {"last": torch.full((4,), index + 1, dtype=torch.bfloat16)},
+            "meta": {},
+        }
+    runner.requests = states
+    calls = []
+
+    def predict(primary, hidden):
+        calls.append((primary.clone(), hidden.clone()))
+        codes = torch.tensor([[[7], [2], [3]], [[8], [4], [5]]], dtype=torch.long)
+        embeds = torch.tensor([[[10.0, 10.0, 10.0, 10.0]], [[20.0, 20.0, 20.0, 20.0]]], dtype=torch.bfloat16)
+        return codes, embeds
+
+    runner._predict_talker_codes = predict
+
+    OmniGPUModelRunner._materialize_pending_talker_history(
+        runner,
+        [
+            ("a", 2, torch.tensor([7]), torch.zeros(1, 4, dtype=torch.bfloat16), payloads["a"]),
+            ("b", 2, torch.tensor([8]), torch.zeros(1, 4, dtype=torch.bfloat16), payloads["b"]),
+        ],
+    )
+
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0][0], torch.tensor([[7], [8]]))
+    torch.testing.assert_close(calls[0][1], torch.tensor([[[1, 1, 1, 1]], [[2, 2, 2, 2]]], dtype=torch.bfloat16))
+    torch.testing.assert_close(states["a"].talker_codec_inputs[0], torch.tensor([7, 2, 3]))
+    torch.testing.assert_close(states["b"].talker_codec_inputs[0], torch.tensor([8, 4, 5]))
+    torch.testing.assert_close(states["a"].talker_next_input_embedding, torch.full((1, 4), 10, dtype=torch.bfloat16))
+    torch.testing.assert_close(states["b"].talker_next_input_embedding, torch.full((1, 4), 20, dtype=torch.bfloat16))
+
+
+def test_request_local_talker_step_embeddings_are_consumed_before_next_mtp_reuse(monkeypatch):
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
+    from vllm_omni.worker.talker_history import bind_talker_history, preprocess_talker_history
+
+    runner = object.__new__(OmniGPUModelRunner)
+    replay_outputs = []
+
+    def talker_replay_inputs(input_ids, input_embeds, **kwargs):
+        codec_embeddings = kwargs["codec_embeddings"]
+        assert codec_embeddings is not None
+        replay_outputs.append(codec_embeddings + input_ids.reshape(-1, 1).to(codec_embeddings.dtype))
+        return input_ids, replay_outputs[-1], {}
+
+    runner.model = SimpleNamespace(
+        talker=SimpleNamespace(num_code_groups=3),
+        talker_config=SimpleNamespace(text_config=SimpleNamespace(vocab_size=32)),
+        talker_replay_inputs=talker_replay_inputs,
+    )
+    states = {}
+    items = []
+    for index, req_id in enumerate(("a", "b")):
+        state = SimpleNamespace(
+            prompt_token_ids=[100, 101],
+            output_token_ids=[7 + index],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        bind_talker_history(state, PrefixCacheRequestOwner(index + 1))
+        states[req_id] = state
+        items.append(
+            (
+                req_id,
+                2,
+                torch.tensor([7 + index]),
+                torch.zeros(1, 4, dtype=torch.bfloat16),
+                {"hidden_states": {"last": torch.full((4,), index + 1, dtype=torch.bfloat16)}, "meta": {}},
+            )
+        )
+    runner.requests = states
+    codes_source = torch.tensor([[[7], [2], [3]], [[8], [4], [5]]], dtype=torch.long)
+    embeddings_source = torch.tensor([[[10.0, 10.0, 10.0, 10.0]], [[20.0, 20.0, 20.0, 20.0]]], dtype=torch.bfloat16)
+    runner._predict_talker_codes = lambda primary, hidden: (codes_source, embeddings_source)
+    original_clone = torch.Tensor.clone
+    embedding_storage = embeddings_source.untyped_storage().data_ptr()
+
+    def clone_spy(self, *args, **kwargs):
+        if self.untyped_storage().data_ptr() == embedding_storage:
+            raise AssertionError("step-local pending embeddings must not be cloned")
+        return original_clone(self, *args, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(torch.Tensor, "clone", clone_spy)
+        OmniGPUModelRunner._materialize_pending_talker_history(runner, items)
+    codes_source.fill_(99)
+    torch.testing.assert_close(states["a"].talker_codec_inputs[0], torch.tensor([7, 2, 3]))
+    torch.testing.assert_close(states["b"].talker_codec_inputs[0], torch.tensor([8, 4, 5]))
+
+    first_ids, first_embeds, _ = preprocess_talker_history(
+        runner.model,
+        states["a"],
+        row_start=2,
+        input_ids=torch.tensor([7]),
+        input_embeds=torch.zeros(1, 4, dtype=torch.bfloat16),
+        payload={"hidden_states": {"last": torch.ones(4, dtype=torch.bfloat16)}, "meta": {"decode_flag": True}},
+    )
+    second_ids, second_embeds, _ = preprocess_talker_history(
+        runner.model,
+        states["b"],
+        row_start=2,
+        input_ids=torch.tensor([8]),
+        input_embeds=torch.zeros(1, 4, dtype=torch.bfloat16),
+        payload={"hidden_states": {"last": torch.ones(4, dtype=torch.bfloat16)}, "meta": {"decode_flag": True}},
+    )
+
+    assert first_ids.tolist() == [7]
+    assert second_ids.tolist() == [8]
+    assert states["a"].talker_next_input_embedding is None
+    assert states["b"].talker_next_input_embedding is None
+    embeddings_source.fill_(-100)
+    torch.testing.assert_close(first_embeds, torch.full((1, 4), 17, dtype=torch.bfloat16))
+    torch.testing.assert_close(second_embeds, torch.full((1, 4), 28, dtype=torch.bfloat16))
+
+
 def _runner_for_talker_graph_init(
     *,
     talker_mtp_graph_safe: bool | None,
@@ -1206,6 +1346,115 @@ def test_preprocess_one_token_chunked_prefill_tail_then_decode(monkeypatch, batc
         assert route == ("batch" if batched_decode and not is_prefill else "normal")
         torch.testing.assert_close(embeds, torch.full((1, 4), 42.0 if is_prefill else 43.0))
         assert ("codes" in runner.model_intermediate_buffer["r"]) == (not is_prefill)
+
+
+def _make_history_order_runner(monkeypatch, rows, *, accepted_ids):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    runner, scheduled, calls, batch_calls = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    runner._talker_history_enabled = True
+    runner.has_talker_mtp = False
+    runner.model = SimpleNamespace(has_preprocess=True)
+    events: list[tuple[str, list[str]] | tuple[str, str, int]] = []
+    materialized = []
+    for index, (req_id, prompt_len, _computed, _scheduled) in enumerate(rows):
+        state = runner.requests[req_id]
+        state.prompt_token_ids = list(range(prompt_len))
+        state.output_token_ids = list(accepted_ids.get(req_id, ()))
+        state.sampling_params = SimpleNamespace(max_tokens=8)
+        runner.model_intermediate_buffer[req_id]["hidden_states"] = {
+            "last": torch.full((4,), index + 1, dtype=torch.float32)
+        }
+
+    def materialize(items):
+        events.append(("materialize", [req_id for req_id, *_ in items]))
+        materialized.append(
+            {
+                "input_ids": [input_ids.clone() for _req_id, _row_start, input_ids, _input_embeds, _payload in items],
+                "hidden": [
+                    payload["hidden_states"]["last"].clone()
+                    for _req_id, _row_start, _input_ids, _input_embeds, payload in items
+                ],
+            }
+        )
+
+    def preprocess_talker_history(_model, _state, *, row_start, input_ids, input_embeds, payload):
+        phase = "history" if _state.output_token_ids else "fresh"
+        events.append((phase, payload["request_id"], row_start))
+        embeds = input_ids.float().view(-1, 1).expand(-1, 4).clone()
+        if phase == "fresh":
+            embeds += 100
+        return input_ids, embeds, {"history_marker": payload["request_id"]}
+
+    def preprocess(input_ids, input_embeds, **info):
+        raise AssertionError("request-local history mode must use preprocess_talker_history")
+
+    runner.model.preprocess = preprocess
+    monkeypatch.setattr(runner, "_materialize_pending_talker_history", materialize)
+    monkeypatch.setattr(mod, "preprocess_talker_history", preprocess_talker_history)
+    return runner, scheduled, events, materialized, calls, batch_calls
+
+
+def test_request_local_history_orders_fresh_prefill_before_pending_materialize(monkeypatch):
+    rows = [
+        ("decode-first", 4, 4, 1),
+        ("fresh-prefill-later", 5, 0, 2),
+        ("resumed-prefill", 6, 0, 3),
+    ]
+    runner, scheduled, events, materialized, _, _ = _make_history_order_runner(
+        monkeypatch,
+        rows,
+        accepted_ids={"decode-first": [11], "resumed-prefill": [12]},
+    )
+
+    _, embeds, *_ = runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+
+    assert events == [
+        ("fresh", "fresh-prefill-later", 0),
+        ("materialize", ["decode-first", "resumed-prefill"]),
+        ("history", "decode-first", 4),
+        ("history", "resumed-prefill", 0),
+    ]
+    assert len(materialized) == 1
+    assert [ids.tolist() for ids in materialized[0]["input_ids"]] == [[0], [3, 4, 5]]
+    assert [hidden.tolist() for hidden in materialized[0]["hidden"]] == [[1.0] * 4, [3.0] * 4]
+    torch.testing.assert_close(embeds[1:3], torch.tensor([[101.0] * 4, [102.0] * 4]))
+    torch.testing.assert_close(embeds[0], torch.zeros(4))
+    torch.testing.assert_close(embeds[3:6], torch.tensor([[3.0] * 4, [4.0] * 4, [5.0] * 4]))
+
+
+def test_request_local_history_all_fresh_keeps_order_without_materialize(monkeypatch):
+    rows = [
+        ("fresh-a", 5, 0, 1),
+        ("fresh-b", 6, 2, 2),
+    ]
+    runner, scheduled, events, materialized, _, _ = _make_history_order_runner(monkeypatch, rows, accepted_ids={})
+
+    runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+
+    assert events == [
+        ("fresh", "fresh-a", 0),
+        ("fresh", "fresh-b", 2),
+    ]
+    assert materialized == []
+
+
+def test_request_local_history_disabled_preserves_original_mixed_order(monkeypatch):
+    rows = [
+        ("decode-first", 4, 4, 1),
+        ("fresh-prefill-later", 5, 0, 2),
+        ("resumed-prefill", 6, 0, 3),
+    ]
+    runner, scheduled, calls, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    runner._talker_history_enabled = False
+
+    runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+
+    assert [info["request_id"] for _route, info in calls] == [
+        "decode-first",
+        "fresh-prefill-later",
+        "resumed-prefill",
+    ]
 
 
 class DecodeOnlyPreprocessModel:
