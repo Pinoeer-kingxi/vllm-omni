@@ -533,3 +533,121 @@ def _generate_pair(engine, name, *, preempt=False, evict=False, reorder=False):
         assert sum(len(output.new_token_ids) for output in outputs[request.request_id]) == 18
         assert _emitted_codes(outputs[request.request_id]).shape == (request.num_prompt_tokens + 17, 16)
     return [(request, outputs[request.request_id]) for request in requests]
+
+
+def test_full_checkpoint_new_prefill_preserves_pending_history(talker_engine, monkeypatch):
+    engine = talker_engine
+    if not engine.vllm_config.cache_config.enable_prefix_caching:
+        pytest.skip("request-local ordering is specific to the guarded cache path")
+    assert engine.reset_prefix_cache()
+    torch.manual_seed(321)
+    accepted = _request(engine, "ongoing-before-prefill")
+    fresh = _request(engine, "new-during-decode")
+    runner = engine.model_executor.driver_worker.worker.model_runner
+    outputs: dict[str, list[OmniEngineCoreOutput]] = {accepted.request_id: [], fresh.request_id: []}
+    materialize = runner._materialize_pending_talker_history
+    batch_sizes = []
+    checked_mixed = False
+    hidden_before = None
+    codes_before = None
+
+    def materialize_live(items):
+        nonlocal checked_mixed
+        if fresh.request_id in runner.requests and not runner.requests[fresh.request_id].output_token_ids:
+            # Fresh prefill must already have initialized its own cursor, while
+            # the other request's pending producer still sees its original state.
+            assert (
+                runner.model_intermediate_buffer[fresh.request_id]["meta"]["num_processed_tokens"]
+                == fresh.num_prompt_tokens
+            )
+            torch.testing.assert_close(
+                runner.model_intermediate_buffer[accepted.request_id]["hidden_states"]["last"],
+                hidden_before,
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                torch.stack(runner.requests[accepted.request_id].talker_codec_inputs),
+                codes_before,
+                rtol=0,
+                atol=0,
+            )
+            checked_mixed = True
+        pending_before = sum(
+            len(runner.requests[req_id].talker_codec_inputs) < len(runner.requests[req_id].output_token_ids)
+            for req_id, *_ in items
+        )
+        materialize(items)
+        if pending_before:
+            batch_sizes.append(pending_before)
+
+    monkeypatch.setattr(runner, "_materialize_pending_talker_history", materialize_live)
+    engine.add_request(accepted)
+    added = False
+    for _ in range(64):
+        result, _ = engine.step_fn()
+        for batch in (result or {}).values():
+            for output in batch.outputs:
+                outputs[output.request_id].append(output)
+        _assert_no_pending_talker_embeddings(runner)
+        if not added and accepted.num_output_tokens >= 6:
+            hidden_before = runner.model_intermediate_buffer[accepted.request_id]["hidden_states"]["last"].clone()
+            codes_before = torch.stack(runner.requests[accepted.request_id].talker_codec_inputs).clone()
+            engine.add_request(fresh)
+            added = True
+        if added and accepted.is_finished() and fresh.is_finished() and not engine.batch_queue:
+            break
+    assert checked_mixed
+    assert max(batch_sizes) == 2
+    assert sum(batch_sizes) == 34, "each nonterminal accepted primary is materialized exactly once"
+    for request in (accepted, fresh):
+        assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+        assert sum(len(output.new_token_ids) for output in outputs[request.request_id]) == 18
+        assert _emitted_codes(outputs[request.request_id]).shape == (request.num_prompt_tokens + 17, 16)
+
+
+def test_full_checkpoint_two_live_requests_keep_batched_mtp(talker_engine, checkpoint_code2wav, cache_off_reference):
+    engine = talker_engine
+    assert engine.reset_prefix_cache()
+    torch.manual_seed(321)
+    cold = _generate_pair(engine, "batch-cold")
+    reference = [
+        (
+            list(request.output_token_ids),
+            _emitted_codes(outputs).clone(),
+            _decode_emitted_codes(checkpoint_code2wav, request, outputs),
+        )
+        for request, outputs in cold
+    ]
+    if not engine.vllm_config.cache_config.enable_prefix_caching:
+        cache_off_reference["batch"] = reference
+        return
+    assert "batch" in cache_off_reference, "run the complete module with its cache-off oracle"
+    for before, after in zip(cache_off_reference["batch"], reference, strict=True):
+        assert before[0] == after[0]
+        torch.testing.assert_close(before[1], after[1], rtol=0, atol=0)
+        torch.testing.assert_close(before[2], after[2], rtol=0, atol=0)
+    for name, preempt, evict in (("warm", False, False), ("resume", True, False), ("evicted", True, True)):
+        torch.manual_seed(321)
+        actual = _generate_pair(engine, f"batch-{name}", preempt=preempt, evict=evict)
+        if name == "warm":
+            assert all(
+                any(output.prefill_stats and output.prefill_stats.num_cached_tokens > 0 for output in outputs)
+                for _, outputs in actual
+            )
+        for (request, outputs), (tokens, codes, wave) in zip(actual, reference, strict=True):
+            assert list(request.output_token_ids) == tokens, name
+            torch.testing.assert_close(_emitted_codes(outputs), codes, rtol=0, atol=0)
+            torch.testing.assert_close(
+                _decode_emitted_codes(checkpoint_code2wav, request, outputs), wave, rtol=0, atol=0
+            )
+    # Global residual sampling is row-ordered. Reordering may change future
+    # samples, but must not regenerate accepted input decisions or duplicate
+    # their delivery. The helper also checks the actual reordered MTP batches.
+    torch.manual_seed(321)
+    reordered = _generate_pair(engine, "batch-reordered", preempt=True, evict=True, reorder=True)
+    for (request, outputs), (tokens, codes, _wave) in zip(reordered, reference, strict=True):
+        assert list(request.output_token_ids[:6]) == tokens[:6]
+        prefix_end = request.num_prompt_tokens + 5
+        torch.testing.assert_close(_emitted_codes(outputs)[:prefix_end], codes[:prefix_end], rtol=0, atol=0)
+        _decode_emitted_codes(checkpoint_code2wav, request, outputs)
