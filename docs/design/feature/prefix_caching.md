@@ -218,6 +218,14 @@ fixed conditioning and these decisions without resampling. Replacement clears
 that history; resume requires the same content owner and accepted frontier.
 Codec history is not carried in client metadata or scheduler IPC.
 
+For full-payload connector delivery, the runner constructs `codes.audio` once
+at the request-end flush from this history instead of caching and copying it
+on every step. The snapshot contains prompt-zero rows and the first N-1 codec
+decisions for N accepted primaries; the terminal primary has no next-input row.
+Retired owners cannot publish this snapshot. Connector-less delivery keeps its
+existing cached codec payload path, and same-owner abort cleanup preserves the
+transport's existing partial-output behavior.
+
 The test-only worker and deploy profile are checked in under
 `tests/model_executor/models/qwen3_omni/`. They bypass only the public Talker
 support refusal, retain the KV/layout/token-accounting checks, and do not
