@@ -346,8 +346,8 @@ class OmniSchedulingCoordinator:
         For AR mode: only scheduler-visible metadata is applied locally.
         For Generation mode: updates ``request.prompt_token_ids``.
 
-        Additionally, if the payload contains ``next_stage_prompt_len``,
-        updates the request's ``prompt_token_ids`` to the correct length.
+        Actual codec IDs take precedence over length-only placeholders in
+        generation mode. Each notice prepares and installs at most one input.
         """
         for req_id, metadata in request_metadata.items():
             request = requests.get(req_id)
@@ -363,7 +363,12 @@ class OmniSchedulingCoordinator:
             conditioning_digest = metadata.get("next_stage_conditioning_digest")
             if conditioning_digest is not None and (model_mode != "ar" or next_ids is None or next_len is None):
                 raise ValueError("conditioning digest requires IDs and length in one AR input notice")
-            if model_mode == "ar" and next_ids is not None:
+            codec_ids = (
+                self._flatten_prompt_token_ids(metadata.get("code_predictor_codes")) if model_mode != "ar" else None
+            )
+            if codec_ids:
+                self._finalize_prompt(request, codec_ids)
+            elif model_mode == "ar" and next_ids is not None:
                 if (
                     not isinstance(next_ids, list)
                     or not next_ids
@@ -387,46 +392,40 @@ class OmniSchedulingCoordinator:
             # Only apply when the request has not started decoding yet
             # (no output tokens). Resetting a mid-decode request would
             # destroy generated tokens and desync KV cache state.
-            elif "next_stage_prompt_len" in metadata:
-                if next_len is not None:
-                    output_token_ids = getattr(request, "_output_token_ids", None)
-                    if model_mode == "ar" and getattr(request, "_omni_input_finalized", False):
-                        if next_len != request.num_prompt_tokens:
-                            raise ValueError(
-                                f"conflicting finalized prompt length for req {req_id}: "
-                                f"{request.num_prompt_tokens} != {next_len}"
-                            )
-                    elif output_token_ids is not None and len(output_token_ids) > 0:
-                        logger.debug(
-                            "[Coordinator stage-%s] Skipping prompt resize for req %s: "
-                            "request already has %s output tokens",
-                            self._stage_id,
-                            req_id,
-                            len(output_token_ids),
+            elif next_len is not None:
+                if model_mode == "ar" and getattr(request, "_omni_input_finalized", False):
+                    if next_len != request.num_prompt_tokens:
+                        raise ValueError(
+                            f"conflicting finalized prompt length for req {req_id}: "
+                            f"{request.num_prompt_tokens} != {next_len}"
                         )
-                    else:
-                        current_prompt_ids = getattr(request, "prompt_token_ids", []) or []
-                        current_prompt_len = len(current_prompt_ids)
-                        if current_prompt_len != next_len or getattr(request, "num_prompt_tokens", None) != next_len:
-                            self._finalize_prompt(request, [0] * next_len)
-                            logger.debug(
-                                "[Coordinator stage-%s] Updated prompt_token_ids length to %s for req %s",
-                                self._stage_id,
-                                next_len,
-                                req_id,
-                            )
-                        elif not getattr(request, "_omni_input_finalized", False):
-                            self._finalize_prompt(request, current_prompt_ids)
+                elif request.num_output_tokens > 0:
+                    logger.debug(
+                        "[Coordinator stage-%s] Skipping prompt resize for req %s: "
+                        "request already has %s output tokens",
+                        self._stage_id,
+                        req_id,
+                        request.num_output_tokens,
+                    )
+                else:
+                    current_prompt_ids = request.prompt_token_ids or []
+                    if len(current_prompt_ids) != next_len or request.num_prompt_tokens != next_len:
+                        self._finalize_prompt(request, [0] * next_len)
+                        logger.debug(
+                            "[Coordinator stage-%s] Updated prompt_token_ids length to %s for req %s",
+                            self._stage_id,
+                            next_len,
+                            req_id,
+                        )
+                    elif not getattr(request, "_omni_input_finalized", False):
+                        self._finalize_prompt(request, current_prompt_ids)
 
             if model_mode != "ar":
-                new_ids = self._flatten_prompt_token_ids(metadata.get("code_predictor_codes"))
                 runtime_seed = None
                 if "left_context_size" in metadata:
                     runtime_seed = {
                         "meta": {"left_context_size": metadata["left_context_size"]},
                     }
-                if new_ids:
-                    self._finalize_prompt(request, new_ids)
                 request._omni_initial_model_buffer = runtime_seed
 
             if metadata.get("input_terminal") is True:

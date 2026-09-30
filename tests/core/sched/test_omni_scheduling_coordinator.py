@@ -229,6 +229,66 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req._output_token_ids, [])
 
 
+@pytest.mark.parametrize("prompt_len", [None, 4, 12])
+@pytest.mark.parametrize("codes", [[1, 2, 3, 4], [[1, 2], [3, 4]], torch.tensor([[1, 2], [3, 4]])])
+def test_generation_notice_hashes_actual_codec_input_once(prompt_len, codes, mocker):
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(4, sha256)
+    request = Request(
+        request_id="r1",
+        prompt_token_ids=[0] * 8,
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        block_hasher=hasher,
+    )
+    old_ids = request.all_token_ids
+    prepare = mocker.spy(coord_mod, "prepare_request_input")
+    coordinator = OmniSchedulingCoordinator(stage_id=2)
+    coordinator.update_request_metadata(
+        {"r1": request},
+        {
+            "r1": {
+                "next_stage_prompt_len": prompt_len,
+                "code_predictor_codes": codes,
+                "left_context_size": 2,
+                "input_terminal": True,
+            }
+        },
+        model_mode="generation",
+    )
+    fresh = Request(
+        request_id="fresh",
+        prompt_token_ids=[1, 2, 3, 4],
+        sampling_params=request.sampling_params,
+        pooling_params=None,
+        block_hasher=hasher,
+    )
+    assert prepare.call_count == 1
+    assert prepare.call_args.kwargs["prompt_token_ids"] == [1, 2, 3, 4]
+    assert list(request.all_token_ids) == [1, 2, 3, 4]
+    assert list(old_ids) == [0] * 8
+    assert request.block_hashes == fresh.block_hashes
+    assert request._omni_initial_model_buffer == {"meta": {"left_context_size": 2}}
+    assert coordinator.input_terminal_req_ids == {"r1"}
+
+
+def test_invalid_generation_codes_do_not_install_length_only_input():
+    request = _make_request("r1", status=RequestStatus.WAITING_FOR_INPUT)
+    coordinator = OmniSchedulingCoordinator(stage_id=2)
+    before = dict(request.__dict__)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        coordinator.update_request_metadata(
+            {"r1": request},
+            {"r1": {"next_stage_prompt_len": 4, "code_predictor_codes": [-1], "input_terminal": True}},
+            model_mode="generation",
+        )
+    assert request.__dict__ == before
+    assert not coordinator.input_terminal_req_ids
+
+
 @pytest.mark.parametrize("new_length", [4, 12])
 def test_initial_length_finalization_rebuilds_real_block_hashes(new_length):
     from vllm.sampling_params import SamplingParams

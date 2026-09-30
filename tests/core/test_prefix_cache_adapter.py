@@ -5,6 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.request import Request
 
 from vllm_omni.core.prefix_cache.adapter import (
     PrefixCacheEventKind,
@@ -209,7 +212,7 @@ def test_replayed_scheduler_step_does_not_rewrite_adapter_observations():
     last.prefix_cache_step_sequence = 2
     adapter.translate_step(last)
     assert adapter.translate_step(first).events == ()
-    assert "a" not in adapter._observed_req_ids
+    assert adapter.translate_scheduler_output(first)[0].kind is PrefixCacheEventKind.STARTED
 
 
 def test_stale_lookup_and_terminal_do_not_rewind_adapter_owner():
@@ -225,3 +228,24 @@ def test_stale_lookup_and_terminal_do_not_rewind_adapter_owner():
     assert all(event.kind is PrefixCacheEventKind.FINISHED for event in events)
     assert adapter._observed_owners["a"] == current
     assert adapter.translate_step(admitted).events[0].kind is PrefixCacheEventKind.EXTENDED
+
+
+@pytest.mark.parametrize("owner", [None, PrefixCacheRequestOwner(1)])
+def test_ownerless_cached_step_preserves_admission_until_terminal(owner):
+    adapter = PrefixCacheSchedulerAdapter()
+    request = Request(
+        request_id="a",
+        prompt_token_ids=[1, 2, 3, 4],
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+    )
+    admitted = output(new=[NewRequestData.from_request(request, block_ids=())])
+    admitted.prefix_cache_owners = {"a": owner} if owner is not None else {}
+    assert adapter.translate_step(admitted).events[0].kind is PrefixCacheEventKind.STARTED
+    cached = output(cached={"req_ids": ["a"], "num_computed_tokens": [4]})
+    assert adapter.translate_step(cached).events[0].kind is PrefixCacheEventKind.EXTENDED
+    assert adapter.translate_step(admitted).events[0].kind is PrefixCacheEventKind.EXTENDED
+    terminal = adapter.translate_step(output(finished=["a"])).events[0]
+    assert terminal.kind is PrefixCacheEventKind.FINISHED
+    assert terminal.owner == owner
+    assert adapter.translate_step(admitted).events[0].kind is PrefixCacheEventKind.STARTED

@@ -86,8 +86,7 @@ class PrefixCacheSchedulerAdapter:
     """
 
     def __init__(self) -> None:
-        self._observed_req_ids: set[str] = set()
-        self._observed_owners: dict[str, PrefixCacheRequestOwner] = {}
+        self._observed_owners: dict[str, PrefixCacheRequestOwner | None] = {}
         self._last_step_sequence = -1
 
     @staticmethod
@@ -129,7 +128,6 @@ class PrefixCacheSchedulerAdapter:
             terminal_owners[req_id] = terminal_owner
             if current_owner is None or terminal_owner is None or terminal_owner >= current_owner:
                 self._observed_owners.pop(req_id, None)
-                self._observed_req_ids.discard(req_id)
 
         cached_by_id: dict[str, tuple[int, Any, int]] = {}
         if cached is not None:
@@ -154,7 +152,6 @@ class PrefixCacheSchedulerAdapter:
             current_owner = self._observed_owners.get(event.req_id)
             if current_owner is not None and event.owner < current_owner:
                 continue
-            self._observed_req_ids.add(event.req_id)
             self._observed_owners[event.req_id] = event.owner
             events.append(event)
 
@@ -166,13 +163,10 @@ class PrefixCacheSchedulerAdapter:
                 continue
             kind: PrefixCacheEventKind = (
                 PrefixCacheEventKind.STARTED
-                if req_id not in self._observed_req_ids
-                or (owner is not None and self._observed_owners.get(req_id) != owner)
+                if req_id not in self._observed_owners or (owner is not None and current_owner != owner)
                 else PrefixCacheEventKind.EXTENDED
             )
-            self._observed_req_ids.add(req_id)
-            if owner is not None:
-                self._observed_owners[req_id] = owner
+            self._observed_owners[req_id] = owner if owner is not None else current_owner
             computed_tokens = int(getattr(data, "num_computed_tokens", 0) or 0)
             blocks = self._blocks(data)
             events.append(
@@ -193,9 +187,7 @@ class PrefixCacheSchedulerAdapter:
             current_owner = self._observed_owners.get(req_id)
             if owner is not None and current_owner is not None and owner < current_owner:
                 continue
-            self._observed_req_ids.add(req_id)
-            if owner is not None:
-                self._observed_owners[req_id] = owner
+            self._observed_owners[req_id] = owner if owner is not None else current_owner
             hit_end, resumed_blocks, num_output_tokens = cached_by_id.get(req_id, (0, None, 0))
             events.append(
                 PrefixCacheRequestEvent(
