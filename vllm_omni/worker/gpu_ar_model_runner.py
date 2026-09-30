@@ -67,6 +67,7 @@ from vllm_omni.worker.sampling_utils import (
     sanitize_min_tokens_stop_ids,
 )
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
+from vllm_omni.worker.talker_history import build_request_end_talker_codes
 
 logger = init_logger(__name__)
 
@@ -1187,11 +1188,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             else:
                 hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
             hidden_states_cpu = None
+            save_multimodal_outputs = (
+                self._strip_request_local_talker_codes(multimodal_outputs)
+                if self._should_use_request_local_talker_snapshot()
+                else multimodal_outputs
+            )
             # Prefix-cache write: freeze + submit; policy gating (full
             # hidden, skip/deferred keys) happens inside the manager.
             prefix_cache_step_id = self._prefix_cache_save_step(
                 hidden_states,
-                multimodal_outputs,
+                save_multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
             )
@@ -1597,6 +1603,40 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             and self._should_accumulate_full_payload_output()
         )
 
+    def _should_use_request_local_talker_snapshot(self) -> bool:
+        """Use runner-owned codec history as the final Qwen full payload."""
+        return (
+            bool(getattr(self, "_talker_history_enabled", False))
+            and self.omni_prefix_cache is not None
+            and self._should_accumulate_full_payload_output()
+        )
+
+    @staticmethod
+    def _strip_request_local_talker_codes(payload: Any) -> Any:
+        """Remove ``codes.audio`` while preserving unrelated payload keys."""
+        if not isinstance(payload, dict):
+            return payload
+        stripped = flatten_payload(payload)
+        stripped.pop("codes.audio", None)
+        return stripped or None
+
+    def _materialize_full_payload_entry(self, entry):
+        output, request = super()._materialize_full_payload_entry(entry)
+        if not self._should_use_request_local_talker_snapshot():
+            return output, request
+        owner = entry[4] if len(entry) > 4 else None
+        if owner is not None and getattr(owner, "retired", False):
+            return output, request
+        if request is None:
+            raise ValueError("Talker request-end snapshot requires a retained request")
+        output = dict(output)
+        output["codes.audio"] = build_request_end_talker_codes(
+            self.model,
+            request,
+            owner=getattr(owner, "owner", None),
+        )
+        return output, request
+
     def _build_omni_step_outputs(
         self,
         pooler_inter: Sequence[dict[str, object] | None] | None,
@@ -1799,7 +1839,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
-        defer_full_payload_d2h = needs_pooler_payload and self._should_defer_full_payload_d2h()
+        request_local_talker_snapshot = needs_pooler_payload and self._should_use_request_local_talker_snapshot()
+        defer_full_payload_d2h = needs_pooler_payload and (
+            self._should_defer_full_payload_d2h() or request_local_talker_snapshot
+        )
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         include_hidden_payload = self._model_omni_pooler_payload_include_hidden()
@@ -1850,8 +1893,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 if cache_outputs is not None:
                     combined_hidden_states = cache_outputs.hidden_states
                     combined_multimodal_outputs = cache_outputs.mm_outputs or None
+                    if request_local_talker_snapshot:
+                        combined_multimodal_outputs = self._strip_request_local_talker_codes(
+                            combined_multimodal_outputs
+                        )
             if combined_multimodal_outputs is None:
-                flat_mm = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
+                if request_local_talker_snapshot:
+                    flat_mm = self._strip_request_local_talker_codes(multimodal_outputs)
+                else:
+                    flat_mm = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
                 if defer_full_payload_d2h:
                     with record_function_or_nullcontext("omni_output_builder:snapshot_mm_payload"):
                         mm_cpu = snapshot_mm_payload(flat_mm)
@@ -1882,6 +1932,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 )
                 combined_hidden_states = delivery.hidden_states
                 combined_multimodal_outputs = delivery.mm_outputs or None
+                if request_local_talker_snapshot:
+                    combined_multimodal_outputs = self._strip_request_local_talker_codes(combined_multimodal_outputs)
 
             pooler_output = []
             with record_function_or_nullcontext("omni_output_builder:build_pooler_payloads"):
@@ -1971,7 +2023,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 for i, rid in enumerate(req_ids_output_copy):
                     req_state = self.requests.get(rid)
                     payload = pooler_inter[i] or {}
-                    if rid in live and rid in downstream_req_id_set and req_state is not None and payload:
+                    if (
+                        rid in live
+                        and rid in downstream_req_id_set
+                        and req_state is not None
+                        and (payload or request_local_talker_snapshot)
+                    ):
                         if cache_outputs is None:
                             self.accumulate_full_payload_output(rid, payload, req_state)
                         else:

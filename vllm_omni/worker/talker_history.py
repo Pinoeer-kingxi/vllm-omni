@@ -76,6 +76,36 @@ def _validate_history_frontier(state: Any, *, spec_groups: int) -> list[torch.Te
     return history
 
 
+def build_request_end_talker_codes(
+    model: Any,
+    state: Any,
+    *,
+    owner: PrefixCacheRequestOwner | None,
+) -> torch.Tensor:
+    """Build the request-end full-payload codec snapshot from local history.
+
+    Partial recompute can materialize the latest accepted primary before its
+    recompute sample is discarded, so the valid final/cleanup frontier is
+    N-1 or N local rows for N accepted primaries. The payload consumed by
+    Qwen code2wav remains aligned as prompt-zero rows plus only N-1 generated
+    codec decisions.
+    """
+    local_owner = getattr(state, "talker_codec_owner", None)
+    if not isinstance(local_owner, PrefixCacheRequestOwner) or owner != local_owner:
+        raise ValueError("Talker request-end snapshot requires matching local scheduler owner")
+    spec_groups = int(model.talker.num_code_groups)
+    history = _validate_history_frontier(state, spec_groups=spec_groups)
+    accepted = _accepted_output_tokens(state)
+    prompt_len = len(state.prompt_token_ids)
+    generated_rows = max(0, len(accepted) - 1)
+    rows = history[:generated_rows]
+    device = rows[0].device if rows else torch.device("cpu")
+    prompt = torch.zeros((prompt_len, spec_groups), dtype=torch.long, device=device)
+    if not rows:
+        return prompt
+    return torch.cat((prompt, torch.stack(rows, dim=0)), dim=0)
+
+
 def collect_pending_talker_primary(
     model: Any,
     state: Any,

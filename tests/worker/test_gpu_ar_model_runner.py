@@ -806,6 +806,187 @@ def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch):
     assert events == ["accumulate:r1", "accumulate:r2"]
 
 
+def _make_request_local_snapshot_runner():
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner._async_chunk = False
+    runner._talker_history_enabled = True
+    runner._pending_full_payload_send = {}
+    runner._full_payload_replace_keys_cached = frozenset()
+    runner.model_config = SimpleNamespace(
+        model_arch="Qwen3OmniMoeForConditionalGeneration",
+        model_stage="talker",
+        async_chunk=False,
+        custom_process_next_stage_input_func="module.full_payload",
+    )
+    runner.vllm_config.model_config = runner.model_config
+    runner._custom_process_func = object()
+    runner._omni_connector = object()
+    runner.model = SimpleNamespace(
+        has_postprocess=False,
+        talker=SimpleNamespace(num_code_groups=3),
+    )
+    owner = PrefixCacheRequestOwner(7)
+    request = SimpleNamespace(
+        prompt_token_ids=[100, 101],
+        output_token_ids=[11, 12, 13],
+        talker_codec_inputs=[
+            torch.tensor([1, 2, 3], dtype=torch.long),
+            torch.tensor([4, 5, 6], dtype=torch.long),
+            torch.tensor([7, 8, 9], dtype=torch.long),
+        ],
+        talker_codec_owner=owner,
+    )
+    runner.requests = {"r1": request}
+    runner.input_batch = SimpleNamespace(req_ids=["r1"], req_id_to_index={"r1": 0})
+    progress = PrefixCacheRequestProgress(owner=owner)
+    runner.omni_prefix_cache = _delivery_test_manager()
+    raw = StageCacheOutputs(
+        hidden_states=None,
+        mm_outputs={"codes.audio": {"r1": torch.tensor([[1, 2, 3]], dtype=torch.long)}},
+        token_ranges={"r1": (0, 1)},
+        scheduled_token_ranges={"r1": (0, 1)},
+        token_mm_keys=frozenset({"codes.audio"}),
+        _progress={"r1": progress},
+    )
+    return runner, raw, request, progress
+
+
+def test_request_local_snapshot_gate_strips_codes_and_keeps_empty_owner_handoff(monkeypatch):
+    runner, raw, request, _progress = _make_request_local_snapshot_runner()
+    accumulated = []
+
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", req_ids))
+    monkeypatch.setattr(
+        GPUARModelRunner, "_prepare_prefix_cache_pooler_payload_sources", lambda self, **kwargs: (None, raw)
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "accumulate_full_payload_output",
+        lambda self, rid, payload, req, **kwargs: accumulated.append((rid, payload, req, kwargs.get("owner"))),
+    )
+    monkeypatch.setattr("vllm_omni.worker.gpu_ar_model_runner.build_mm_cpu", lambda *_: pytest.fail("raw D2H"))
+
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(total_num_scheduled_tokens=1, num_scheduled_tokens={"r1": 1}),
+        hidden_states=torch.tensor([[1.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"codes": {"audio": torch.ones(1, 3)}},
+        req_ids_output_copy=["r1"],
+        req_id_to_index_output_copy={"r1": 0},
+        valid_sampled_token_ids=[[]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0], dtype=torch.long),
+        prefix_cache_step_id=7,
+    )
+
+    assert output.inter_stage_outputs is None
+    assert output.multimodal_outputs is None
+    assert accumulated == [("r1", {}, request, raw._progress["r1"])]
+
+
+def test_request_local_snapshot_strip_preserves_unrelated_payload_keys():
+    payload = {
+        "codes": {"audio": torch.tensor([[1]]), "ref": torch.tensor([[2]])},
+        "codes.audio": torch.tensor([[3]]),
+        "meta.finished": torch.tensor(False),
+    }
+
+    stripped = GPUARModelRunner._strip_request_local_talker_codes(payload)
+
+    assert set(stripped) == {"codes.ref", "meta.finished"}
+    assert stripped["codes.ref"] is payload["codes"]["ref"]
+    assert stripped["meta.finished"] is payload["meta.finished"]
+    assert "audio" in payload["codes"] and "codes.audio" in payload
+
+
+def test_request_local_snapshot_empty_handoff_stays_downstream_only(monkeypatch):
+    runner, raw, request, progress = _make_request_local_snapshot_runner()
+    other_owner = PrefixCacheRequestOwner(8)
+    other = SimpleNamespace(
+        prompt_token_ids=[200],
+        output_token_ids=[21],
+        talker_codec_inputs=[],
+        talker_codec_owner=other_owner,
+    )
+    runner.requests["r2"] = other
+    runner.input_batch = SimpleNamespace(req_ids=["r1", "r2"], req_id_to_index={"r1": 0, "r2": 1})
+    raw.mm_outputs["codes.audio"]["r2"] = torch.tensor([[9, 9, 9]], dtype=torch.long)
+    raw.token_ranges["r2"] = (0, 1)
+    raw.scheduled_token_ranges["r2"] = (0, 1)
+    raw._progress["r2"] = PrefixCacheRequestProgress(owner=other_owner)
+    accumulated = []
+
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", ["r1"]))
+    monkeypatch.setattr(
+        GPUARModelRunner, "_prepare_prefix_cache_pooler_payload_sources", lambda self, **kwargs: (None, raw)
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "accumulate_full_payload_output",
+        lambda self, rid, payload, req, **kwargs: accumulated.append((rid, payload, req, kwargs.get("owner"))),
+    )
+
+    GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(total_num_scheduled_tokens=2, num_scheduled_tokens={"r1": 1, "r2": 1}),
+        hidden_states=torch.tensor([[1.0], [2.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"codes": {"audio": torch.ones(2, 3)}},
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[], []],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
+        prefix_cache_step_id=7,
+        excluded_output_req_ids=frozenset({"r2"}),
+    )
+
+    assert accumulated == [("r1", {}, request, progress)]
+
+
+def test_request_local_snapshot_materializes_codes_once_at_flush():
+    runner, _raw, request, progress = _make_request_local_snapshot_runner()
+    stored = {"hidden": torch.tensor([[1.0]])}
+    entry: tuple[Any, ...] = ({}, stored, {}, request, progress)
+
+    output, returned_request = GPUARModelRunner._materialize_full_payload_entry(runner, entry)
+
+    assert returned_request is request
+    assert output["hidden"].tolist() == [[1.0]]
+    assert output["codes.audio"].tolist() == [
+        [0, 0, 0],
+        [0, 0, 0],
+        [1, 2, 3],
+        [4, 5, 6],
+    ]
+    output["codes.audio"][-1].fill_(99)
+    assert request.talker_codec_inputs[1].tolist() == [4, 5, 6]
+
+
+def test_request_local_snapshot_materialize_drops_retired_owner():
+    runner, _raw, request, progress = _make_request_local_snapshot_runner()
+    progress.retired = True
+
+    assert GPUARModelRunner._materialize_full_payload_entry(runner, ({}, {}, {}, request, progress))[0] == {}
+
+
 def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatch):
     runner = _make_async_output_runner(engine_output_type="latent")
 

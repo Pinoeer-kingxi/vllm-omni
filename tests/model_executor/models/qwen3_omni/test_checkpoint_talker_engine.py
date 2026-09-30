@@ -20,6 +20,7 @@ import time
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -35,6 +36,7 @@ from vllm.v1.request import RequestStatus
 from tests.model_executor.models.qwen3_omni.qualification_worker import (
     qualification_prefix_config as _qualification_prefix_config,
 )
+from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
@@ -42,7 +44,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_code2wav import Qwen3
 from vllm_omni.model_executor.stage_input_processors.qwen3_omni import talker2code2wav_full_payload
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.request import OmniRequest
-from vllm_omni.worker import gpu_model_runner
+from vllm_omni.worker import gpu_ar_model_runner, gpu_model_runner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.omni]
 
@@ -651,3 +653,163 @@ def test_full_checkpoint_two_live_requests_keep_batched_mtp(talker_engine, check
         prefix_end = request.num_prompt_tokens + 5
         torch.testing.assert_close(_emitted_codes(outputs)[:prefix_end], codes[:prefix_end], rtol=0, atol=0)
         _decode_emitted_codes(checkpoint_code2wav, request, outputs)
+
+
+@pytest.mark.parametrize("temperature", [0, 0.7], ids=["greedy", "sampled"])
+@torch.inference_mode()
+def test_full_checkpoint_request_end_history_matches_cache_off(
+    talker_engine, checkpoint_code2wav, cache_off_reference, temperature, monkeypatch
+):
+    engine = talker_engine
+    if not engine.vllm_config.cache_config.enable_prefix_caching:
+        pytest.skip("request-local history requires the guarded cache path")
+    assert temperature in cache_off_reference, "run the full module for the independent cache-off oracle"
+    off_tokens, off_codes, off_wave = cache_off_reference[temperature]
+    runner = engine.model_executor.driver_worker.worker.model_runner
+    # Drain earlier requests before opting this connector-less harness into
+    # the production full-payload accumulator. Observe the real flush boundary,
+    # not the per-step wire payload used by the other engine tests.
+    engine.step_fn()
+    assert not runner._pending_full_payload_send
+    captured: dict[str, tuple[dict[str, Any], Any]] = {}
+
+    def capture_send(*, scheduler_output, outputs):
+        assert scheduler_output is None
+        for rid, (payload, state) in outputs.items():
+            assert rid not in captured, "request-end payload must flush exactly once"
+            captured[rid] = (payload, state)
+        return list(outputs)
+
+    save_step = runner._prefix_cache_save_step
+
+    def save_without_duplicate_codes(hidden, multimodal, **kwargs):
+        assert "codes.audio" not in flatten_payload(multimodal or {})
+        return save_step(hidden, multimodal, **kwargs)
+
+    build_mm_cpu = gpu_ar_model_runner.build_mm_cpu
+    snapshot_mm_payload = gpu_ar_model_runner.snapshot_mm_payload
+
+    def cpu_without_codes(payload):
+        assert "codes.audio" not in (payload or {})
+        return build_mm_cpu(payload)
+
+    def snapshot_without_codes(payload):
+        assert "codes.audio" not in (payload or {})
+        return snapshot_mm_payload(payload)
+
+    monkeypatch.setattr(runner, "_should_accumulate_full_payload_output", lambda: True)
+    monkeypatch.setattr(runner, "send_full_payload_outputs", capture_send)
+    monkeypatch.setattr(runner, "_prefix_cache_save_step", save_without_duplicate_codes)
+    monkeypatch.setattr(gpu_ar_model_runner, "build_mm_cpu", cpu_without_codes)
+    monkeypatch.setattr(gpu_ar_model_runner, "snapshot_mm_payload", snapshot_without_codes)
+    assert engine.reset_prefix_cache(reset_running_requests=True)
+
+    for variant, preempt_after, evict in (
+        ("cold", None, False),
+        ("warm", None, False),
+        ("resumed", 12, False),
+        ("evicted", 12, True),
+    ):
+        rid = f"request-end-{temperature}-{variant}"
+        torch.manual_seed(321)
+        request, outputs, _, _ = _generate(
+            engine, rid, temperature=temperature, preempt_after=preempt_after, evict_prefix=evict
+        )
+        assert list(request.output_token_ids) == off_tokens
+        assert all(not output.multimodal_output for output in outputs)
+        if variant == "warm":
+            assert any(
+                output.prefill_stats is not None and output.prefill_stats.num_cached_tokens > 0 for output in outputs
+            )
+        entry = runner._pending_full_payload_send[rid]
+        assert "codes.audio" not in entry[0] and "codes.audio" not in entry[1]
+        assert entry[4] is not None and not entry[4].retired
+        assert rid not in captured
+        # The actual scheduler's zero-token finished step triggers flush before
+        # removing runner state. No direct call to the materializer or flush.
+        engine.step_fn()
+        assert rid not in runner._pending_full_payload_send
+        assert rid not in runner.requests
+        payload, state = captured[rid]
+        assert state.output_token_ids == off_tokens
+        codes = payload["codes.audio"]
+        torch.testing.assert_close(codes.cpu(), off_codes.cpu(), rtol=0, atol=0)
+        waveform = _decode_emitted_codes(checkpoint_code2wav, request, [SimpleNamespace(multimodal_output=payload)])
+        torch.testing.assert_close(waveform, off_wave, rtol=0, atol=0)
+        if state.talker_codec_inputs:
+            before = codes.clone()
+            state.talker_codec_inputs[-1].fill_(4095)
+            torch.testing.assert_close(codes, before, rtol=0, atol=0)
+        engine.step_fn()
+        assert len(captured) == ("cold", "warm", "resumed", "evicted").index(variant) + 1
+
+
+@pytest.mark.parametrize("terminal_kind", ["eos", "stop", "abort-after-recompute"])
+@torch.inference_mode()
+def test_full_checkpoint_request_end_terminal_cleanup(talker_engine, cache_off_reference, terminal_kind, monkeypatch):
+    engine = talker_engine
+    if not engine.vllm_config.cache_config.enable_prefix_caching:
+        pytest.skip("request-local history requires the guarded cache path")
+    runner = engine.model_executor.driver_worker.worker.model_runner
+    engine.step_fn()
+    captured: dict[str, tuple[dict[str, Any], Any]] = {}
+
+    def capture_send(*, scheduler_output, outputs):
+        assert not (captured.keys() & outputs.keys())
+        captured.update(outputs)
+        return list(outputs)
+
+    monkeypatch.setattr(runner, "_should_accumulate_full_payload_output", lambda: True)
+    monkeypatch.setattr(runner, "send_full_payload_outputs", capture_send)
+    rid = f"request-end-{terminal_kind}"
+    request = _request(engine, rid)
+    if terminal_kind != "abort-after-recompute":
+        # A genuinely sampled primary, not mocked logits or predictor output.
+        assert 0 in cache_off_reference, "run the full module for the independent cache-off oracle"
+        token = cache_off_reference[0][0][0]
+        if terminal_kind == "eos":
+            request.sampling_params.ignore_eos = False
+            request.sampling_params._eos_token_id = token
+        else:
+            request.sampling_params.stop_token_ids = [token]
+    torch.manual_seed(321)
+    engine.add_request(request)
+    for _ in range(48):
+        engine.step_fn()
+        _assert_no_pending_talker_embeddings(runner)
+        if request.is_finished():
+            break
+        if terminal_kind == "abort-after-recompute" and request.num_output_tokens >= 6:
+            assert engine.reset_prefix_cache(reset_running_requests=True)
+            # Force a real partial recompute: pending MTP advances history to N
+            # while the prefill sample is discarded. Cancellation is legal here.
+            with monkeypatch.context() as partial:
+                partial.setattr(engine.scheduler, "max_num_scheduled_tokens", 4)
+                engine.step_fn()
+            state = runner.requests[rid]
+            assert len(state.talker_codec_inputs) == len(state.output_token_ids) == 6
+            engine.abort_requests([rid])
+            break
+    expected_status = (
+        RequestStatus.FINISHED_ABORTED if terminal_kind == "abort-after-recompute" else RequestStatus.FINISHED_STOPPED
+    )
+    assert request.status == expected_status
+    state = runner.requests[rid]
+    count = max(0, len(state.output_token_ids) - 1)
+    expected = torch.zeros(
+        (len(state.prompt_token_ids) + count, runner.model.talker.num_code_groups), dtype=torch.long, device="cuda"
+    )
+    if count:
+        expected[len(state.prompt_token_ids) :] = torch.stack(state.talker_codec_inputs[:count])
+    engine.step_fn()
+    assert rid not in runner.requests and rid not in runner._pending_full_payload_send
+    # Existing full-payload transport flushes same-owner partial output on abort;
+    # it has no reliable abort bit. Preserve that behavior without adding a
+    # terminal primary's next-input code or failing the engine during cleanup.
+    torch.testing.assert_close(captured[rid][0]["codes.audio"].cpu(), expected.cpu(), rtol=0, atol=0)
+    torch.manual_seed(321)
+    following, _, _, _ = _generate(engine, f"after-{rid}")
+    engine.step_fn()
+    assert following.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert following.request_id in captured
+    assert not runner._pending_full_payload_send

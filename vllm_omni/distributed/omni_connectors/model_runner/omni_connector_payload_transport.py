@@ -608,8 +608,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 latest[k] = v
         return chunks, latest, rows
 
-    @staticmethod
-    def _materialize_full_payload_entry(entry):
+    def _materialize_full_payload_entry(self, entry):
         if len(entry) == 2:
             return entry
         chunks, latest, _rows, request = entry[:4]

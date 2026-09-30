@@ -230,7 +230,9 @@ class Qwen3OmniMoeForConditionalGeneration(
                 # last hidden stays on GPU; no consumer needs a host copy of
                 # every cached Talker hidden row.
                 self.requires_full_prefix_cached_hidden_states = False
-                # Retain codec payload delivery independently of replay state.
+                # Connector-less delivery still uses cached codec payloads.
+                # Full-payload connector delivery uses request-local history
+                # at completion instead of duplicating those rows in the cache.
                 self.deferred_prefix_cache_mm_keys = {"codes.audio"}
             self.set_custom_preprocess(self.talker_preprocess)
             self.set_custom_postprocess(self.talker_postprocess)
