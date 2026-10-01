@@ -197,6 +197,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         # vLLM batch-invariant reductions may return FP32 for low-precision
         # input. Preserve the embedding/transformer dtype at this boundary.
         hidden = embedded_codes.mean(1).to(embedded_codes.dtype)
+        del embedded_codes
         # Shape: [batch, seq_len, hidden_size]
 
         # Stage 2: Pre-Transformer (add temporal context)
