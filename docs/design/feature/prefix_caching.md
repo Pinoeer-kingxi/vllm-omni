@@ -319,8 +319,8 @@ The manager consumes these snapshots without reading scheduler or batch state:
   boundary and replacement block table. The manager recovers the hit portion
   not yet delivered. If the new hit ends before the delivery boundary, the
   runner still saves every recomputed row, but the outgoing payload excludes
-  positions already handed off. V2 resume and prompt-content replacement are
-  separate lifecycle contracts and are not covered by this path.
+  positions already handed off. V2 resume is not covered by this adapter;
+  prompt-content replacement follows the ownership contract above.
 
 Each request tracks `computed_upto`, the current execution boundary;
 `saved_upto`, the greatest token end registered with a token-aligned cache write;

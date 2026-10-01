@@ -1745,7 +1745,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         query_start_loc_cpu: Any,
         postprocess_already_applied: bool = False,
         prefix_cache_step_id: int | None = None,
-        excluded_output_req_ids: frozenset[str] = frozenset(),
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
@@ -1753,7 +1752,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         delivery = None
 
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
-        downstream_req_ids = [rid for rid in downstream_req_ids if rid not in excluded_output_req_ids]
         downstream_req_ids, sparse_mm_index, audio_sparse_output = resolve_sparse_mm_routing(
             engine_output_type=engine_output_type,
             req_ids_output_copy=req_ids_output_copy,
@@ -1775,6 +1773,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if not needs_pooler_payload and prefix_cache_step_id is not None:
             # No consumer for this step's merge: consume the step context by
             # id (exactly-once contract). The cache write still lands.
+            assert self.omni_prefix_cache is not None
             self.omni_prefix_cache.discard_step(prefix_cache_step_id)
             prefix_cache_step_id = None
         if self.omni_prefix_cache is None and needs_scheduled_hidden_payload and not audio_sparse_output:

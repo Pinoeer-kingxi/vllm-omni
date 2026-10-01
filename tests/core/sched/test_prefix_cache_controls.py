@@ -207,6 +207,43 @@ def test_invalid_full_payload_finishes_only_its_request(input_failure_scheduler,
     assert healthy.status == RequestStatus.WAITING
 
 
+@pytest.mark.parametrize("bad_first", [False, True])
+@pytest.mark.parametrize("invalid_ids", [[1.5], [True], ["1"], [float("inf")], [{}], [[[1]]]])
+def test_invalid_input_ids_do_not_block_healthy_request(input_failure_scheduler, bad_first, invalid_ids):
+    scheduler, model_mode = input_failure_scheduler
+    bad, healthy = _make_request(), _make_request()
+    bad.request_id, healthy.request_id = "invalid-ids", "healthy-ids"
+    ordered = [bad, healthy] if bad_first else [healthy, bad]
+    ids_key = "next_stage_prompt_ids" if model_mode == "ar" else "code_predictor_codes"
+    for req in ordered:
+        scheduler.requests[req.request_id] = req
+        scheduler._prefix_cache_owner(req)
+        scheduler.waiting.add_request(req)
+    metadata = {
+        req.request_id: {ids_key: invalid_ids if req is bad else [4, 5], "input_terminal": True} for req in ordered
+    }
+    scheduler._latest_omni_connector_output = OmniConnectorOutput(
+        request_metadata=metadata,
+        stage_recv_req_ids=set(metadata),
+        input_owners={req.request_id: scheduler._prefix_cache_owner(req) for req in ordered},
+    )
+
+    scheduler._process_pending_omni_inputs(model_mode)
+
+    assert bad.status == RequestStatus.FINISHED_ERROR
+    assert bad.request_id not in scheduler.requests
+    assert bad.prompt_token_ids == [1, 2, 3]
+    assert list(scheduler.waiting) == [healthy]
+    assert healthy.prompt_token_ids == [4, 5]
+    assert scheduler.input_coordinator.input_terminal_req_ids == {healthy.request_id}
+    scheduler._free_request_blocks.assert_called_once_with(bad)
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=model_mode == "ar")
+    assert len(outputs[bad.client_index].outputs) == 1
+    assert outputs[bad.client_index].outputs[0].request_id == bad.request_id
+    assert outputs[bad.client_index].outputs[0].finish_reason == FinishReason.ERROR
+
+
 @pytest.mark.parametrize("exception_type", [ValueError, RuntimeError, TypeError])
 def test_full_payload_finalizer_isolates_only_validation_errors(input_failure_scheduler, exception_type):
     scheduler, model_mode = input_failure_scheduler

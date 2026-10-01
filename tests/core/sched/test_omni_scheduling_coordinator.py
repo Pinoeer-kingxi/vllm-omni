@@ -275,14 +275,19 @@ def test_generation_notice_hashes_actual_codec_input_once(prompt_len, codes, moc
     assert coordinator.input_terminal_req_ids == {"r1"}
 
 
-def test_invalid_generation_codes_do_not_install_length_only_input():
+@pytest.mark.parametrize(
+    "codes",
+    [[-1], [1.5], [True], ["1"], [float("inf")], [{}], [[[1]]], torch.tensor([[1.5]])],
+    ids=["negative", "float", "bool", "string", "infinity", "mapping", "extra-dimension", "float-tensor"],
+)
+def test_invalid_generation_codes_do_not_install_length_only_input(codes):
     request = _make_request("r1", status=RequestStatus.WAITING_FOR_INPUT)
     coordinator = OmniSchedulingCoordinator(stage_id=2)
     before = dict(request.__dict__)
     with pytest.raises(ValueError, match="non-negative integer"):
         coordinator.update_request_metadata(
             {"r1": request},
-            {"r1": {"next_stage_prompt_len": 4, "code_predictor_codes": [-1], "input_terminal": True}},
+            {"r1": {"next_stage_prompt_len": 4, "code_predictor_codes": codes, "input_terminal": True}},
             model_mode="generation",
         )
     assert request.__dict__ == before

@@ -312,8 +312,8 @@ class OmniSchedulingCoordinator:
         self._waiting_for_input = deque()
 
     @staticmethod
-    def _flatten_prompt_token_ids(value: Any) -> list[int]:
-        """Normalize connector metadata into flat prompt token ids."""
+    def _flatten_prompt_token_ids(value: Any) -> list[Any]:
+        """Flatten codec metadata without coercion; input preparation validates IDs."""
         if value is None:
             return []
         if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "tolist"):
@@ -322,18 +322,18 @@ class OmniSchedulingCoordinator:
             value = value.tolist()
 
         if isinstance(value, (list, tuple)):
-            flattened: list[int] = []
+            flattened: list[Any] = []
             for item in value:
                 if hasattr(item, "detach") and hasattr(item, "cpu") and hasattr(item, "tolist"):
                     item = item.detach().cpu().tolist()
                 elif hasattr(item, "tolist") and not isinstance(item, (list, tuple)):
                     item = item.tolist()
                 if isinstance(item, (list, tuple)):
-                    flattened.extend(int(token_id) for token_id in item)
+                    flattened.extend(item)
                 else:
-                    flattened.append(int(item))
+                    flattened.append(item)
             return flattened
-        return [int(value)]
+        return [value]
 
     def update_request_metadata(
         self,
