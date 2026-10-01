@@ -80,6 +80,42 @@ def test_length_only_notice_finalizes_even_when_placeholder_length_matches():
     assert request._omni_input_finalized
 
 
+@pytest.mark.parametrize("parked", [False, True])
+@pytest.mark.parametrize("metadata", [None, {}, {"input_terminal": True}])
+def test_full_payload_readiness_finalizes_unchanged_prompt_before_lookup(parked, metadata, monkeypatch, mocker):
+    scheduler, request = scheduler_request()
+    coordinator = scheduler.input_coordinator = OmniSchedulingCoordinator(stage_id=1)
+    scheduler.waiting = MockQueue([request])
+    scheduler.running = []
+    request._omni_input_finalized = False
+    tokens = list(request.prompt_token_ids)
+    if parked:
+        scheduler._consume_pending_connector_output("ar")
+        assert request.status == RequestStatus.WAITING_FOR_INPUT
+
+    notice = OmniConnectorOutput(
+        request_metadata={} if metadata is None else {request.request_id: metadata},
+        stage_recv_req_ids={request.request_id},
+        input_owners={request.request_id: scheduler._prefix_cache_owner(request)},
+    )
+    scheduler._latest_omni_connector_output = notice
+    finalize = mocker.spy(coordinator, "_finalize_prompt")
+    native_lookup = mocker.Mock(return_value=(None, 0, 0, False))
+    monkeypatch.setattr(Scheduler, "_get_local_prefix_cache_hit", native_lookup)
+    scheduler._consume_pending_connector_output("ar")
+    scheduler._get_local_prefix_cache_hit(request)
+    assert request._omni_input_finalized
+    assert request.prompt_token_ids == tokens
+    assert request.status == RequestStatus.WAITING
+    assert list(scheduler.waiting) == [request]
+    request.num_computed_tokens = 1
+    scheduler._latest_omni_connector_output = notice
+    scheduler._consume_pending_connector_output("ar")
+    assert request.num_computed_tokens == 1
+    finalize.assert_called_once_with(request, tokens)
+    native_lookup.assert_called_once_with(request)
+
+
 def test_executor_roundtrip_cleans_writer_when_reader_setup_fails(monkeypatch, mocker):
     writer = SimpleNamespace(
         export_handle=mocker.Mock(return_value=object()),

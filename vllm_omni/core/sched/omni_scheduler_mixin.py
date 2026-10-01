@@ -436,6 +436,9 @@ class OmniSchedulerMixin:
             chunk_ready_req_ids.update(output.chunk_ready_req_ids & current_ids)
             chunk_finished_req_ids.update(output.chunk_finished_req_ids & current_ids)
             stage_recv_req_ids.update(output.stage_recv_req_ids & current_ids)
+        if model_mode == "ar" and not input_coordinator._async_chunk:
+            for req_id in stage_recv_req_ids:
+                request_metadata.setdefault(req_id, {})
         for req_id, metadata in request_metadata.items():
             try:
                 input_coordinator.update_request_metadata(

@@ -419,6 +419,10 @@ class OmniSchedulingCoordinator:
                         )
                     elif not getattr(request, "_omni_input_finalized", False):
                         self._finalize_prompt(request, current_prompt_ids)
+            elif model_mode == "ar" and not self._async_chunk and not getattr(request, "_omni_input_finalized", False):
+                # Full-payload producers may leave the admitted prompt unchanged
+                # and publish only readiness/terminal metadata.
+                self._finalize_prompt(request, request.prompt_token_ids or [])
 
             if model_mode != "ar":
                 runtime_seed = None
