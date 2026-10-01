@@ -8,6 +8,7 @@ from queue import SimpleQueue
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -82,13 +83,23 @@ def test_length_only_notice_finalizes_even_when_placeholder_length_matches():
 
 @pytest.mark.parametrize("parked", [False, True])
 @pytest.mark.parametrize("metadata", [None, {}, {"input_terminal": True}])
-def test_full_payload_readiness_finalizes_unchanged_prompt_before_lookup(parked, metadata, monkeypatch, mocker):
+@pytest.mark.parametrize("embedding_only", [False, True])
+def test_full_payload_readiness_finalizes_unchanged_prompt_before_lookup(
+    parked, metadata, embedding_only, monkeypatch, mocker
+):
+    from tests.core.sched.test_input_finalization import _request
+
     scheduler, request = scheduler_request()
+    if embedding_only:
+        request = _request(torch.ones(3, 4), None, None)
+        scheduler.requests = {request.request_id: request}
     coordinator = scheduler.input_coordinator = OmniSchedulingCoordinator(stage_id=1)
     scheduler.waiting = MockQueue([request])
     scheduler.running = []
     request._omni_input_finalized = False
-    tokens = list(request.prompt_token_ids)
+    tokens = list(request.prompt_token_ids) if request.prompt_token_ids is not None else None
+    prompt_length = request.num_prompt_tokens
+    hashes = list(request.block_hashes)
     if parked:
         scheduler._consume_pending_connector_output("ar")
         assert request.status == RequestStatus.WAITING_FOR_INPUT
@@ -106,6 +117,8 @@ def test_full_payload_readiness_finalizes_unchanged_prompt_before_lookup(parked,
     scheduler._get_local_prefix_cache_hit(request)
     assert request._omni_input_finalized
     assert request.prompt_token_ids == tokens
+    assert request.num_prompt_tokens == prompt_length
+    assert request.block_hashes == hashes
     assert request.status == RequestStatus.WAITING
     assert list(scheduler.waiting) == [request]
     request.num_computed_tokens = 1
