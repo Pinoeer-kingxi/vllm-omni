@@ -491,16 +491,13 @@ class OmniSchedulerMixin:
         collector = getattr(adapter, "collect_failed_receive_request_ids", None)
         if collector is None:
             return
-        failures = collector()
-        present_ids = {request_id for request_id in failures if request_id in self.requests}
-        if not present_ids:
-            return
-        logger.error(
-            "Marking %d request(s) as FINISHED_ERROR after invalid streaming input: %s",
-            len(present_ids),
-            {request_id: failures[request_id] for request_id in sorted(present_ids)},
-        )
-        self.finish_requests(present_ids, RequestStatus.FINISHED_ERROR)
+        for request_id, failure in collector().items():
+            request = self.requests.get(request_id)
+            if request is None or request.is_finished():
+                continue
+            reason = f"Invalid connector input: {failure}"
+            logger.error("Marking request %s as FINISHED_ERROR: %s", request_id, reason)
+            self._finish_input_error_requests({request_id}, reason)
 
     def _restore_omni_wait_queues(self) -> None:
         """Restore requests temporarily parked by Omni input gates."""

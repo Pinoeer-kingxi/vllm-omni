@@ -293,6 +293,61 @@ def test_invalid_input_ids_do_not_block_healthy_request(input_failure_scheduler,
     assert outputs[bad.client_index].outputs[0].finish_reason == FinishReason.ERROR
 
 
+@pytest.mark.parametrize("deferred_free", [False, True])
+def test_invalid_chunk_receive_emits_each_error_once(input_failure_scheduler, deferred_free, mocker):
+    scheduler, model_mode = input_failure_scheduler
+    bad_length, bad_ids, healthy = (_make_request() for _ in range(3))
+    bad_length.request_id, bad_ids.request_id, healthy.request_id = "bad-length", "bad-ids", "healthy"
+    for req in (bad_length, healthy, bad_ids):
+        scheduler.requests[req.request_id] = req
+        scheduler._prefix_cache_owner(req)
+        scheduler.waiting.add_request(req)
+    failures = {
+        bad_length.request_id: "invalid prompt length",
+        bad_ids.request_id: "invalid codec IDs",
+        "freed": "late",
+    }
+    scheduler.chunk_transfer_adapter = SimpleNamespace(
+        collect_failed_receive_request_ids=mocker.Mock(side_effect=[failures, failures, {}]),
+        finish_requests=mocker.Mock(),
+        cleanup_receiver=mocker.Mock(),
+    )
+    scheduler._connector_finished.return_value = (deferred_free, None)
+
+    scheduler._process_chunk_receive_failures()
+
+    assert bad_length.status == bad_ids.status == RequestStatus.FINISHED_ERROR
+    assert list(scheduler.waiting) == [healthy]
+    assert healthy.status == RequestStatus.WAITING
+    assert healthy.prompt_token_ids == bad_length.prompt_token_ids == bad_ids.prompt_token_ids == [1, 2, 3]
+    assert scheduler._prefix_cache_pending_terminal_owners == {
+        req.request_id: scheduler._prefix_cache_owner(req) for req in (bad_length, bad_ids)
+    }
+    for req in (bad_length, bad_ids):
+        assert (req.request_id in scheduler.requests) == deferred_free
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=model_mode == "ar")
+    errors = {output.request_id: output for output in outputs[bad_length.client_index].outputs}
+    assert len(outputs[bad_length.client_index].outputs) == 2
+    assert set(errors) == {bad_length.request_id, bad_ids.request_id}
+    for req_id, output in errors.items():
+        assert output.finish_reason == FinishReason.ERROR
+        assert output.stop_reason == f"Invalid connector input: {failures[req_id]}"
+    assert outputs[bad_length.client_index].finished_requests == set(errors)
+
+    # A finished request can remain live while its connector delays KV freeing.
+    # Repeated failure notices must not clean it up or emit its ERROR again.
+    scheduler._process_chunk_receive_failures()
+    scheduler._process_chunk_receive_failures()
+    outputs = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=model_mode == "ar")
+    assert outputs == {}
+    assert scheduler._connector_finished.call_count == 2
+    assert scheduler._free_request_blocks.call_count == (0 if deferred_free else 2)
+    assert scheduler.encoder_cache_manager.free.call_count == 2
+    assert list(scheduler.waiting) == [healthy]
+
+
 @pytest.mark.parametrize("exception_type", [ValueError, RuntimeError, TypeError])
 def test_full_payload_finalizer_isolates_only_validation_errors(input_failure_scheduler, exception_type):
     scheduler, model_mode = input_failure_scheduler
