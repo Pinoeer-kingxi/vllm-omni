@@ -225,25 +225,18 @@ class PrefixCacheSchedulerAdapter:
         *,
         num_scheduled_tokens: Mapping[str, int],
     ) -> PrefixCacheWriteLayout:
-        req_order = tuple(group_view.batch_req_ids())
-        offsets: dict[str, tuple[int, int]] = {}
-        cursor = 0
-        for req_id in req_order:
-            count = max(0, int(num_scheduled_tokens.get(req_id, 0)))
-            offsets[req_id] = (cursor, cursor + count)
-            cursor += count
-        slots = group_view.step_slots_cpu(list(req_order), dict(num_scheduled_tokens))
+        req_order = list(group_view.batch_req_ids())
+        slots = group_view.step_slots_cpu(req_order, dict(num_scheduled_tokens))
         writes: list[PrefixCacheWrite] = []
         cursor = 0
         for req_id in req_order:
-            start, end = offsets[req_id]
-            count = end - start
+            count = num_scheduled_tokens.get(req_id, 0)
             token_start, token_end = group_view.token_range(req_id, count)
             writes.append(
                 PrefixCacheWrite(
                     req_id,
-                    start,
-                    end,
+                    cursor,
+                    cursor + count,
                     token_start,
                     token_end,
                 )

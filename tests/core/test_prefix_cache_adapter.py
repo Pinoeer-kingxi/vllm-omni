@@ -151,6 +151,23 @@ def test_write_layout_keeps_request_positions_separate_from_batch_rows():
     assert [(w.row_start, w.row_end) for w in layout.writes] == [(0, 2), (2, 3)]
 
 
+@pytest.mark.parametrize("scheduled", [{}, {"a": 1}])
+def test_write_layout_keeps_zero_token_requests_without_advancing_rows(scheduled, mocker):
+    view = FakeView()
+    slots = torch.arange(sum(scheduled.values()))
+    slot_mapping = mocker.patch.object(view, "step_slots_cpu", return_value=slots)
+
+    layout = PrefixCacheSchedulerAdapter().build_write_layout(view, num_scheduled_tokens=scheduled)
+
+    assert layout.total_rows == len(slots)
+    assert layout.slots_cpu is slots
+    assert [(w.req_id, w.row_start, w.row_end, w.token_start, w.token_end) for w in layout.writes] == [
+        ("b", 0, 0, 12, 12),
+        ("a", 0, len(slots), 7, 7 + len(slots)),
+    ]
+    slot_mapping.assert_called_once_with(["b", "a"], scheduled)
+
+
 def test_same_id_terminal_and_new_preserves_new_observation_for_extension():
     adapter = PrefixCacheSchedulerAdapter()
     adapter.translate_scheduler_output(output(new=[SimpleNamespace(req_id="r")]))
