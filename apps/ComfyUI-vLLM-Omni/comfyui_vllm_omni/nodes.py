@@ -360,6 +360,36 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         return (output,)
 
 
+class VLLMOmniRestoreVideo(_VLLMOmniGenerateBase):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "url": ("STRING", {"default": "http://localhost:8098/v1"}),
+                "model": ("STRING", {"default": "seedvr2"}),
+                "width": ("INT", {"default": 224, "min": 16, "step": 16}),
+                "height": ("INT", {"default": 128, "min": 16, "step": 16}),
+                "seed": ("INT", {"default": 7723, "min": 0, "max": 0x7FFFFFFFFFFFFFFF}),
+                "timeout_seconds": ("INT", {"default": 1800, "min": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    FUNCTION = "restore"
+    DESCRIPTION = "Restore a whole clip on a remote SeedVR2 service, retaining source FPS, frame count and audio."
+
+    async def restore(
+        self, video: VideoInput, url: str, model: str, width: int, height: int, seed: int, timeout_seconds: int
+    ) -> tuple[VideoInput]:
+        if timeout_seconds <= 0:
+            raise ValueError("Restoration timeout must be positive.")
+        client = VLLMOmniClient(url.strip().rstrip("/"), timeout=timeout_seconds, max_poll_duration=timeout_seconds)
+        output = await client.restore_video(model=model.strip(), video=video, width=width, height=height, seed=seed)
+        return (output,)
+
+
 class VLLMOmniUnderstanding(_VLLMOmniGenerateBase):
     @classmethod
     def INPUT_TYPES(cls):
