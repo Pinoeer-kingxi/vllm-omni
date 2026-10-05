@@ -56,6 +56,7 @@ async def service(unused_tcp_port):
         "submission": {"id": "restore-1", "status": "queued"},
         "submit_status": 200,
         "poll": [{"status": "in_progress"}, {"status": "completed"}],
+        "poll_started": asyncio.Event(),
         "content": _clip(),
         "deleted": False,
         "delete_status": 200,
@@ -78,6 +79,7 @@ async def service(unused_tcp_port):
         return web.json_response(state["submission"], status=state["submit_status"])
 
     async def poll(request):
+        state["poll_started"].set()
         await asyncio.sleep(state["poll_delay"])
         records = state["poll"]
         return web.json_response(records.pop(0) if len(records) > 1 else records[0], status=state["poll_status"])
@@ -240,11 +242,10 @@ async def test_unresponsive_cleanup_does_not_block_timeout(service):
 
 async def test_cancellation_deletes_running_job(service):
     client, state = service
+    state["submit_delay"] = 0.1
     state["poll"] = [{"status": "in_progress"}]
     task = asyncio.create_task(_restore(client))
-    while not state["fields"]:
-        await asyncio.sleep(0.001)
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(state["poll_started"].wait(), timeout=1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
