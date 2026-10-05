@@ -141,6 +141,15 @@ aiohttp **3.14.3** and FFmpeg CLI **4.4.2**, on shared NVIDIA RTX A6000 GPUs
 (48 GB each). ComfyUI was pinned to
 `5c460d8172fe30761ff67c0df3d5643bb74e0d70`, with frontend **1.53.10**.
 
+After rebasing, a standalone GPU smoke test also passed on **vLLM 0.31.0**
+(FlashInfer 0.7.0.post1) at integration commit `4c64b69c`, using the portable input and native
+Load Video → Restore → Save Video with caching disabled. On one RTX A6000,
+it completed in **11.04 seconds**: six frames at exact **30000/1001 FPS**,
+**224×128** output and **48 kHz mono AAC**. Full FFmpeg decode and Chromium
+playback passed; the browser decoded all six frames and the audio track.
+Source/restored zero-lag audio correlation was **0.99657**. The multi-container
+and full H3 results below remain qualified against vLLM 0.30.0.
+
 SeedVR2 uses `seedvr2_ema_3b_fp16.safetensors`, `ema_vae_fp16.safetensors` and
 `pos_emb.pt`; hashes and layout are maintained in the
 [model guide](../../../docs/models/seedvr2.md#model-directory). Downloads were
