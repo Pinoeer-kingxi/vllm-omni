@@ -152,6 +152,15 @@ playback passed; the browser decoded all six frames and the audio track.
 Source/restored zero-lag audio correlation was **0.99657**. The multi-container
 and full H3 results below remain qualified against vLLM 0.30.0.
 
+The native Stop fix at `a5a6ae12` was also tested on that vLLM 0.31 stack,
+with one RTX A6000 and caching disabled. The audio sample restored successfully
+before and after interrupting a 17-frame clip requesting 448×256 output. Native
+Stop reported interruption in **0.14 seconds**, deleted the remote job (DELETE
+200, subsequent GET 404), and skipped Save Video. Both successful outputs retained
+six frames, exact **30000/1001 FPS** and **48 kHz mono AAC**, passed full FFmpeg
+decode and Chromium playback, and had identical decoded RGB frames. The full
+ComfyUI CPU suite at that commit passed all **108 tests**.
+
 SeedVR2 uses `seedvr2_ema_3b_fp16.safetensors`, `ema_vae_fp16.safetensors` and
 `pos_emb.pt`; hashes and layout are maintained in the
 [model guide](../../../docs/models/seedvr2.md#model-directory). Downloads were
