@@ -10,7 +10,9 @@ import av
 import numpy as np
 import pytest
 from aiohttp import web
+from comfy.model_management import InterruptProcessingException
 from comfy_api.input import VideoInput
+from comfyui_vllm_omni import nodes as omni_nodes
 from comfyui_vllm_omni.nodes import VLLMOmniRestoreVideo
 from comfyui_vllm_omni.utils import api_client
 from comfyui_vllm_omni.utils import format as media_format
@@ -252,6 +254,71 @@ async def test_cancellation_deletes_running_job(service):
     assert state["deleted"]
 
 
+@pytest.fixture
+async def waiting_restoration(monkeypatch):
+    """Keep the real node/client; substitute the HTTP boundary of a running job."""
+    polled = asyncio.Event()
+    delete_started = asyncio.Event()
+    delete_release = asyncio.Event()
+    delete_release.set()
+    state = {"deleted": False}
+    pending_response = asyncio.Event()
+
+    async def request(session, url, verb="get", **kwargs):
+        if verb == "post":
+            return {"id": "restore-1", "status": "queued"}
+        if verb == "delete":
+            delete_started.set()
+            await delete_release.wait()
+            state["deleted"] = True
+            return {"deleted": True}
+        polled.set()
+        await pending_response.wait()
+
+    client = api_client.VLLMOmniClient("http://service/v1", timeout=1, poll_interval=0, max_poll_duration=5)
+    monkeypatch.setattr(api_client, "url_json", request)
+    monkeypatch.setattr(omni_nodes, "VLLMOmniClient", lambda *args, **kwargs: client)
+    task = asyncio.create_task(
+        VLLMOmniRestoreVideo().restore(VideoInput(), "http://service/v1", "seedvr2", 224, 128, 7723, 1)
+    )
+    try:
+        await asyncio.wait_for(polled.wait(), timeout=1)
+        yield task, state, delete_started, delete_release
+    finally:
+        delete_release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("wait_for_cleanup", [False, True])
+async def test_comfyui_stop_cancels_restoration_and_deletes_job(waiting_restoration, monkeypatch, wait_for_cleanup):
+    task, state, delete_started, delete_release = waiting_restoration
+    if wait_for_cleanup:
+        delete_release.clear()
+
+    def interrupt():
+        raise InterruptProcessingException()
+
+    monkeypatch.setattr(omni_nodes, "processing_interrupted", lambda: True)
+    monkeypatch.setattr(omni_nodes, "throw_exception_if_processing_interrupted", interrupt)
+    if wait_for_cleanup:
+        await asyncio.wait_for(delete_started.wait(), timeout=1)
+        assert not task.done()
+        delete_release.set()
+    with pytest.raises(InterruptProcessingException):
+        await asyncio.wait_for(task, timeout=1)
+    assert state["deleted"]
+
+
+async def test_parent_cancellation_waits_for_job_cleanup(waiting_restoration):
+    task, state, _, _ = waiting_restoration
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    assert state["deleted"]
+
+
 async def test_corrupt_response_still_deletes_job(service):
     client, state = service
     state["content"] = b"not an MP4"
@@ -307,6 +374,17 @@ async def test_node_uses_configured_timeout_and_normalizes_url(monkeypatch):
     assert calls["timeout"] == calls["poll_timeout"] == 600
     with pytest.raises(ValueError, match="timeout must be positive"):
         await node.restore(VideoInput(), "http://localhost/v1", "seedvr2", 224, 128, 7723, 0)
+
+
+@pytest.mark.parametrize("error", [ValueError("invalid dimensions"), RuntimeError("Timed out waiting for video job")])
+async def test_node_preserves_client_errors(monkeypatch, error):
+    async def restore(self, **kwargs):
+        raise error
+
+    monkeypatch.setattr(api_client.VLLMOmniClient, "restore_video", restore)
+    with pytest.raises(type(error)) as raised:
+        await VLLMOmniRestoreVideo().restore(VideoInput(), "http://service/v1", "seedvr2", 224, 128, 7723, 1)
+    assert raised.value is error
 
 
 @pytest.mark.parametrize("channels", [0, 1, 2])

@@ -33,11 +33,13 @@ requesting a smaller output does not bypass the input limit.
 
 The node submits one asynchronous whole-clip job through `/v1/videos`, polls its
 status and downloads the completed MP4. `timeout_seconds` bounds an HTTP request
-and the polling/download phase (default 1,800 seconds). A known job is deleted
-after download, failure, timeout or cancellation. Cleanup waits at most ten
-seconds, or the configured HTTP timeout when shorter; cancellation may still need
-the server's GPU work to drain. A network failure during submission can leave
-the server with a job whose ID the client never received.
+and the polling/download phase (default 1,800 seconds). ComfyUI **Stop** interrupts
+the node while it waits for the remote request. The client attempts to delete a
+known job after download, failure, timeout or cancellation. The node waits for
+this best-effort cleanup, bounded to ten seconds or the configured HTTP timeout
+when shorter; cancellation may still need the server's GPU work to drain. A
+network failure during submission can leave the server with a job whose ID the
+client never received.
 
 The request deliberately omits FPS, duration and frame count. SeedVR2 reads the
 source timing, pads internally to 4n+1 and crops back to the decoded input count.
@@ -60,7 +62,7 @@ a 48 kHz mono AAC 440 Hz test tone. Keep the template's seed **7723** and output
 **224×128**. The complete sample exercises padding to nine and cropping back to six.
 
 The visual input is a downsampled excerpt of *Big Buck Bunny*:
-(c) copyright 2008, Blender Foundation / www.bigbuckbunny.org, licensed under
+(c) copyright 2008, Blender Foundation / [www.bigbuckbunny.org](https://www.bigbuckbunny.org), licensed under
 [CC BY 3.0](https://peach.blender.org/about/). The excerpt has been resized,
 shortened and given a synthetic test tone. Its original download is
 [Big_Buck_Bunny_720_10s_10MB.mp4](https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/4cba700bd771f44d72b549253da025c32e944d42/Big_Buck_Bunny_720_10s_10MB.mp4)

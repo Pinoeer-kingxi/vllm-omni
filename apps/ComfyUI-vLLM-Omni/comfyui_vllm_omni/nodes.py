@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import asyncio
 import math
-from typing import Literal
+from typing import Literal, cast
 
 import torch
+from comfy.model_management import processing_interrupted, throw_exception_if_processing_interrupted
 from comfy_api.input import AudioInput, VideoInput
 
 from .utils.api_client import VLLMOmniClient
@@ -386,8 +388,26 @@ class VLLMOmniRestoreVideo(_VLLMOmniGenerateBase):
         if timeout_seconds <= 0:
             raise ValueError("Restoration timeout must be positive.")
         client = VLLMOmniClient(url.strip().rstrip("/"), timeout=timeout_seconds, max_poll_duration=timeout_seconds)
-        output = await client.restore_video(model=model.strip(), video=video, width=width, height=height, seed=seed)
-        return (output,)
+        throw_exception_if_processing_interrupted()
+        node_task = cast(asyncio.Task[object], asyncio.current_task())
+
+        async def interrupt_when_stopped() -> None:
+            while not processing_interrupted():
+                await asyncio.sleep(0.1)
+            # Cancel once; the request's finally block owns bounded job cleanup.
+            node_task.cancel()
+
+        interrupt = asyncio.create_task(interrupt_when_stopped())
+        try:
+            output = await client.restore_video(model=model.strip(), video=video, width=width, height=height, seed=seed)
+            return (output,)
+        except asyncio.CancelledError:
+            # Preserve ComfyUI's interruption signal after the client cleans up.
+            throw_exception_if_processing_interrupted()
+            raise
+        finally:
+            interrupt.cancel()
+            await asyncio.gather(interrupt, return_exceptions=True)
 
 
 class VLLMOmniUnderstanding(_VLLMOmniGenerateBase):

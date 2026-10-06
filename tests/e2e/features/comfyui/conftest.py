@@ -8,6 +8,7 @@ This module sets up the test environment by:
 1. Adding the ComfyUI plugin to Python path
 2. Mocking comfy_api.input module (AudioInput, VideoInput) since comfyui is not installed
 3. Mocking comfy_extras.nodes_audio module
+4. Mocking comfy.model_management's interruption API
 """
 
 import os
@@ -89,9 +90,20 @@ def _setup_comfyui_test_environment():
     vars(mock_nodes_audio).update(load=mock_load)
     vars(mock_comfy_extras).update(nodes_audio=mock_nodes_audio)
 
+    class InterruptProcessingException(BaseException):
+        """Match ComfyUI's user-interruption exception."""
+
+    mock_model_management = ModuleType("comfy.model_management")
+    vars(mock_model_management).update(
+        InterruptProcessingException=InterruptProcessingException,
+        processing_interrupted=lambda: False,
+        throw_exception_if_processing_interrupted=lambda: None,
+    )
+
     # Install mock modules BEFORE importing any comfyui_vllm_omni code
     sys.modules["comfy_api"] = mock_comfy_api
     sys.modules["comfy_api.input"] = mock_comfy_api_input
     sys.modules["comfy_api.latest"] = mock_comfy_api_latest
     sys.modules["comfy_extras"] = mock_comfy_extras
     sys.modules["comfy_extras.nodes_audio"] = mock_nodes_audio
+    sys.modules["comfy.model_management"] = mock_model_management
