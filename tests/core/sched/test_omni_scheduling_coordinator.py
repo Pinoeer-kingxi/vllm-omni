@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.sampling_params import SamplingParams
+from vllm import SamplingParams
 from vllm.v1.request import Request
 
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
@@ -25,6 +25,9 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import _LoadEntry
+from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
+from vllm_omni.request import OmniRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -227,6 +230,59 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req.num_prompt_tokens, 4)
         self.assertEqual(req._all_token_ids, [1, 2, 3, 4])
         self.assertEqual(req._output_token_ids, [])
+
+
+@pytest.mark.parametrize("codes", [[], torch.empty((0, 16), dtype=torch.long)])
+@pytest.mark.parametrize("prompt_len", [None, 4])
+def test_empty_generation_snapshot_clears_previous_input(codes, prompt_len, mocker):
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+
+    init_none_hash(sha256)
+    request = Request(
+        request_id="r1",
+        prompt_token_ids=[1] * 8,
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(4, sha256),
+    )
+    request.append_output_token_ids([99])
+    request.num_computed_tokens = 8
+    old_ids = request.all_token_ids
+    prepare = mocker.spy(coord_mod, "prepare_request_input")
+    coordinator = OmniSchedulingCoordinator(stage_id=2)
+
+    coordinator.update_request_metadata(
+        {"r1": request},
+        {"r1": {"code_predictor_codes": codes, "next_stage_prompt_len": prompt_len}},
+        model_mode="generation",
+    )
+
+    assert prepare.call_count == 1
+    assert prepare.call_args.kwargs["prompt_token_ids"] == []
+    assert request.prompt_token_ids == []
+    assert request.num_prompt_tokens == request.num_computed_tokens == 0
+    assert list(request.all_token_ids) == list(request.output_token_ids) == []
+    assert request.block_hashes == []
+    assert list(old_ids) == [1] * 8 + [99]
+
+
+@pytest.mark.parametrize("metadata", [{}, {"code_predictor_codes": None}])
+def test_missing_generation_snapshot_preserves_input(metadata, mocker):
+    request = _make_request("r1")
+    request.append_output_token_ids([99])
+    request.num_computed_tokens = 1
+    old_ids = request.all_token_ids
+    prepare = mocker.spy(coord_mod, "prepare_request_input")
+
+    OmniSchedulingCoordinator(stage_id=2).update_request_metadata(
+        {"r1": request}, {"r1": metadata}, model_mode="generation"
+    )
+
+    prepare.assert_not_called()
+    assert request.all_token_ids is old_ids
+    assert list(request.output_token_ids) == [99]
+    assert request.num_computed_tokens == 1
 
 
 @pytest.mark.parametrize("prompt_len", [None, 4, 12])
@@ -672,3 +728,20 @@ class TestTimeoutDetection(unittest.TestCase):
         self.assertNotIn("r1", coord.requests_with_ready_chunks)
         self.assertEqual([r.request_id for r in coord._waiting_for_chunk_running], ["r2"])
         self.assertEqual([h.request_id for h in coord.pending_chunk_registrations], ["r2"])
+
+
+def test_sender_address_on_the_engine_request_reaches_both_receive_paths():
+    """Ensure the sender address the orchestrator puts on an engine request reaches the receivers."""
+    sender = {"host": "10.0.0.2", "zmq_port": 50071}
+    engine_request = build_engine_core_request_from_tokens(
+        "req-1", {"prompt_token_ids": [0]}, SamplingParams(max_tokens=1)
+    )
+    engine_request.payload_sender_info = sender
+    request = OmniRequest.from_engine_core_request(engine_request, block_hasher=None)
+    # Build the coordinator and process the request with sender info
+    coordinator = OmniSchedulingCoordinator(stage_id=1)
+    coordinator.process_pending_full_payload_inputs(MockQueue([request]), stage_recv_req_ids=set())
+
+    # Ensure that the payload send info is accessible on both pending input registrations and a wrapped load entry
+    assert [handle.payload_sender_info for handle in coordinator.pending_input_registrations] == [sender]
+    assert _LoadEntry(request).source_metadata == {"source_host": "10.0.0.2", "source_port": 50071}

@@ -104,6 +104,10 @@ class _SendCompletion:
 class _OmniConnectorRuntimeMixin:
     """Own connector lifecycle, shared state, and KV transfer delegation."""
 
+    if TYPE_CHECKING:
+
+        def _stage_payload_broadcast_groups(self) -> tuple[Any, ...]: ...
+
     _omni_connector: Any
     _kv_transfer_manager: Any
     _async_chunk: bool
@@ -147,6 +151,7 @@ class _OmniConnectorRuntimeMixin:
     _lock: Any
     _stop_event: Any
     _work_available: Any
+    _save_work_available: Any
     _recv_thread: Any
     _save_thread: Any
     _omni_connector_initialized: bool
@@ -316,6 +321,10 @@ class _OmniConnectorRuntimeMixin:
         self._omni_connector_output_drain_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._work_available = threading.Event()
+        # The save loop has its own event: both loops clear theirs after a
+        # wait, so a shared event let the receiver swallow a send wakeup and
+        # left the payload waiting for the saver's 10 ms timeout.
+        self._save_work_available = threading.Event()
 
         # Start background threads only when there's a connector
         self._recv_thread: threading.Thread | None = None
@@ -346,6 +355,8 @@ class _OmniConnectorRuntimeMixin:
         if getattr(self, "_synchronous_payload_transport", False):
             return
         self._stop_event.set()
+        self._work_available.set()
+        self._save_work_available.set()
         if self._recv_thread is not None:
             self._recv_thread.join(timeout=5)
         if self._save_thread is not None:

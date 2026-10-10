@@ -536,15 +536,20 @@ def test_policy_from_model_shim():
     class M:
         requires_full_prefix_cached_hidden_states = False
         deferred_prefix_cache_mm_keys = {"codes.audio"}
+        mm_outputs_written_in_sample = True
 
     p = ModelCachePolicy.from_model(M())
     assert p.needs_full_hidden_states is False
     assert p.hidden_key is None
     assert p.deferred_keys == frozenset({"codes.audio"})
+    assert p.mm_outputs_written_in_sample is True
     assert p.get_hit_keys([HIDDEN_KEY, "codes.audio"]) == ["codes.audio"]
     assert p.skip_immediate_mm("codes.audio")
     d = ModelCachePolicy.from_model(object())
     assert d.needs_full_hidden_states is True and not d.deferred_keys
+    assert d.mm_outputs_written_in_sample is False
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="mm_outputs_written_in_sample"):
+        ModelCachePolicy(mm_outputs_written_in_sample=True)
     assert d.hidden_key == HIDDEN_KEY
     assert d.get_hit_keys(["talker.h", HIDDEN_KEY]) == [HIDDEN_KEY, "talker.h"]
 
@@ -1425,9 +1430,7 @@ def test_same_step_hit_refreshes_prefetch_after_write(reuse_blocks, deferred_mm)
         hidden = torch.cat([torch.full((8, HIDDEN), 20.0), torch.full((4, HIDDEN), 30.0)])
         mm = torch.cat([torch.full((8, 2), 200.0), torch.full((4, 2), 300.0)])
         layout = adapter.build_write_layout(view, num_scheduled_tokens={"a": 8, "b": 4})
-        sid = mgr.save_outputs(
-            hidden, {"mm": mm}, num_tokens_unpadded=12, num_tokens_padded=12, write_layout=layout
-        )
+        sid = mgr.save_outputs(hidden, {"mm": mm}, num_tokens_unpadded=12, num_tokens_padded=12, write_layout=layout)
         outs = mgr.materialize(sid, ["a", "b"])
 
         assert torch.equal(outs.hidden_states["b"][:8], hidden[:8])

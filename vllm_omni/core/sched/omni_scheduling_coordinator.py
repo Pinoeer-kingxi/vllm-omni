@@ -187,8 +187,8 @@ class OmniSchedulingCoordinator:
                 self.pending_input_registrations.append(
                     OmniChunkRecvHandle(
                         request_id=request.request_id,
-                        external_req_id=getattr(request, "external_req_id", None),
-                        payload_sender_info=getattr(request, "payload_sender_info", None),
+                        external_req_id=request.external_req_id,
+                        payload_sender_info=request.payload_sender_info,
                         input_owner=getattr(request, "_omni_prefix_cache_owner", None),
                     )
                 )
@@ -202,8 +202,8 @@ class OmniSchedulingCoordinator:
                     self.pending_input_registrations.append(
                         OmniChunkRecvHandle(
                             request_id=request.request_id,
-                            external_req_id=getattr(request, "external_req_id", None),
-                            payload_sender_info=getattr(request, "payload_sender_info", None),
+                            external_req_id=request.external_req_id,
+                            payload_sender_info=request.payload_sender_info,
                             input_owner=getattr(request, "_omni_prefix_cache_owner", None),
                         )
                     )
@@ -363,10 +363,10 @@ class OmniSchedulingCoordinator:
             conditioning_digest = metadata.get("next_stage_conditioning_digest")
             if conditioning_digest is not None and (model_mode != "ar" or next_ids is None or next_len is None):
                 raise ValueError("conditioning digest requires IDs and length in one AR input notice")
-            codec_ids = (
-                self._flatten_prompt_token_ids(metadata.get("code_predictor_codes")) if model_mode != "ar" else None
-            )
-            if codec_ids:
+            codec_snapshot = metadata.get("code_predictor_codes") if model_mode != "ar" else None
+            if codec_snapshot is not None:
+                # Empty snapshots clear the previous codec chunk as well.
+                codec_ids = self._flatten_prompt_token_ids(codec_snapshot)
                 self._finalize_prompt(request, codec_ids)
             elif model_mode == "ar" and next_ids is not None:
                 if (
@@ -510,7 +510,7 @@ class OmniSchedulingCoordinator:
                 self.pending_chunk_registrations.append(
                     OmniChunkRecvHandle(
                         request_id=request.request_id,
-                        external_req_id=getattr(request, "external_req_id", None),
+                        external_req_id=request.external_req_id,
                         input_owner=getattr(request, "_omni_prefix_cache_owner", None),
                     )
                 )

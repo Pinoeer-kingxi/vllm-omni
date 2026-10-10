@@ -207,6 +207,32 @@ def _pcm_s16le_to_seed_tts_wer_bytes(
     return (pcm_f32 * 32767).astype(np.int16).tobytes()
 
 
+def _stream_pcm_format_from_headers(
+    headers: Mapping[str, str],
+    sample_rate: int,
+    channels: int,
+) -> tuple[int, int]:
+    """Prefer the server's ``X-Audio-Sample-Rate``/``X-Audio-Channels`` headers.
+
+    Raw PCM has no self-describing header; the server states the model-native
+    format. ``sample_rate``/``channels`` (env-configured) remain the fallback.
+    """
+    resolved = []
+    for name, fallback in (("X-Audio-Sample-Rate", sample_rate), ("X-Audio-Channels", channels)):
+        raw = headers.get(name)
+        value = fallback
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                logger.warning("Ignoring invalid %s header %r; using %d", name, raw, fallback)
+            else:
+                if value != fallback:
+                    logger.debug("Streamed PCM %s=%d from server header (configured %d)", name, value, fallback)
+        resolved.append(max(value, 1))
+    return resolved[0], resolved[1]
+
+
 get_samples_old = datasets.get_samples
 
 _DEFAULT_DAILY_OMNI_REPO = "liarliar/Daily-Omni"
@@ -1201,6 +1227,27 @@ def _update_output_stage_metrics_from_payload(
         if output.stage_metrics is None:
             output.stage_metrics = {}
         output.stage_metrics.update(stage_snapshot)
+
+
+# Per-request stage fields persisted in benchmark results. Full snapshots carry
+# per-token latency lists, which would inflate every chat-omni result file.
+_REQUEST_STAGE_METRIC_FIELDS = (
+    defs.NUM_TOKENS_OUT,
+    "finish_reason",
+    defs.AUDIO_FRAMES,
+    f"{defs.AUDIO_DURATION}_s",
+)
+
+
+def _compact_request_stage_metrics(snapshot: object) -> dict[str, dict] | None:
+    """Keep the stage fields used for workload checks; empty snapshots become None."""
+    if not isinstance(snapshot, dict) or not snapshot:
+        return None
+    return {
+        stage: {field: metrics[field] for field in _REQUEST_STAGE_METRIC_FIELDS if field in metrics}
+        for stage, metrics in snapshot.items()
+        if isinstance(metrics, dict)
+    }
 
 
 def _apply_chat_stage0_token_timings(output: MixRequestFuncOutput) -> bool:
@@ -2589,6 +2636,7 @@ async def async_request_openai_audio_speech(
     output.prompt_len = request_func_input.prompt_len
 
     # PCM format: 16-bit signed; sample_rate/channels are model-dependent.
+    # The env vars are a fallback for servers that do not send format headers.
     sample_rate, channels = defs.stream_pcm_format_from_env()
     sample_width = defs.DEFAULT_AUDIO_SAMPLE_WIDTH
 
@@ -2602,6 +2650,7 @@ async def async_request_openai_audio_speech(
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
+                sample_rate, channels = _stream_pcm_format_from_headers(response.headers, sample_rate, channels)
                 async for chunk in response.content.iter_any():
                     if not chunk:
                         continue
@@ -3635,6 +3684,14 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+    # Preserve request order, including missing snapshots, so CI can verify
+    # fixed stage workloads without parsing logs or storing audio payloads.
+    request_stage_metrics = [
+        _compact_request_stage_metrics(getattr(output, "stage_metrics", None)) for output in outputs
+    ]
+    if any(request_stage_metrics):
+        result["request_stage_metrics"] = request_stage_metrics
+
     # Plain-vLLM backends (e.g. the vLLM-text perf config) return upstream
     # RequestFuncOutput objects without the Mix duplex fields; read them
     # tolerantly or the whole benchmark result is discarded ("fallback to

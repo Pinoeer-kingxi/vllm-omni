@@ -166,6 +166,8 @@ def input_failure_scheduler(request, mocker):
     scheduler = scheduler_cls.__new__(scheduler_cls)
     scheduler.requests = {}
     scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.deferred_waiting = set()
     scheduler.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.running = []
     scheduler.chunk_transfer_adapter = None
@@ -182,6 +184,7 @@ def input_failure_scheduler(request, mocker):
     scheduler.finished_req_ids = set()
     scheduler.finished_req_ids_dict = defaultdict(set)
     scheduler.ec_connector = None
+    scheduler.aux_output_connector = None
     # Keep native finish/free logic; replace only connector and cache I/O.
     scheduler._connector_finished = mocker.Mock(return_value=(False, None))
     scheduler._free_request_blocks = mocker.Mock()
@@ -588,6 +591,8 @@ def test_retired_output_does_not_mutate_reused_request_or_drop_surviving_batch_m
     scheduler.chunk_transfer_adapter = None
     scheduler._pending_finish_reqs = []
     scheduler.recompute_kv_load_failures = False
+    scheduler._first_chunk_express = False
+    scheduler._express_min_slack_s = 0
     scheduler._async_chunk_transport_enabled.return_value = False
     base = SchedulerOutput.make_empty()
     base.num_scheduled_tokens = {retired.request_id: 2, survivor.request_id: 1}
@@ -707,6 +712,7 @@ def test_control_only_step_reaches_real_executor_and_runner_before_zero_return(m
     engine.batch_queue_size = 2
     engine.engines_running = False
     engine.is_ec_consumer = False
+    engine.is_mm_encoder_only = False
     engine.is_pooling_model = False
     try:
         assert EngineCoreProc.has_work(engine)
