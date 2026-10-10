@@ -127,6 +127,8 @@ nav:
     - design/index.md
     - Architecture Documents:
       - Architecture Overview: design/architecture_overview.md
+    - Proposals:
+      - Configured Stage Transitions (RFC): design/feature/pipeline_configured_stage_transitions_rfc.md
     - Feature Design:
       - Runtime and Stage Execution:
         - Disaggregated Inference: design/feature/disaggregated_inference.md

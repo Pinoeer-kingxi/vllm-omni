@@ -9,6 +9,12 @@ in the active navigation.
 
 - [Architecture Overview](architecture_overview.md)
 
+## Proposals
+
+These RFCs are pending community review and describe proposed behavior.
+
+- [Pipeline-configured static stage transitions](feature/pipeline_configured_stage_transitions_rfc.md)
+
 ## Feature Design Documents
 
 For user-facing configuration and current compatibility, see the
