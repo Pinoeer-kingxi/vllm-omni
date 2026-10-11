@@ -151,6 +151,9 @@ The nonzero-subgroup regression covers both sender and receiver behavior.
 Claims and expiry use the same lock. Completion identifies both a payload
 generation and a unique READ claim; duplicate or stale ACKs cannot release a
 different reader or replacement payload. Replacing a claimed key is rejected.
+The final ACK retains its claim and source ownership until deregistration succeeds.
+Failed release unpublishes metadata; replaying the same ACK retries remaining
+registrations without accepting another READ or releasing a replacement generation.
 Terminal errors also release claims; timeout, unknown status, and active sibling
 transfers retain the complete destination bundle and source claim until terminal.
 Zero-element tensors retain their shape/dtype/skeleton positions but never create
@@ -167,10 +170,18 @@ Neither TTL nor ordinary `cleanup(key)` frees a claimed source allocation.
 After publication has stopped, `cleanup_prefix()` removes that prefix's metadata
 and destroys its private native contexts before releasing source tensors. This
 also handles a lost remote READ owner without resetting another request's agent.
+Retirement detaches the contexts under the state lock, destroys them outside that
+lock while retaining source storage, then finalizes ownership under the lock.
+Concurrent cleanup waits for the existing operation; key reuse is rejected until
+retirement finishes. Independent publication, GET and ACK can continue.
 Producer `close()` applies the same ordering to all pending contexts.
 `wait_for_cleanup()` additionally waits for matching local READs and deferred
 claims; a deadline reports failure while retaining resources still owned locally.
 Native context destruction is synchronous and has no universal hard deadline.
+
+The lease reaper owns expiry cleanup. A failed expired release retains its source
+ownership, keeps metadata unpublished and retries after a 100 ms backoff. Failure
+of one payload does not stop the reaper or reject another request's publication.
 
 Receive cleanup releases handles, descriptor lists, remote agents and registrations
 in that order before acknowledging the source. Failed releases retain the remaining
@@ -190,6 +201,15 @@ records measured costs and their limits; it does not establish general performan
 parity. Native ownership validation covers NIXL 1.5 with UCX TCP/cuda_copy. Other
 backend and SDK combinations require validation.
 
+An [independent H100 review](https://github.com/vllm-project/vllm-omni/pull/8744#pullrequestreview-5483707044)
+of commit `7ec25991` measured publication of ready 32 KiB tensors with 64 retained
+prefixes: put P95 increased from 0.238 ms on the base to 1554.224 ms, with 315
+additional threads. This fixture performs no payload READ or model inference.
+The lifecycle fixes retain the per-prefix context policy and device-wide CUDA
+readiness fence; they do not establish that this publication overhead is resolved.
+Payloads can be written on non-current streams, so narrowing that fence requires
+an explicit producer-readiness contract rather than assuming the current stream.
+
 ## Validation
 
 The native CUDA smoke test requires NIXL and at least two visible CUDA devices:
@@ -205,5 +225,13 @@ checks mixed CPU/GPU tensor leaves from an `OmniPayloadStruct`, sends `XFER_DONE
 and verifies that producer registrations are released. This validates same-host,
 cross-GPU operation. Inter-node UCX transport is supported by the design but was not
 validated by this test.
+
+One-GPU regressions inject transient/persistent deregistration failures into the
+real SDK and gate native-owner destruction to check independent request progress.
+The two-GPU live-READ test requires an actual `PROC` observation immediately before
+prefix cleanup, then verifies survivor delivery, key reuse and resource release.
+If the READ already completed, the test skips rather than claiming active-READ
+cancellation coverage. These tests validate the selected local transport; cross-node
+RDMA cancellation needs a separate run with the revised source.
 
 For more details, refer to the [NIXL repository](https://github.com/ai-dynamo/nixl).

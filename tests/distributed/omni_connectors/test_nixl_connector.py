@@ -10,6 +10,7 @@ the payload normalisation rather than any actual RDMA transfer.
 
 import ctypes
 import sys
+import threading
 import time
 import types
 import weakref
@@ -438,6 +439,207 @@ def test_cleanup_registration_failure_preserves_owner_for_retry(producer, monkey
     producer.cleanup("req_0_0")
     assert not producer._pending
     assert not producer._registered_descs
+
+
+@pytest.mark.parametrize("registration_groups", [1, 2])
+def test_final_ack_retries_failed_registration_release(producer, monkeypatch, registration_groups):
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import (
+        _ACK,
+        _GET_META_MSG,
+        _META_NOT_FOUND,
+        _XFER_DONE_MSG,
+    )
+
+    key = "ack-retry_0_0"
+    data = torch.ones(4)
+    if registration_groups == 2:
+        monkeypatch.setattr(
+            producer, "_resolve_memory_type", lambda tensor: "DRAM" if tensor.dtype == torch.uint8 else "VRAM"
+        )
+        data = {"meta": "value", "audio": data}
+    assert producer.put("0", "2", key, data)[0]
+    metadata = msgspec.msgpack.decode(
+        producer._handle_handshake_message(_GET_META_MSG + msgspec.msgpack.encode({"key": key, "claim_id": "reader"}))
+    )
+    pending = producer._pending[key]
+    original_release = pending.agent.deregister_memory
+    attempts = []
+
+    def fail_once(descs):
+        attempts.append(descs)
+        if len(attempts) == registration_groups:
+            raise RuntimeError("injected deregistration failure")
+        original_release(descs)
+
+    monkeypatch.setattr(pending.agent, "deregister_memory", fail_once)
+    completion = _XFER_DONE_MSG + msgspec.msgpack.encode(
+        {"key": key, "generation": metadata["generation"], "claim_id": "reader"}
+    )
+    with pytest.raises(RuntimeError, match="injected deregistration failure"):
+        producer._handle_handshake_message(completion)
+    assert producer._pending[key] is pending
+    assert pending.tensors and pending.registrations
+    assert key not in producer._published
+    assert (
+        producer._handle_handshake_message(
+            _GET_META_MSG + msgspec.msgpack.encode({"key": key, "claim_id": "late-reader"})
+        )
+        == _META_NOT_FOUND
+    )
+    assert producer._handle_handshake_message(completion) == _ACK
+    assert len(attempts) == registration_groups + 1
+    assert not producer._pending and not producer._registered_descs
+    assert producer.put("0", "2", key, torch.zeros(4))[0]
+    replacement = producer._pending[key]
+    assert producer._handle_handshake_message(completion) == _ACK
+    assert producer._pending[key] is replacement and replacement.registrations
+
+
+@pytest.mark.parametrize("operation", ["put", "get", "ack"])
+def test_context_retirement_allows_unrelated_request_progress(producer, monkeypatch, operation):
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _GET_META_MSG, _XFER_DONE_MSG
+
+    entered = threading.Event()
+    retire = threading.Event()
+    finished = threading.Event()
+    errors = []
+    storage_at_retirement = []
+
+    class GatedAgent(_FakeNixlAgent):
+        def __del__(self):
+            storage_at_retirement.append(source_ref() is not None)
+            entered.set()
+            retire.wait(5)
+            storage_at_retirement.append(source_ref() is not None)
+
+    monkeypatch.setattr(producer, "_agent_factory", lambda: GatedAgent("blocked"))
+    assert producer.put("0", "2", "blocked_0_0", torch.ones(4))[0]
+    source_ref = weakref.ref(producer._pending["blocked_0_0"].tensors[0])
+    monkeypatch.setattr(producer, "_agent_factory", lambda: _FakeNixlAgent("other"))
+    assert producer.put("0", "2", "other_0_0", torch.ones(4))[0]
+    claim = {"key": "other_0_0", "claim_id": "reader"}
+    if operation == "ack":
+        metadata = msgspec.msgpack.decode(
+            producer._handle_handshake_message(_GET_META_MSG + msgspec.msgpack.encode(claim))
+        )
+        claim["generation"] = metadata["generation"]
+
+    def independent_request():
+        try:
+            if operation == "put":
+                assert not producer.put("0", "2", "blocked_0_0", torch.zeros(4))[0]
+                assert producer.put("0", "2", "new_0_0", torch.ones(4))[0]
+            elif operation == "get":
+                metadata = msgspec.msgpack.decode(
+                    producer._handle_handshake_message(_GET_META_MSG + msgspec.msgpack.encode(claim))
+                )
+                assert metadata["claim_id"] == "reader"
+            else:
+                producer._handle_handshake_message(_XFER_DONE_MSG + msgspec.msgpack.encode(claim))
+                assert "other_0_0" not in producer._pending
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    cleanup = threading.Thread(target=producer.cleanup_prefix, args=("blocked_0_",))
+    other = threading.Thread(target=independent_request)
+    cleanup.start()
+    try:
+        assert entered.wait(2), "Native context retirement did not start"
+        other.start()
+        assert finished.wait(1), f"Context retirement blocked independent {operation}"
+        assert not errors
+        assert source_ref() is not None
+    finally:
+        retire.set()
+        cleanup.join(3)
+        if other.ident is not None:
+            other.join(3)
+    assert not cleanup.is_alive() and not other.is_alive()
+    assert storage_at_retirement == [True, True]
+    assert source_ref() is None
+    assert producer.put("0", "2", "blocked_0_0", torch.zeros(4))[0]
+
+
+def test_expired_release_failure_does_not_reject_independent_put(producer, monkeypatch):
+    observed = threading.Event()
+    assert producer.put("0", "2", "expired_0_0", torch.ones(4))[0]
+    pending = producer._pending["expired_0_0"]
+    pending.deadline = 0
+
+    def fail_release(descs):
+        observed.set()
+        raise RuntimeError("injected persistent deregistration failure")
+
+    monkeypatch.setattr(pending.agent, "deregister_memory", fail_release)
+    producer._lease_wakeup.set()
+    assert observed.wait(2)
+    assert producer.put("0", "2", "independent_0_0", torch.ones(4))[0]
+    assert producer._pending["expired_0_0"] is pending
+    assert pending.tensors and pending.registrations
+    assert "expired_0_0" not in producer._published
+
+
+def test_lease_reaper_retries_release_failure_without_exiting(nixl_connector_cls, monkeypatch):
+    connector = nixl_connector_cls({"role": "sender", "host": "127.0.0.1"})
+    observed = threading.Event()
+    retried = threading.Event()
+    recover = threading.Event()
+    attempts = []
+    try:
+        assert connector.put("0", "2", "expired_0_0", torch.ones(4))[0]
+        pending = connector._pending["expired_0_0"]
+        original_release = pending.agent.deregister_memory
+
+        def release(descs):
+            attempts.append(time.monotonic())
+            if len(attempts) == 3:
+                retried.set()
+            observed.set()
+            if not recover.is_set():
+                raise RuntimeError("injected deregistration failure")
+            original_release(descs)
+
+        monkeypatch.setattr(pending.agent, "deregister_memory", release)
+        pending.deadline = 0
+        connector._lease_wakeup.set()
+        assert observed.wait(2)
+        assert retried.wait(2), "Lease reaper stopped retrying the failed release"
+        assert connector._lease_thread.is_alive()
+        assert all(b - a >= 0.05 for a, b in zip(attempts[:2], attempts[1:3]))
+        assert connector._pending["expired_0_0"] is pending
+        assert pending.tensors and pending.registrations
+        recover.set()
+        deadline = time.monotonic() + 2
+        while connector._pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not connector._pending and not connector._registered_descs
+        assert connector._lease_thread.is_alive()
+    finally:
+        recover.set()
+        connector.close()
+
+
+def test_failed_first_publication_still_expires(nixl_connector_cls, monkeypatch):
+    connector = nixl_connector_cls({"role": "sender", "host": "127.0.0.1", "lease_seconds": 0.01})
+    agent = _FakeNixlAgent("failed-publication")
+
+    def fail_metadata():
+        raise RuntimeError("injected metadata publication failure")
+
+    monkeypatch.setattr(agent, "get_agent_metadata", fail_metadata)
+    monkeypatch.setattr(connector, "_agent_factory", lambda: agent)
+    try:
+        assert not connector.put("0", "2", "failed_0_0", torch.ones(4))[0]
+        deadline = time.monotonic() + 2
+        while connector._pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not connector._pending and not connector._registered_descs
+        assert not agent.registered
+        assert connector._lease_thread.is_alive()
+    finally:
+        connector.close()
 
 
 @pytest.mark.parametrize("other_request_id", ["req_1", "req_0_other", "req_0_1_other"])

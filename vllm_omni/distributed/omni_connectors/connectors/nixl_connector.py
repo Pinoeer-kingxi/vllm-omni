@@ -67,6 +67,7 @@ class _PendingPayload:
     deadline: float
     generation: str = field(default_factory=lambda: uuid.uuid4().hex)
     claims: set[str] = field(default_factory=set)
+    releasing: threading.Event | None = None
 
 
 class NixlConnector(OmniConnectorBase):
@@ -253,7 +254,6 @@ class NixlConnector(OmniConnectorBase):
             raise RuntimeError("Cannot put data: NixlConnector is closed")
 
         try:
-            self._cleanup_expired_pending()
             kind = _KIND_TENSORS
             if self._is_tensor_payload(data):
                 tensors, tensor_specs = self._normalize_tensor_payload(data)
@@ -284,10 +284,15 @@ class NixlConnector(OmniConnectorBase):
 
             with self._state_lock:
                 previous = self._pending.get(put_key)
-                if previous is not None and previous.claims:
+                if previous is not None and (previous.claims or previous.releasing is not None):
                     raise RuntimeError(f"Cannot replace claimed NIXL payload {put_key}")
-                if previous is not None:
-                    self.cleanup(put_key)
+            if previous is not None:
+                self.cleanup(put_key)
+            with self._state_lock:
+                if self._closed or getattr(self, "_closing", False):
+                    raise RuntimeError("Cannot publish data: NixlConnector is closed")
+                if put_key in self._pending:
+                    raise RuntimeError(f"Cannot replace active NIXL payload {put_key}")
                 parts = put_key.rsplit("_", 1)
                 prefix = f"{parts[0]}_" if len(parts) == 2 and parts[1].isdigit() else None
                 agent = next(
@@ -312,6 +317,7 @@ class NixlConnector(OmniConnectorBase):
                 # Record ownership before registration; failed puts retain any
                 # partially registered resources for the same cleanup boundary.
                 self._pending[put_key] = pending
+                self._lease_wakeup.set()
                 descriptor_groups = []
                 for memory_type, indexed_tensors in grouped_tensors.items():
                     tensor_indices = [tensor_index for tensor_index, _ in indexed_tensors]
@@ -340,7 +346,6 @@ class NixlConnector(OmniConnectorBase):
                     metadata["sender_host"] = self.host
                     metadata["sender_zmq_port"] = self._zmq_port
                     self._published[put_key] = metadata
-            self._lease_wakeup.set()
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
             logger.debug("NixlConnector put %s->%s key=%s size=%d", from_stage, to_stage, put_key, size)
@@ -489,23 +494,41 @@ class NixlConnector(OmniConnectorBase):
         if not key_prefix.endswith("_"):
             raise ValueError("Request payload prefixes must end with '_' before the numeric chunk or target ID")
         with self._state_lock:
-            keys = [key for key in self._pending if _matches_payload_prefix(key, key_prefix)]
-            self._retire_producer_contexts(keys)
-            return len(keys)
+            payloads = {
+                key: payload for key, payload in self._pending.items() if _matches_payload_prefix(key, key_prefix)
+            }
+        return self._retire_producer_contexts(payloads)
 
-    def _retire_producer_contexts(self, keys: list[str]) -> None:
-        """Retire whole source contexts while holding the producer state lock."""
-        payloads = [self._pending[key] for key in keys]
-        for key in keys:
-            self._published.pop(key, None)
-        # A context is shared only by numeric chunks of this exact request/stage
-        # prefix. Keep every payload's storage through the last native teardown.
-        for payload in payloads:
-            payload.agent = None
-        for key, payload in zip(keys, payloads):
-            payload.registrations.clear()
-            payload.tensors.clear()
-            self._pending.pop(key)
+    def _retire_producer_contexts(self, payloads: dict[str, _PendingPayload]) -> int:
+        """Detach under the state lock, retire outside it, then release storage."""
+        while True:
+            with self._state_lock:
+                payloads = {key: payload for key, payload in payloads.items() if self._pending.get(key) is payload}
+                if not payloads:
+                    return 0
+                releasing = next(
+                    (payload.releasing for payload in payloads.values() if payload.releasing is not None), None
+                )
+                if releasing is None:
+                    retired = threading.Event()
+                    agents = []
+                    for key, payload in payloads.items():
+                        self._published.pop(key, None)
+                        payload.releasing = retired
+                        agents.append(payload.agent)
+                        payload.agent = None
+                    break
+            releasing.wait()
+        # Keep every source allocation until the last native context destructor
+        # returns. Pending identities prevent replacement during retirement.
+        agents.clear()
+        with self._state_lock:
+            for key, payload in payloads.items():
+                payload.registrations.clear()
+                payload.tensors.clear()
+                self._pending.pop(key)
+        retired.set()
+        return len(payloads)
 
     @property
     def _registered_descs(self) -> list[Any]:
@@ -530,25 +553,40 @@ class NixlConnector(OmniConnectorBase):
             time.sleep(min(max(self._poll_interval_s, 0.001), remaining))
 
     def _release_pending(self, key: str, pending: _PendingPayload, *, cache_agent: bool = False) -> None:
-        with self._state_lock:
-            if self._pending.get(key) is not pending:
-                return
+        while True:
+            with self._state_lock:
+                if self._pending.get(key) is not pending:
+                    return
+                releasing = pending.releasing
+                if releasing is None:
+                    released = threading.Event()
+                    pending.releasing = released
+                    self._published.pop(key, None)
+                    agent = pending.agent
+                    break
+            releasing.wait()
+        try:
             while pending.registrations:
                 reg_descs = pending.registrations[0]
-                pending.agent.deregister_memory(reg_descs)
+                agent.deregister_memory(reg_descs)
                 pending.registrations.pop(0)
-            self._pending.pop(key)
-            agent = pending.agent
-            pending.agent = None
-            if (
-                cache_agent
-                and not self._closed
-                and self._idle_producer_agent is None
-                and not any(payload.agent is agent for payload in self._pending.values())
-            ):
-                # Only a completed claim with every registration released can
-                # leave a reusable context. Keep one idle context per connector.
-                self._idle_producer_agent = agent
+            with self._state_lock:
+                self._pending.pop(key)
+                pending.agent = None
+                pending.tensors.clear()
+                if (
+                    cache_agent
+                    and not self._closed
+                    and self._idle_producer_agent is None
+                    and not any(payload.agent is agent for payload in self._pending.values())
+                ):
+                    # Retain at most one fully unregistered completed context.
+                    self._idle_producer_agent = agent
+            agent = None
+        finally:
+            with self._state_lock:
+                pending.releasing = None
+            released.set()
 
     def _take_pending(self, request_id: str, expected: _PendingPayload | None = None) -> _PendingPayload | None:
         with self._state_lock:
@@ -584,8 +622,11 @@ class NixlConnector(OmniConnectorBase):
         # Stop private source contexts before releasing their storage. Local
         # READ buffers remain owned until their handles can be released below.
         with self._state_lock:
-            self._retire_producer_contexts(list(self._pending))
+            payloads = dict(self._pending)
+            idle_agent = self._idle_producer_agent
             self._idle_producer_agent = None
+        self._retire_producer_contexts(payloads)
+        del idle_agent
         _RETAINED_PRODUCERS.discard(self)
         self._stop_event.set()
         self._lease_wakeup.set()
@@ -775,7 +816,6 @@ class NixlConnector(OmniConnectorBase):
             while not self._stop_event.is_set():
                 try:
                     if not dict(poller.poll(500)):
-                        self._cleanup_expired_pending()
                         continue
                     identity, _, payload = router.recv_multipart()
                     router.send_multipart([identity, b"", self._handle_handshake_message(payload)])
@@ -811,6 +851,7 @@ class NixlConnector(OmniConnectorBase):
         if payload.startswith(_XFER_DONE_MSG):
             request = msgspec.msgpack.decode(payload[len(_XFER_DONE_MSG) :])
             key = request.get("key")
+            completed = None
             with self._state_lock:
                 pending = self._pending.get(key)
                 if (
@@ -818,10 +859,15 @@ class NixlConnector(OmniConnectorBase):
                     and request.get("generation") == pending.generation
                     and request.get("claim_id") in pending.claims
                 ):
-                    pending.claims.remove(request["claim_id"])
-                    completed = self._take_pending(key)
-                    if completed is not None:
-                        self._release_pending(key, completed, cache_agent=True)
+                    if len(pending.claims) > 1:
+                        pending.claims.remove(request["claim_id"])
+                    else:
+                        # Keep the final claim until release succeeds so an
+                        # identical completion can retry without republishing.
+                        self._published.pop(key, None)
+                        completed = pending
+            if completed is not None:
+                self._release_pending(key, completed, cache_agent=True)
             return _ACK
         logger.warning("NixlConnector handshake received an unknown message")
         return _META_NOT_FOUND
@@ -909,7 +955,15 @@ class NixlConnector(OmniConnectorBase):
             )
             claimed = self._take_pending(request_id, expected=pending)
             if claimed is not None:
-                self._release_pending(request_id, claimed)
+                try:
+                    self._release_pending(request_id, claimed)
+                except Exception:
+                    # The reaper owns lease retries; a failed payload must not
+                    # terminate it or interfere with independent publication.
+                    with self._state_lock:
+                        if self._pending.get(request_id) is claimed:
+                            claimed.deadline = time.monotonic() + 0.1
+                    logger.warning("NIXL expired payload release failed for %s; retrying", request_id, exc_info=True)
 
     def _lease_reaper_loop(self) -> None:
         while not self._stop_event.is_set():
