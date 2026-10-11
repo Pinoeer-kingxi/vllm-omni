@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
+from weakref import ref
 
 import pytest
 import torch
-from torch import nn
 from transformers import Qwen3OmniMoeConfig
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeCode2WavConfig
 from vllm.config import CacheConfig, DeviceConfig, VllmConfig
@@ -219,22 +218,18 @@ def test_fallback_loads_checkpoint_and_matches_explicit_float32(mocker, blackwel
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_codec_mean_preserves_embedding_dtype_with_fp32_reduction(dtype, monkeypatch):
-    model = object.__new__(Qwen3OmniMoeCode2Wav)
-    nn.Module.__init__(model)
-    model.config = SimpleNamespace(num_quantizers=3)
-    model._cudnn_benchmark = False
-    model.code_embedding = nn.Embedding(24, 4, dtype=dtype)
-    model.register_buffer("code_offset", torch.arange(3).reshape(1, 3, 1) * 8)
-    model.upsample = nn.ModuleList()
-    model.decoder = nn.ModuleList()
+@torch.inference_mode()
+def test_codec_mean_preserves_embedding_dtype_with_fp32_reduction(dtype, mocker, monkeypatch):
+    model = _codec(mocker, dtype, device="cpu")
+    embedding_refs = []
+    model.code_embedding.register_forward_hook(lambda _module, _inputs, output: embedding_refs.append(ref(output)))
 
-    def check_transformer_input(*, inputs_embeds):
-        assert inputs_embeds.dtype == dtype
-        return SimpleNamespace(last_hidden_state=inputs_embeds)
+    def check_transformer_input(_module, _inputs, kwargs):
+        assert kwargs["inputs_embeds"].dtype == dtype
+        assert embedding_refs[-1]() is None
 
-    model.pre_transformer = check_transformer_input
-    codes = torch.tensor([[[1, 2], [3, 4], [5, 6]]])
+    model.pre_transformer.register_forward_pre_hook(check_transformer_input, with_kwargs=True)
+    codes = torch.tensor([[[1, 2, 3, 4], [5, 6, 7, 8]]])
     expected = model(codes)
     native_mean = torch.Tensor.mean
 
