@@ -169,14 +169,6 @@ def test_checkpoint_runtime_producer_preserves_samples_and_owned_snapshot(
         hidden = torch.randn(batch_size, talker.config.text_config.hidden_size, device=device, dtype=torch.bfloat16)
         rng = torch.cuda.get_rng_state(device) if device.type == "cuda" else torch.random.get_rng_state()
         zero_input_embeds = torch.zeros_like(hidden).reshape(batch_size, 1, -1)
-        expected_codes, expected_sum = talker.code_predictor_forward(
-            primary, zero_input_embeds, last_talker_hidden=hidden.reshape(batch_size, 1, -1)
-        )
-        expected_codes, expected_sum = expected_codes.clone(), expected_sum.clone()
-        if device.type == "cuda":
-            torch.cuda.set_rng_state(rng, device)
-        else:
-            torch.random.set_rng_state(rng)
         runner.talker_mtp_inputs_embeds.gpu.fill_(poison_value)
         runner.text_step.gpu.fill_(poison_value)
         states = {}
@@ -204,8 +196,28 @@ def test_checkpoint_runtime_producer_preserves_samples_and_owned_snapshot(
             context.setattr(
                 torch.cuda, "synchronize", mocker.Mock(side_effect=AssertionError("no device-wide barrier"))
             )
-            OmniGPUModelRunner._materialize_pending_talker_history_batch(runner, items)
-        assert invoke_rows == [batch_size]
+            OmniGPUModelRunner._materialize_pending_talker_history(runner, items)
+        assert sum(invoke_rows) == batch_size
+        # Scalar and batched producers consume global RNG in different orders.
+        # Compare each actual call to native prediction with the same row group.
+        if device.type == "cuda":
+            torch.cuda.set_rng_state(rng, device)
+        else:
+            torch.random.set_rng_state(rng)
+        expected_code_rows, expected_embedding_rows = [], []
+        offset = 0
+        for rows in invoke_rows:
+            end = offset + rows
+            codes, summed = talker.code_predictor_forward(
+                primary[offset:end],
+                zero_input_embeds[offset:end],
+                last_talker_hidden=hidden[offset:end].reshape(rows, 1, -1),
+            )
+            expected_code_rows.append(codes.clone())
+            expected_embedding_rows.append(summed.clone())
+            offset = end
+        expected_codes = torch.cat(expected_code_rows)
+        expected_sum = torch.cat(expected_embedding_rows)
         frozen = {}
         for row, req_id in enumerate(states):
             state = states[req_id]
