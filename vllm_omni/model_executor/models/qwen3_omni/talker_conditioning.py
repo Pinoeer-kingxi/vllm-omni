@@ -9,7 +9,7 @@ the actual payload. A caller UUID or an arbitrary embedding is not such proof.
 
 import json
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from hashlib import sha256
 
 import regex as re
@@ -17,15 +17,6 @@ import regex as re
 from vllm_omni.inputs.processed_media import ProcessedMediaIdentity as TalkerProcessedMediaIdentity
 
 from .talker_input_plan import TalkerPrefillPart
-
-
-@dataclass(frozen=True)
-class TalkerCacheNamespace:
-    source_model: str
-    talker_model: str
-    projection: str
-    source_adapter: str | None = None
-    talker_adapter: str | None = None
 
 
 def _token_ids(values: Sequence[int], name: str) -> tuple[int, ...]:
@@ -204,42 +195,4 @@ def complete_talker_conditioning_digest(
             "text_controls": text_controls,
             "codec_controls": codec_controls,
         }
-    )
-
-
-def talker_conditioning_digest(
-    *,
-    prompt_ids: Sequence[int],
-    sequence_ids: Sequence[int],
-    row_plan: Sequence[TalkerPrefillPart],
-    embedding_rows: int,
-    hidden_rows: int,
-    text_controls: tuple[int, int, int],
-    codec_controls: tuple[int, int, int, int, int, int],
-    media_token_ids: tuple[int, int, int],
-    namespace: TalkerCacheNamespace,
-    processed_media: Sequence[TalkerProcessedMediaIdentity],
-) -> str:
-    """Encode complete conditioning when both owners' namespaces are available."""
-    if not isinstance(namespace, TalkerCacheNamespace):
-        raise ValueError("Talker conditioning requires an explicit model/projection namespace")
-    source_digest = thinker_conditioning_digest(
-        prompt_ids=prompt_ids,
-        sequence_ids=sequence_ids,
-        row_plan=row_plan,
-        embedding_rows=embedding_rows,
-        hidden_rows=hidden_rows,
-        text_controls=text_controls,
-        media_token_ids=media_token_ids,
-        processed_media=processed_media,
-        source_model=namespace.source_model,
-        source_adapter=namespace.source_adapter,
-    )
-    return complete_talker_conditioning_digest(
-        source_digest=source_digest,
-        talker_model=namespace.talker_model,
-        projection=namespace.projection,
-        talker_adapter=namespace.talker_adapter,
-        text_controls=text_controls,
-        codec_controls=codec_controls,
     )
