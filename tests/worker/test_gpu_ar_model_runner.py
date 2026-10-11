@@ -618,11 +618,11 @@ def test_prefix_delivery_builder_acks_only_after_success(monkeypatch):
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
     monkeypatch.setattr(
         GPUARModelRunner,
-        "get_omni_connector_output",
-        lambda self: (_ for _ in ()).throw(RuntimeError("connector failed")),
+        "_build_omni_step_outputs",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("builder failed")),
     )
 
-    with pytest.raises(RuntimeError, match="connector failed"):
+    with pytest.raises(RuntimeError, match="builder failed"):
         _build_prefix_delivery_output(runner)
     assert progress.delivered_upto == {}
 
@@ -2269,7 +2269,9 @@ def test_token_only_output_keeps_prefix_cache_merge(token_only_builder, mocker):
     runner.omni_prefix_cache = object()
     cached = {"codes.audio": {"r1": torch.tensor([31]), "r2": torch.tensor([32])}}
     merge = mocker.patch.object(
-        runner, "_prepare_prefix_cache_pooler_payload_sources", return_value=(None, None, cached)
+        runner,
+        "_prepare_prefix_cache_pooler_payload_sources",
+        return_value=(None, StageCacheOutputs(hidden_states=None, mm_outputs=cached)),
     )
     output = runner._build_omni_model_runner_output_from_snapshot(**kwargs)
 
