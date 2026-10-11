@@ -656,12 +656,25 @@ def test_full_checkpoint_request_end_history_matches_cache_off(
 
 @pytest.mark.parametrize("terminal_kind", ["eos", "stop", "abort-after-recompute"])
 @torch.inference_mode()
-def test_full_checkpoint_request_end_terminal_cleanup(talker_engine, cache_off_reference, terminal_kind, monkeypatch):
+def test_full_checkpoint_request_end_terminal_cleanup(talker_engine, terminal_kind, monkeypatch):
     engine = talker_engine
     if not engine.vllm_config.cache_config.enable_prefix_caching:
         pytest.skip("request-local history requires the guarded cache path")
     runner = engine.model_executor.driver_worker.worker.model_runner
     engine.step_fn()
+    rid = f"request-end-{terminal_kind}"
+    request = _request(engine, rid)
+    if terminal_kind != "abort-after-recompute":
+        # Derive a real terminal primary without an audio-oracle dependency.
+        torch.manual_seed(321)
+        reference, _, _, _ = _generate(engine, f"terminal-reference-{terminal_kind}")
+        engine.step_fn()
+        token = reference.output_token_ids[0]
+        if terminal_kind == "eos":
+            request.sampling_params.ignore_eos = False
+            request.sampling_params._eos_token_id = token
+        else:
+            request.sampling_params.stop_token_ids = [token]
     captured: dict[str, tuple[dict[str, Any], Any]] = {}
 
     def capture_send(*, scheduler_output, outputs):
@@ -671,17 +684,6 @@ def test_full_checkpoint_request_end_terminal_cleanup(talker_engine, cache_off_r
 
     monkeypatch.setattr(runner, "_should_accumulate_full_payload_output", lambda: True)
     monkeypatch.setattr(runner, "send_full_payload_outputs", capture_send)
-    rid = f"request-end-{terminal_kind}"
-    request = _request(engine, rid)
-    if terminal_kind != "abort-after-recompute":
-        # A genuinely sampled primary, not mocked logits or predictor output.
-        assert 0 in cache_off_reference, "run the full module for the independent cache-off oracle"
-        token = cache_off_reference[0][0][0]
-        if terminal_kind == "eos":
-            request.sampling_params.ignore_eos = False
-            request.sampling_params._eos_token_id = token
-        else:
-            request.sampling_params.stop_token_ids = [token]
     torch.manual_seed(321)
     engine.add_request(request)
     for _ in range(48):
