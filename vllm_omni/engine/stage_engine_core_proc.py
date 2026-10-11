@@ -153,8 +153,7 @@ class StageEngineCoreProc(EngineCoreProc):
         deadline = time.monotonic() + REQUEST_RESOURCE_RELEASE_TIMEOUT_S
         completions = [adapter.release_request_resources(request_id, deadline=deadline) for request_id in request_ids]
         for completion in completions:
-            if completion is not None:
-                completion.result(timeout=max(0, deadline - time.monotonic()))
+            completion.result(timeout=max(0, deadline - time.monotonic()))
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
