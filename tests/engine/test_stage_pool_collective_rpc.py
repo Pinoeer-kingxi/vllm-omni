@@ -11,7 +11,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from tests.engine.test_orchestrator import FakeStageClient, _build_request_output
+from tests.engine.test_orchestrator import FakeStageClient, _build_request_output, _terminal_engine_core_outputs
+from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_pool import StagePool
 
 pytestmark = [pytest.mark.core_model]
@@ -177,7 +178,8 @@ def test_abort_requests_does_not_commit_op_state_when_engine_abort_fails():
 
 
 @pytest.mark.cpu
-def test_abort_retry_keeps_all_replica_prefixes_until_the_pool_stops(mocker):
+@pytest.mark.parametrize("request_finishes_during_abort", [False, True])
+def test_abort_retry_keeps_all_replica_prefixes_until_the_pool_stops(mocker, request_finishes_during_abort):
     async def run() -> None:
         class RecordingOutputProcessor:
             def __init__(self) -> None:
@@ -195,22 +197,45 @@ def test_abort_retry_keeps_all_replica_prefixes_until_the_pool_stops(mocker):
             def commit_aborted_request_state(self, request_ids, *, internal=False):
                 assert internal is False
                 for rid in request_ids:
-                    self.prefixes.pop(rid)
+                    self.prefixes.pop(rid, None)
 
-        first, second = FakeStageClient(), FakeStageClient()
+            def process_outputs(self, outputs, *_args):
+                for output in outputs:
+                    if output.finish_reason is not None:
+                        self.prefixes.pop(output.request_id, None)
+                return SimpleNamespace(request_outputs=[], reqs_to_abort=[])
+
+        first, second = FakeStageClient(final_output=True), FakeStageClient(final_output=True)
         mocker.patch.object(second, "abort_requests_async", side_effect=[RuntimeError("lost ack"), None])
         processor = RecordingOutputProcessor()
         pool = StagePool(0, [first, second], output_processor=processor)
         pool._request_bindings.update({"first": 0, "second": 1})
+        orch = Orchestrator(
+            request_async_queue=asyncio.Queue(),
+            output_async_queue=asyncio.Queue(),
+            rpc_async_queue=asyncio.Queue(),
+            stage_pools=[pool],
+        )
+        for rid in ("first", "second"):
+            orch.request_states[rid] = OrchestratorRequestState(
+                request_id=rid, final_stage_id=0, final_output_stage_ids={0}
+            )
+        if request_finishes_during_abort:
+
+            async def abort_first(_ids):
+                await orch._process_llm_stage_outputs(0, 0, _terminal_engine_core_outputs("first"), set())
+
+            mocker.patch.object(first, "abort_requests_async", side_effect=abort_first)
         with pytest.raises(RuntimeError, match="lost ack"):
-            await pool.abort_requests(["first", "second"])
+            await orch._cleanup_request_ids(["first", "second"], abort=True)
         assert processor.prefixes == {"first": [7, 8], "second": [9]}
-        outputs = await pool.abort_requests(["first", "second"])
-        assert [(rid, list(output.outputs[0].token_ids)) for rid, output in outputs] == [
+        outputs = await orch._cleanup_request_ids(["first", "second"], abort=True)
+        assert [(msg.request_id, list(msg.engine_outputs.outputs[0].token_ids)) for msg in outputs] == [
             ("first", [7, 8]),
             ("second", [9]),
         ]
         assert not processor.prefixes
+        assert not orch.request_states
 
     asyncio.run(run())
 

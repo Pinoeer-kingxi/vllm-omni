@@ -906,7 +906,7 @@ class OrchestratorBase:
                 )
             request_id = getattr(eco, "request_id", None)
             req_state = self.request_states.get(request_id) if request_id is not None else None
-            if req_state is None:
+            if req_state is None or req_state.closing:
                 continue
             if (
                 getattr(eco, "finish_reason", None) == FinishReason.ERROR
@@ -936,6 +936,15 @@ class OrchestratorBase:
             if await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state):
                 raw_terminal_request_ids.add(req_state.request_id)
             await self._report_duplex_session_request_error(stage_id, replica_id, eco, req_state)
+        # An in-flight abort owns the processor snapshot. Late terminal outputs
+        # must not delete it before a failed stage/replica abort can retry.
+        raw_outputs.outputs = [
+            eco
+            for eco in raw_outputs.outputs
+            if (request_id := getattr(eco, "request_id", None)) is None
+            or (state := self.request_states.get(request_id)) is None
+            or not state.closing
+        ]
         iteration_stats = IterationStats() if (self._stat_logger is not None and raw_outputs.outputs) else None
         processed = await pool.process_llm_raw_outputs(
             replica_id,
