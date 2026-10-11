@@ -2124,6 +2124,7 @@ async def test_abort_retry_does_not_repeat_successful_stage_abort():
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [first, second]
     orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
+    orchestrator.request_states = {}
 
     with pytest.raises(RuntimeError, match="stage abort failed"):
         await orchestrator._abort_request_ids(["req-a"])

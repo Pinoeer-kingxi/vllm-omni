@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.engine.test_orchestrator import FakeStageClient, _build_request_output
 from vllm_omni.engine.stage_pool import StagePool
 
 pytestmark = [pytest.mark.core_model]
@@ -171,6 +172,45 @@ def test_abort_requests_does_not_commit_op_state_when_engine_abort_fails():
         assert output_processor.collected is True
         assert output_processor.committed is False
         abort.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_abort_retry_keeps_all_replica_prefixes_until_the_pool_stops(mocker):
+    async def run() -> None:
+        class RecordingOutputProcessor:
+            def __init__(self) -> None:
+                self.prefixes = {"first": [7, 8], "second": [9]}
+
+            def abort_requests_collecting_outputs(self, request_ids, *, internal=False, commit_state=True):
+                assert internal is False and commit_state is False
+                outputs = [
+                    _build_request_output(rid, token_ids=self.prefixes[rid])
+                    for rid in request_ids
+                    if rid in self.prefixes
+                ]
+                return list(request_ids), outputs
+
+            def commit_aborted_request_state(self, request_ids, *, internal=False):
+                assert internal is False
+                for rid in request_ids:
+                    self.prefixes.pop(rid)
+
+        first, second = FakeStageClient(), FakeStageClient()
+        mocker.patch.object(second, "abort_requests_async", side_effect=[RuntimeError("lost ack"), None])
+        processor = RecordingOutputProcessor()
+        pool = StagePool(0, [first, second], output_processor=processor)
+        pool._request_bindings.update({"first": 0, "second": 1})
+        with pytest.raises(RuntimeError, match="lost ack"):
+            await pool.abort_requests(["first", "second"])
+        assert processor.prefixes == {"first": [7, 8], "second": [9]}
+        outputs = await pool.abort_requests(["first", "second"])
+        assert [(rid, list(output.outputs[0].token_ids)) for rid, output in outputs] == [
+            ("first", [7, 8]),
+            ("second", [9]),
+        ]
+        assert not processor.prefixes
 
     asyncio.run(run())
 

@@ -242,6 +242,8 @@ class OrchestratorRequestState:
     final_output_stage_ids: set[int] = field(default_factory=set)
     finished_stage_ids: set[int] = field(default_factory=set)
     pending_final_output: OutputMessage | None = None
+    # Keep collected tokens until cleanup succeeds, including across retries.
+    pending_abort_outputs: list[OutputMessage] = field(default_factory=list, repr=False)
 
     # Wall-clock timestamp when the client-facing engine request was accepted.
     request_timestamp: float = 0.0
@@ -712,7 +714,6 @@ class OrchestratorBase:
         """
         if not request_ids:
             return []
-        abort_outputs: list[OutputMessage] = []
         for pool in self.stage_pools:
             stage_outputs = await pool.abort_requests(request_ids) or []
             if bool(getattr(pool, "final_output", False)) and getattr(pool, "stage_type", None) != "diffusion":
@@ -732,7 +733,7 @@ class OrchestratorBase:
                         replica_id=pool.get_bound_replica_id(orch_req_id),
                         final_output_type=final_output_type,
                     )
-                    abort_outputs.append(
+                    req_state.pending_abort_outputs.append(
                         OutputMessage(
                             request_id=orch_req_id,
                             stage_id=pool.stage_id,
@@ -744,6 +745,13 @@ class OrchestratorBase:
                         )
                     )
             pool.release_bindings(request_ids)
+        abort_outputs = [
+            output
+            for request_id in request_ids
+            if (state := self.request_states.get(request_id)) is not None
+            for output in state.pending_abort_outputs
+        ]
+        abort_outputs.sort(key=lambda output: self._stage_routing.stage_order.index(output.stage_id))
         last_index_by_req: dict[str, int] = {}
         for index, output_msg in enumerate(abort_outputs):
             last_index_by_req[output_msg.request_id] = index
@@ -2707,6 +2715,7 @@ class OrchestratorBase:
                 audio_sample_rate=final_pool._infer_audio_sample_rate(),
             )
             submit_ts = req_state.stage_submit_ts.get(final_stage_id)
+            final_replica_id = final_pool.get_bound_replica_id(req_id)
             logger.info(
                 "[Orchestrator] req=%s stage-%s produced no terminal inputs for stage-%s; "
                 "returning empty %s output from final stage-%s",
@@ -2716,20 +2725,22 @@ class OrchestratorBase:
                 final_output_type or "text",
                 final_stage_id,
             )
+            # Later chunk receivers may already be prewarmed. Release them
+            # before reporting success; failed cleanup reports a request error.
+            await self._cleanup_request_ids([req_id], abort=True, release_owners=True)
+            if req_id in self.request_states:
+                return
             await self.output_async_queue.put(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=final_stage_id,
-                    replica_id=final_pool.get_bound_replica_id(req_id),
+                    replica_id=final_replica_id,
                     engine_outputs=terminal_output,
                     metrics=None,
                     finished=True,
                     stage_submit_ts=submit_ts,
                 )
             )
-            # Later chunk receivers may already be prewarmed. Empty bridge
-            # input means they will never receive a payload or terminal marker.
-            await self._cleanup_request_ids([req_id], abort=True, release_owners=True)
             return
 
         # Build and submit requests for each input

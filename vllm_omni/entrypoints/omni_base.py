@@ -450,7 +450,8 @@ class OmniBase(PDDisaggregationMixin):
                 request_id,
             )
         finally:
-            self.request_states.pop(request_id, None)
+            if req_state is None or not req_state.cleanup_pending:
+                self.request_states.pop(request_id, None)
             # Republish gauges so any stale value left by the per-stage
             # publish in _process_single_result (which runs while the request
             # is still in self.request_states) is corrected after the pop.

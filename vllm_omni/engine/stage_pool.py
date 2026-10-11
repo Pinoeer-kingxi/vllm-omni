@@ -1313,9 +1313,13 @@ class StagePool:
             if client is None:
                 continue
             await client.abort_requests_async(engine_abort_ids)
-            if not is_diffusion and self._output_processor is not None:
-                commit = getattr(self._output_processor, "commit_aborted_request_state", None)
-                if callable(commit):
+
+        # Keep prefixes available if a later replica abort fails and this pool
+        # must retry. The caller receives outputs only after the whole pool stops.
+        if not is_diffusion and self._output_processor is not None:
+            commit = getattr(self._output_processor, "commit_aborted_request_state", None)
+            if callable(commit):
+                for replica_request_ids in request_ids_by_replica.values():
                     commit(replica_request_ids, internal=False)
 
         return abort_outputs
