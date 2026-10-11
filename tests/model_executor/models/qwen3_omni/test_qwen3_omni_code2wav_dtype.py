@@ -18,6 +18,7 @@ def test_codec_mean_preserves_embedding_dtype_with_fp32_reduction(dtype, monkeyp
     model = object.__new__(Qwen3OmniMoeCode2Wav)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(num_quantizers=3)
+    model._cudnn_benchmark = False
     model.code_embedding = nn.Embedding(24, 4, dtype=dtype)
     model.register_buffer("code_offset", torch.arange(3).reshape(1, 3, 1) * 8)
     model.upsample = nn.ModuleList()
@@ -33,7 +34,7 @@ def test_codec_mean_preserves_embedding_dtype_with_fp32_reduction(dtype, monkeyp
     native_mean = torch.Tensor.mean
 
     def fp32_mean(tensor, *args, **kwargs):
-        # vLLM 0.30 batch-invariant aten::mean.dim returns FP32 even for
+        # vLLM batch-invariant aten::mean.dim returns FP32 even for
         # BF16/FP16 input. Model dtype must not depend on that override.
         return native_mean(tensor.float(), *args, **kwargs)
 
