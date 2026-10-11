@@ -8,7 +8,6 @@ must not use the production row planner to calculate expected embeddings.
 """
 
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -447,7 +446,9 @@ def _fixed_expected(payload, model):
 
 @pytest.mark.parametrize("chunk_size", [1, 2, 7, 32])
 @pytest.mark.parametrize("text_count", [1, 3])
-def test_full_payload_plan_is_built_once_and_sliced_after_connector_round_trip(monkeypatch, chunk_size, text_count):
+def test_full_payload_plan_is_built_once_and_sliced_after_connector_round_trip(
+    mocker, monkeypatch, chunk_size, text_count
+):
     import importlib
 
     from vllm_omni.data_entry_keys import validate_payload
@@ -456,10 +457,10 @@ def test_full_payload_plan_is_built_once_and_sliced_after_connector_round_trip(m
 
     producer = importlib.import_module("vllm_omni.model_executor.stage_input_processors.qwen3_omni")
     consumer = importlib.import_module("vllm_omni.model_executor.models.qwen3_omni.qwen3_omni")
-    planner = Mock(wraps=plan_talker_prefill)
+    planner = mocker.Mock(wraps=plan_talker_prefill)
     monkeypatch.setattr(producer, "plan_talker_prefill", planner)
     monkeypatch.setattr(
-        consumer, "plan_talker_prefill", Mock(side_effect=AssertionError("consumer replanned fixed input"))
+        consumer, "plan_talker_prefill", mocker.Mock(side_effect=AssertionError("consumer replanned fixed input"))
     )
     model = _model()
     payload = _fixed_payload(model, text_count)
@@ -484,7 +485,9 @@ def test_full_payload_plan_is_built_once_and_sliced_after_connector_round_trip(m
     for start in range(0, len(expected_ids), chunk_size):
         end = min(start + chunk_size, len(expected_ids))
         with monkeypatch.context() as context:
-            context.setattr(torch.Tensor, "tolist", Mock(side_effect=AssertionError("fixed input read back token IDs")))
+            context.setattr(
+                torch.Tensor, "tolist", mocker.Mock(side_effect=AssertionError("fixed input read back token IDs"))
+            )
             ids, embeddings, update = model.talker_preprocess(
                 torch.tensor(expected_ids[start:end]),
                 None,
@@ -503,14 +506,14 @@ def test_full_payload_plan_is_built_once_and_sliced_after_connector_round_trip(m
 
 
 @pytest.mark.parametrize("start", range(12, 21))
-def test_fixed_plan_hit_at_every_bootstrap_boundary_initializes_current_tail(monkeypatch, start):
+def test_fixed_plan_hit_at_every_bootstrap_boundary_initializes_current_tail(mocker, monkeypatch, start):
     import importlib
 
     model = _model()
     payload = _fixed_payload(model)
     expected_ids, expected, tail = _fixed_expected(payload, model)
     module = importlib.import_module("vllm_omni.model_executor.models.qwen3_omni.qwen3_omni")
-    monkeypatch.setattr(module, "plan_talker_prefill", Mock(side_effect=AssertionError("unexpected replan")))
+    monkeypatch.setattr(module, "plan_talker_prefill", mocker.Mock(side_effect=AssertionError("unexpected replan")))
     actual_ids, actual, update = model.talker_preprocess(
         torch.tensor(expected_ids[start:]), None, _omni_is_prefill=True, _omni_num_computed_tokens=start, **payload
     )
@@ -520,7 +523,7 @@ def test_fixed_plan_hit_at_every_bootstrap_boundary_initializes_current_tail(mon
     assert torch.all(update["embed"]["tts_pad_projected"] == 50)
 
 
-def test_new_full_payload_replaces_plan_without_a_request_id_keyed_cache(monkeypatch):
+def test_new_full_payload_replaces_plan_without_a_request_id_keyed_cache(mocker, monkeypatch):
     import importlib
 
     from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -533,7 +536,7 @@ def test_new_full_payload_replaces_plan_without_a_request_id_keyed_cache(monkeyp
     runner.requests = {"same-id": SimpleNamespace()}
     runner.model_intermediate_buffer = {"same-id": old}
     module = importlib.import_module("vllm_omni.model_executor.models.qwen3_omni.qwen3_omni")
-    monkeypatch.setattr(module, "plan_talker_prefill", Mock(side_effect=AssertionError("unexpected replan")))
+    monkeypatch.setattr(module, "plan_talker_prefill", mocker.Mock(side_effect=AssertionError("unexpected replan")))
     for payload in (old, new, old):
         # Exercise the existing per-request buffer replacement boundary.
         runner._replace_intermediate_buffer("same-id", payload)
@@ -563,12 +566,12 @@ def test_new_full_payload_replaces_plan_without_a_request_id_keyed_cache(monkeyp
         [("assistant", 22, 27), ("assistant", 27, 30)],
     ],
 )
-def test_invalid_wire_plan_is_rejected_before_projections(monkeypatch, bad_plan):
+def test_invalid_wire_plan_is_rejected_before_projections(mocker, monkeypatch, bad_plan):
     model = _model()
     payload = _fixed_payload(model)
     payload["meta"]["talker_prefill_plan"] = bad_plan
     monkeypatch.setattr(
-        model.talker.text_projection, "forward", Mock(side_effect=AssertionError("invalid plan projected"))
+        model.talker.text_projection, "forward", mocker.Mock(side_effect=AssertionError("invalid plan projected"))
     )
     with pytest.raises(ValueError, match="Talker prefill plan"):
         model.talker_preprocess(
@@ -577,7 +580,7 @@ def test_invalid_wire_plan_is_rejected_before_projections(monkeypatch, bad_plan)
 
 
 @pytest.mark.parametrize("invalid", ["missing_ids", "short_ids", "past_end", "negative_start"])
-def test_fixed_plan_requires_aligned_identity_and_interval(monkeypatch, invalid):
+def test_fixed_plan_requires_aligned_identity_and_interval(mocker, monkeypatch, invalid):
     model = _model()
     payload = _fixed_payload(model)
     start = 0
@@ -588,7 +591,7 @@ def test_fixed_plan_requires_aligned_identity_and_interval(monkeypatch, invalid)
     else:
         start = 21 if invalid == "past_end" else -1
     monkeypatch.setattr(
-        model.talker.text_projection, "forward", Mock(side_effect=AssertionError("invalid plan projected"))
+        model.talker.text_projection, "forward", mocker.Mock(side_effect=AssertionError("invalid plan projected"))
     )
     with pytest.raises(ValueError, match="fixed.*plan|fixed Talker row plan"):
         model.talker_preprocess(

@@ -14,6 +14,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.kv_hints import KvHintsEnvelope
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.processed_media import ProcessedMediaProvenance
@@ -34,6 +35,7 @@ class OmniInputProcessor(InputProcessor):
         data_parallel_rank: int | None = None,
         resumable: bool = False,
         session_id: str | None = None,
+        kv_hints: KvHintsEnvelope | None = None,
     ) -> EngineCoreRequest:
         if isinstance(prompt, dict) and "type" in prompt:
             engine_input = cast(EngineInput, prompt)
@@ -60,6 +62,7 @@ class OmniInputProcessor(InputProcessor):
             data_parallel_rank=data_parallel_rank,
             resumable=resumable,
             session_id=session_id,
+            kv_hints=kv_hints,
         )
         _, decoder_input = split_enc_dec_input(engine_input)
         provenance = decoder_input.get("_omni_processed_media")

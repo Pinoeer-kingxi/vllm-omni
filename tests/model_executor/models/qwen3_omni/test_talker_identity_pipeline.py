@@ -5,7 +5,6 @@
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -57,7 +56,7 @@ def _config(stage, *, enabled=False):
         ),
         load_config=SimpleNamespace(load_format="safetensors", model_loader_extra_config={}),
         cache_config=SimpleNamespace(enable_prefix_caching=enabled),
-        compute_hash=Mock(return_value="resolved-runtime-graph"),
+        compute_hash=lambda: "resolved-runtime-graph",
     )
 
 
@@ -132,8 +131,9 @@ def _finalize(config, payload, request=None):
     return request, coordinator, metadata
 
 
-def test_source_and_consumer_use_their_own_configs_and_preserve_caller_salt_once():
+def test_source_and_consumer_use_their_own_configs_and_preserve_caller_salt_once(mocker):
     source_config, target_config = _config("thinker"), _config("talker")
+    mocker.spy(source_config, "compute_hash")
     source = _source(source_config)
     transfer = SimpleNamespace(vllm_config=source_config, _get_model_config=lambda: source_config.model_config)
     payload = _payload(source_config, source, transfer)
@@ -144,7 +144,7 @@ def test_source_and_consumer_use_their_own_configs_and_preserve_caller_salt_once
     assert request._omni_original_cache_salt == "original-caller"
     assert request.prompt_token_ids == payload["meta"]["next_stage_prompt_ids"]
     assert request.block_hashes
-    request._block_hasher = Mock(side_effect=AssertionError("duplicate notice rehashed request"))
+    request._block_hasher = mocker.Mock(side_effect=AssertionError("duplicate notice rehashed request"))
     coordinator.update_request_metadata({request.request_id: request}, {request.request_id: metadata})
     source.request_id = "producer-B"
     # Routing-only UUIDs can change without changing actual media identity.
@@ -342,12 +342,12 @@ def test_scheduler_installs_identity_using_actual_target_configuration(architect
     assert callback.__self__.model_namespace == stage_conditioning_namespace(config)
 
 
-def test_late_length_notice_does_not_rehash_or_discard_verified_conditioning():
+def test_late_length_notice_does_not_rehash_or_discard_verified_conditioning(mocker):
     source_config, target_config = _config("thinker"), _config("talker", enabled=True)
     payload = _payload(source_config, _source(source_config))
     request, coordinator, _ = _finalize(target_config, payload)
     before = (request.cache_salt, list(request.block_hashes), request._omni_conditioning_digest)
-    request._block_hasher = Mock(side_effect=AssertionError("late notice rehashed input"))
+    request._block_hasher = mocker.Mock(side_effect=AssertionError("late notice rehashed input"))
     coordinator.update_request_metadata(
         {request.request_id: request}, {request.request_id: {"next_stage_prompt_len": request.num_prompt_tokens}}
     )
