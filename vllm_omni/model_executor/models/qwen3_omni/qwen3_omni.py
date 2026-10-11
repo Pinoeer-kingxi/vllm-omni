@@ -1113,10 +1113,14 @@ class Qwen3OmniMoeForConditionalGeneration(
         thinker_sequences_cpu = None if ids.get("all") is None else _cpu_long(ids["all"])
         thinker_chatml_ids_cpu = None if ids.get("prompt") is None else _cpu_long(ids["prompt"])
         thinker_sequences = (
-            None if thinker_sequences_cpu is None else to_device_nonblocking(thinker_sequences_cpu, talker_device)
+            thinker_sequences_cpu
+            if wire_plan is not None or thinker_sequences_cpu is None
+            else to_device_nonblocking(thinker_sequences_cpu, talker_device)
         )
         thinker_chatml_ids = (
-            None if thinker_chatml_ids_cpu is None else to_device_nonblocking(thinker_chatml_ids_cpu, talker_device)
+            None
+            if wire_plan is not None or thinker_chatml_ids_cpu is None
+            else to_device_nonblocking(thinker_chatml_ids_cpu, talker_device)
         )
 
         tts_bos_thinker = to_device_nonblocking(embed["tts_bos"], talker_device).to(torch.bfloat16)
