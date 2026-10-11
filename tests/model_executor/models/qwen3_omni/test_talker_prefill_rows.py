@@ -121,11 +121,11 @@ def _replay_model_and_payload(text_count):
 @pytest.mark.parametrize("text_count", [0, 1, 3, 8])
 @pytest.mark.parametrize("start,end", [(0, 1), (5, 13), (20, 21), (0, 25), (20, 24), (21, 22), (22, 25), (25, 28)])
 @torch.inference_mode()
-def test_history_reconstruction_uses_absolute_cursor_and_complete_codes(text_count, start, end, monkeypatch):
+def test_history_reconstruction_uses_absolute_cursor_and_complete_codes(text_count, start, end, monkeypatch, mocker):
     model, payload = _replay_model_and_payload(text_count)
     owner = PrefixCacheRequestOwner(9, 2)
     records = tuple(torch.tensor((index + 1, 2, 3), dtype=torch.long) for index in range(7))
-    forbidden = Mock(side_effect=AssertionError("history must not sample/replan"))
+    forbidden = mocker.Mock(side_effect=AssertionError("history must not sample/replan"))
     monkeypatch.setattr(model, "talker_mtp", forbidden)
     monkeypatch.setattr(model.talker.code_predictor, "forward", forbidden)
     monkeypatch.setattr("vllm_omni.model_executor.models.qwen3_omni.qwen3_omni.plan_talker_prefill", forbidden)
@@ -251,7 +251,7 @@ def test_history_replay_single_part_return_skips_final_singleton_cats(case, star
 
 
 @pytest.mark.parametrize("bad_kind", ["missing", "width", "dtype", "untyped"])
-def test_history_reconstruction_rejects_bad_interval_before_any_embedding(bad_kind, monkeypatch):
+def test_history_reconstruction_rejects_bad_interval_before_any_embedding(bad_kind, monkeypatch, mocker):
     model, payload = _replay_model_and_payload(3)
     owner = PrefixCacheRequestOwner(9, 2)
     valid = torch.tensor((1, 2, 3), dtype=torch.long)
@@ -261,7 +261,7 @@ def test_history_reconstruction_rejects_bad_interval_before_any_embedding(bad_ki
         "dtype": torch.tensor((2, 2, 3), dtype=torch.int32),
         "untyped": {"owner": owner, "position": 22, "codes": (2, 2, 3)},
     }[bad_kind]
-    forbidden = Mock(side_effect=AssertionError("bad interval must fail before any projection or gathering"))
+    forbidden = mocker.Mock(side_effect=AssertionError("bad interval must fail before any projection or gathering"))
     monkeypatch.setattr(model, "talker_preprocess_prefill", forbidden)
     monkeypatch.setattr(model.talker, "replay_codec_embeddings", forbidden)
     with pytest.raises(ValueError, match="Talker"):
@@ -278,7 +278,7 @@ def test_history_reconstruction_rejects_bad_interval_before_any_embedding(bad_ki
 
 
 @torch.inference_mode()
-def test_first_decode_handoff_reuses_retained_prefill_tail(monkeypatch):
+def test_first_decode_handoff_reuses_retained_prefill_tail(monkeypatch, mocker):
     model, payload = _replay_model_and_payload(5)
     owner = PrefixCacheRequestOwner(40)
     payload["meta"] = {
@@ -292,7 +292,7 @@ def test_first_decode_handoff_reuses_retained_prefill_tail(monkeypatch):
     monkeypatch.setattr(
         model,
         "talker_preprocess_prefill",
-        Mock(side_effect=AssertionError("first decode handoff must not reconstruct prefill")),
+        mocker.Mock(side_effect=AssertionError("first decode handoff must not reconstruct prefill")),
     )
     codes = (torch.tensor((7, 2, 3), dtype=torch.long),)
     codec_embedding = torch.full((1, WIDTH), 11, dtype=torch.bfloat16)
@@ -346,11 +346,11 @@ def test_first_decode_handoff_rejects_bad_prefill_cursor_before_replay(meta):
 
 @pytest.mark.parametrize("consumed", [0, 1, 3, 6])
 @torch.inference_mode()
-def test_history_restores_queue_for_following_decode_without_user_projection(consumed, monkeypatch):
+def test_history_restores_queue_for_following_decode_without_user_projection(consumed, monkeypatch, mocker):
     model, payload = _replay_model_and_payload(5)
     owner = PrefixCacheRequestOwner(31)
     records = tuple(torch.tensor((1, 2, 3), dtype=torch.long) for _ in range(7))
-    forbidden = Mock(side_effect=AssertionError("history hit must not project user rows"))
+    forbidden = mocker.Mock(side_effect=AssertionError("history hit must not project user rows"))
     monkeypatch.setattr(model, "_get_talker_user_parts", forbidden)
     _, _, update = model.talker_replay_inputs(
         torch.tensor([1]),
@@ -546,7 +546,7 @@ def test_text_only_cpu_mask_user_span_projects_directly_without_bool_gather(monk
 
 
 @pytest.mark.parametrize("bad_kind", ["async_chunk", "no_plan", "length", "owner", "negative", "empty", "shape"])
-def test_history_rejects_invalid_boundary_contract(bad_kind, monkeypatch):
+def test_history_rejects_invalid_boundary_contract(bad_kind, monkeypatch, mocker):
     model, payload = _replay_model_and_payload(1)
     args = dict(row_start=0, prompt_length=21, owner=PrefixCacheRequestOwner(3), codec_inputs=(), payload=payload)
     input_ids = torch.ones(1, dtype=torch.long)
@@ -565,7 +565,7 @@ def test_history_rejects_invalid_boundary_contract(bad_kind, monkeypatch):
         input_ids = torch.empty(0, dtype=torch.long)
     else:
         input_embeds = torch.zeros(1, WIDTH + 1, dtype=torch.bfloat16)
-    forbidden = Mock(side_effect=AssertionError("invalid boundary must fail before projection"))
+    forbidden = mocker.Mock(side_effect=AssertionError("invalid boundary must fail before projection"))
     monkeypatch.setattr(model, "talker_preprocess_prefill", forbidden)
     with pytest.raises(ValueError, match="Talker"):
         model.talker_replay_inputs(input_ids, input_embeds, **args)
