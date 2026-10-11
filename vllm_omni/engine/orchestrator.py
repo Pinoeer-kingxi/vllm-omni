@@ -35,7 +35,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
-from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
+from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS, FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -195,6 +195,41 @@ def build_engine_core_request_from_tokens(
     )
 
 
+def _attach_async_chunk_prewarm_payload(
+    base_input: dict[str, Any],
+    prompt: Any,
+    stage_client: Any,
+    request_id: str,
+    stage_id: int,
+) -> None:
+    """Add the stage's prewarm payload to its placeholder's additional_information.
+
+    Keys are flat ``f"{ASYNC_CHUNK_PREWARM_NS}.{name}"`` so tensor values stay
+    top-level tensors on the wire. ``prompt`` itself is never mutated.
+    """
+    payload_func = getattr(stage_client, "async_chunk_prewarm_payload_func", None)
+    if not callable(payload_func):
+        return
+    try:
+        payload = payload_func(prompt)
+    except Exception:
+        # The stage still gets everything it needs with chunk 0.
+        logger.warning(
+            "[Orchestrator] req=%s stage=%s: async_chunk prewarm payload failed; submitting the placeholder without it",
+            request_id,
+            stage_id,
+            exc_info=True,
+        )
+        return
+    if not isinstance(payload, dict) or not payload:
+        return
+    additional_information = base_input.get("additional_information")
+    base_input["additional_information"] = {
+        **(additional_information if isinstance(additional_information, dict) else {}),
+        **{f"{ASYNC_CHUNK_PREWARM_NS}.{key}": value for key, value in payload.items()},
+    }
+
+
 @dataclass
 class OrchestratorRequestState:
     """Per-request bookkeeping inside the Orchestrator."""
@@ -301,6 +336,7 @@ class OrchestratorBase:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
+    _transfer_release_tasks: set[asyncio.Task] = set()
 
     def __init__(
         self,
@@ -348,6 +384,8 @@ class OrchestratorBase:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
+        # Strong refs for in-flight releases; the loop only weak-refs tasks, so dropping these risks mid-flight GC.
+        self._transfer_release_tasks: set[asyncio.Task] = set()
         self._init_metrics_state(
             stage_pools,
             running_counter,
@@ -690,6 +728,36 @@ class OrchestratorBase:
             output_msg.finished = index == last_index_by_req[output_msg.request_id]
         return abort_outputs
 
+    def _release_stage_transfer_resources(self, request_ids: list[str]) -> None:
+        """Drop each stage's inter-stage transfer resources for finished requests.
+
+        This is the only point that knows every stage is done with the request,
+        so it is the only safe place to reclaim segments a consumer never
+        drained. Scheduled rather than awaited: reclaim is best-effort and must
+        not add RPC latency to request teardown.
+        """
+        if not request_ids:
+            return
+
+        async def _run() -> None:
+            results = await asyncio.gather(
+                *(pool.release_request_resources(request_ids) for pool in self.stage_pools),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning("[Orchestrator] release transfer resources failed: %s", result)
+
+        try:
+            task = asyncio.get_running_loop().create_task(_run())
+            self._transfer_release_tasks.add(task)
+            task.add_done_callback(self._transfer_release_tasks.discard)
+        except RuntimeError:
+            logger.warning(
+                "[Orchestrator] no running event loop; skipped reclaim of transfer resources for %s",
+                request_ids,
+            )
+
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
         for pool in self.stage_pools:
@@ -718,7 +786,7 @@ class OrchestratorBase:
         stage_ids: list[int] = []
         for pool in target_pools:
             clear_sender = pool.stage_type != "diffusion" and (
-                method in ("reset_mm_cache", "sleep")
+                method in ("reset_mm_cache", "sleep", "release_kv_cache_memory")
                 or (method == "pause_scheduler" and kwargs.get("clear_cache", args[1] if len(args) > 1 else True))
             )
             for replica_id in pool.live_replica_ids():
@@ -898,7 +966,7 @@ class OrchestratorBase:
                     req_state is None
                     or req_state.upstream_first_audio
                     or req_state.pending_upstream_first_audio is not None
-                    or stage_id + 1 > req_state.final_stage_id
+                    or (stage_id if final_output else stage_id + 1) > req_state.final_stage_id
                 ):
                     continue
                 audio = mm.get("model_outputs")
@@ -935,7 +1003,7 @@ class OrchestratorBase:
         if pending is None or self.request_states.get(req_state.request_id) is not req_state:
             return
         source_stage, first_output = pending
-        codec_stage = source_stage + 1
+        codec_stage = source_stage if self.stage_pools[source_stage].final_output else source_stage + 1
         pool = self.stage_pools[codec_stage]
         replica_id = pool.get_bound_replica_id(req_state.request_id)
         if replica_id is None or req_state.request_id not in pool.output_processor.request_states:
@@ -1645,6 +1713,7 @@ class OrchestratorBase:
         if abort:
             abort_outputs = await self._abort_request_ids(cleanup_ids)
         self._release_request_bindings(cleanup_ids)
+        self._release_stage_transfer_resources(cleanup_ids)
         for request_id in cleanup_ids:
             self._pd_kv_params.pop(request_id, None)
             req_state = self.request_states.pop(request_id, None)
@@ -2607,8 +2676,15 @@ class OrchestratorBase:
         request_id: str,
         stage0_request: Any,
         req_state: OrchestratorRequestState,
+        *,
+        attach_prewarm_payload: bool = False,
     ) -> bool:
         """Pre-submit downstream stages for async-chunk mode.
+
+        ``attach_prewarm_payload`` adds each LLM stage's
+        ``async_chunk_prewarm_payload_func`` output to its placeholder. Only the
+        initial add sets it; a re-prewarm would resend the payload for a
+        request the stage already holds.
 
         Returns False when the request was failed and cleaned up in here, so a
         caller still holding ``req_state`` stops instead of recording state on
@@ -2709,6 +2785,18 @@ class OrchestratorBase:
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
                 downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
+                # Session-owned and resumable requests keep their downstream
+                # request across turns, so they stay on the chunk-0 path.
+                if attach_prewarm_payload and not req_state.session_owned and not downstream_resumable:
+                    # Pass the original prompt: base_input has already dropped
+                    # multi_modal_data, which the payload function may read.
+                    _attach_async_chunk_prewarm_payload(
+                        base_input,
+                        req_state.prompt,
+                        next_pool.stage_client,
+                        request_id,
+                        next_stage_id,
+                    )
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,
@@ -3000,7 +3088,7 @@ class Orchestrator(OrchestratorBase):
             return
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
+            await self._prewarm_async_chunk_stages(request_id, prompt, req_state, attach_prewarm_payload=True)
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
