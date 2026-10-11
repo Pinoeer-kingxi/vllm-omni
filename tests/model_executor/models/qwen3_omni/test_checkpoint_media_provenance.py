@@ -15,7 +15,7 @@ import pytest
 from PIL import Image
 from vllm.config import DeviceConfig, LoadConfig, VllmConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.cache import MultiModalProcessorOnlyCache, MultiModalProcessorSenderCache
+from vllm.multimodal.cache import LruKeyReplicatedSenderCache, MultiModalProcessorOnlyCache
 from vllm.multimodal.processing.context import TimingContext
 from vllm.multimodal.processing.inputs import ProcessorInputs
 from vllm.sampling_params import SamplingParams
@@ -65,19 +65,20 @@ def _prompt(processor, modality):
     return f"<|im_start|>user\n{content}Describe.<|im_end|>\n<|im_start|>assistant\n"
 
 
-@pytest.mark.parametrize("cache_cls", [MultiModalProcessorOnlyCache, MultiModalProcessorSenderCache])
+@pytest.mark.parametrize("cache_cls", [MultiModalProcessorOnlyCache, LruKeyReplicatedSenderCache])
 @pytest.mark.parametrize("modality", ["image", "audio", "video"])
 def test_checkpoint_processing_and_cache_hits_keep_actual_media_proof(
     checkpoint_config, cache_cls, modality, monkeypatch
 ):
     import vllm_omni.model_executor.models.qwen3_omni.processed_media as digest_module
 
-    processor = MULTIMODAL_REGISTRY.create_processor(checkpoint_config, cache=cache_cls(checkpoint_config))
+    cache = cache_cls(checkpoint_config)
+    processor = MULTIMODAL_REGISTRY.create_processor(checkpoint_config)
     tokens = processor.info.get_tokenizer().encode(_prompt(processor, modality))
 
     def apply(value, label):
         return processor.apply(
-            ProcessorInputs(tokens, processor.info.parse_mm_data({modality: value}), {modality: [label]}),
+            ProcessorInputs(tokens, processor.info.parse_mm_data({modality: value}), {modality: [label]}, cache=cache),
             TimingContext(enabled=False),
         )
 
@@ -98,7 +99,7 @@ def test_checkpoint_processing_and_cache_hits_keep_actual_media_proof(
     # Upstream UUID semantics reuse the old processed value; its old provenance
     # must follow that value, not describe the newly supplied raw media.
     assert hit["_omni_processed_media"] == proof
-    if cache_cls is MultiModalProcessorSenderCache:
+    if cache_cls is LruKeyReplicatedSenderCache:
         assert hit["mm_kwargs"][modality][0] is None
     changed = apply(_media(modality, changed=True), "different-label")
     assert changed["_omni_processed_media"].media[0].content_digest != proof.media[0].content_digest
