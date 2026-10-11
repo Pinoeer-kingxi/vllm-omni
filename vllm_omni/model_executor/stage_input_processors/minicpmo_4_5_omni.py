@@ -3,7 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -90,6 +90,33 @@ def _extract_prompt_reference_audio(
         return reference_audio
 
     return _extract_first_audio_ref({"audio": serving_reference_audio})
+
+
+# The prewarm payload rides inline in the placeholder request; a longer
+# reference is left to the chunk-0 path alone.
+_CODE2WAV_PREWARM_MAX_REF_SECONDS = 60
+
+
+def code2wav_prewarm_payload(prompt: Any) -> dict[str, Any] | None:
+    """Return the reference Code2Wav can prepare before its first chunk.
+
+    Uses the same extractor as ``llm2tts``, so the waveform and sample rate
+    match the reference chunk 0 later carries and hit the same
+    content-addressed caches. Returns ``None`` when there is nothing to send.
+    """
+    try:
+        reference_audio = _extract_prompt_reference_audio(prompt)
+        if reference_audio is None:
+            return None
+        waveform, sample_rate = reference_audio
+        if sample_rate <= 0 or waveform.numel() == 0:
+            return None
+        if waveform.numel() > _CODE2WAV_PREWARM_MAX_REF_SECONDS * sample_rate:
+            return None
+        return {"ref_audio": waveform.contiguous(), "ref_audio_sr": int(sample_rate)}
+    except Exception:
+        logger.debug("MiniCPM-o 4.5 Code2Wav prewarm payload skipped", exc_info=True)
+        return None
 
 
 def _extract_native_runtime_ref_audio(data_plane_metadata):
@@ -203,6 +230,17 @@ def _extract_codec_delta(pooling_output: Any, request_id: str) -> list[int]:
             return []
         codes = pooling_output.get("codes")
         audio = codes.get("audio") if isinstance(codes, Mapping) else pooling_output.get("codes.audio")
+        valid = meta.get("codec_frame_valid") if isinstance(meta, Mapping) else None
+        if valid is None:
+            valid = pooling_output.get("meta.codec_frame_valid")
+        if isinstance(valid, torch.Tensor) and isinstance(audio, torch.Tensor):
+            # Device codec outputs carry a validity mask; prefill rows can
+            # carry empty audio and masks. reshape(0, -1) is ambiguous even
+            # for a correctly empty codec delta.
+            rows = valid.detach().to(device="cpu").reshape(-1).bool()
+            if rows.numel() == 0 and audio.numel() == 0:
+                return []
+            audio = audio.detach().to(device="cpu").reshape(rows.numel(), -1)[rows]
         return _codec_scalars(audio)
     if isinstance(pooling_output, Sequence) and not isinstance(
         pooling_output,
@@ -227,7 +265,7 @@ def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
         else:
             request_payload.pop(request_id, None)
     code_accumulators = getattr(transfer_manager, "code_prompt_token_ids", None)
-    if hasattr(code_accumulators, "pop"):
+    if isinstance(code_accumulators, dict):
         code_accumulators.pop(request_id, None)
 
 
@@ -316,7 +354,8 @@ def tts2code2wav_async_chunk(
         container[_MINICPMO45_ASYNC_STATE] = state
 
     pending = state["pending"]
-    pending.extend(_extract_codec_delta(multimodal_output, request_id))
+    delta = _extract_codec_delta(multimodal_output, request_id)
+    pending.extend(delta)
     pending_text_utf8 = state.setdefault("pending_text_utf8", [])
     current_text_utf8 = (
         segment_text_utf8.detach().to(device="cpu", dtype=torch.uint8).reshape(-1).tolist()
@@ -602,7 +641,7 @@ def _decode_native_duplex_token_ids(
     request_id: str,
 ) -> str | None:
     decode_token_ids = getattr(streaming_context, "source_token_decoder", None)
-    if not isinstance(decode_token_ids, Callable):
+    if not callable(decode_token_ids):
         return None
     decode_ids = [int(token_id) for token_id in token_ids]
     try:
@@ -949,8 +988,16 @@ def llm2tts(
             unit_start = 0
             while unit_start < len(out_ids) and out_ids[unit_start] == listen_id:
                 unit_start += 1
-            if tts_bos_idx is not None:
-                out_start = max(unit_start, tts_bos_idx - prompt_token_ids_len)
+            # Only the unit's opening decision (or a boundary folded as the last
+            # prompt token) starts the slice. The policy also rewrites a mid-unit
+            # <|listen|> into <|tts_bos|>; like the official loop, that token is
+            # fed and handed to the Talker with the text before it, not used as
+            # a new start that would drop the unit's earlier words.
+            folded_boundary = (
+                unit_start == 0 and prompt_token_ids_len > 0 and full_token_ids[prompt_token_ids_len - 1] == tts_bos_id
+            )
+            if folded_boundary:
+                out_start = 0
             elif unit_start < len(out_ids) and out_ids[unit_start] not in tts_end_ids:
                 out_start = unit_start + 1
             else:
@@ -1006,7 +1053,9 @@ def llm2tts(
             if data_plane_metadata is not None:
                 model_intermediate_buffer["duplex"] = data_plane_metadata
             meta["native_duplex_segment_text"] = thinker_text
-            meta.setdefault("override_keys", []).extend(
+            override_keys = meta.setdefault("override_keys", [])
+            assert isinstance(override_keys, list)
+            override_keys.extend(
                 [
                     "llm_output_text",
                     ["meta", "native_duplex_segment_text"],

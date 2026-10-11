@@ -15,8 +15,6 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.slow, pytest.mark.omni]
 
-_SKIP_ISSUE_3649 = pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/3649")
-
 
 def _minimal_chat_json(omni_server: OmniServer) -> dict[str, object]:
     """Minimal valid chat body; individual tests override one offending field."""
@@ -121,9 +119,8 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
         pytest.param(
             "modalities_list_bad",
             400,
-            ("modalities", "value_error", ""),
+            ("modalities", "list of strings"),
             id="modalities_list_bad_element",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "response_format_json_schema_incomplete",
@@ -131,7 +128,7 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
             ("response_format", "BadRequestError", "json_schema"),
             id="invalid_response_format_json_schema",
         ),
-        pytest.param("logprobs_wrong_type", 400, "logprobs", id="logprobs_wrong_type", marks=_SKIP_ISSUE_3649),
+        pytest.param("logprobs_wrong_type", 400, ("logprobs", "boolean"), id="logprobs_wrong_type"),
         pytest.param(
             "logprobs_top_without_enabled",
             400,
@@ -219,44 +216,40 @@ def test_video_chat_stream_invalid_requests(
 # WS /v1/realtime
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Resolved in ``test_realtime_invalid_requests`` (skip ``session.created`` handshake).
-_REALTIME_WS_MODEL_MISMATCH = object()
-_REALTIME_WS_INVALID_AUDIO_APPEND = object()
-
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "send_frames_spec, ws_error_code, err_message",
     [
-        pytest.param("{not-json", "invalid_json", "Invalid JSON", id="invalid_json"),
+        pytest.param("{not-json", "invalid_event", "Invalid or unrecognized client event", id="invalid_json"),
         pytest.param(
             json.dumps({"type": "session.update"}),
             "invalid_event",
-            ("model", "Missing required field"),
-            id="session_update_missing_model",
+            "Invalid or unrecognized client event",
+            id="session_update_missing_session",
         ),
         pytest.param(
-            _REALTIME_WS_MODEL_MISMATCH,
-            "model_not_found",
-            ("model", "does not exist"),
-            id="session_update_model_mismatch",
+            json.dumps({"type": "session.update", "session": []}),
+            "invalid_event",
+            "Invalid or unrecognized client event",
+            id="session_update_invalid_session",
         ),
         pytest.param(
-            json.dumps({"type": "input_audio_buffer.commit", "final": False}),
-            "model_not_validated",
-            ("session.update", "validate the model"),
-            id="commit_without_model_validation",
+            json.dumps({"type": "input_audio_buffer.commit"}),
+            "invalid_request_error",
+            "Input audio buffer is empty",
+            id="commit_without_audio",
         ),
         pytest.param(
             json.dumps({"type": "unknown.event"}),
-            "unknown_event",
-            "Unknown event type",
+            "invalid_event",
+            "Invalid or unrecognized client event",
             id="unknown_event_type",
         ),
         pytest.param(
-            _REALTIME_WS_INVALID_AUDIO_APPEND,
-            "invalid_audio",
-            "Invalid audio data",
+            json.dumps({"type": "input_audio_buffer.append", "audio": "not-valid-base64!!!"}),
+            "invalid_request_error",
+            "Invalid base64 audio data",
             id="invalid_audio_append",
         ),
     ],
@@ -269,27 +262,12 @@ def test_realtime_invalid_requests(
     ws_error_code: str,
     err_message: str | tuple[str, ...],
 ) -> None:
-    send_frames: Any
-    if send_frames_spec is _REALTIME_WS_MODEL_MISMATCH:
-        send_frames = json.dumps(
-            {
-                "type": "session.update",
-                "model": "this-model-is-not-served-on-this-instance",
-            }
-        )
-    elif send_frames_spec is _REALTIME_WS_INVALID_AUDIO_APPEND:
-        send_frames = [
-            json.dumps({"type": "session.update", "model": omni_server.model}),
-            json.dumps({"type": "input_audio_buffer.append", "audio": "not-valid-base64!!!"}),
-        ]
-    else:
-        send_frames = send_frames_spec
     online_client.send_realtime_ws_request(
         {
-            "send_frames": send_frames,
+            "send_frames": send_frames_spec,
             "timeout": 120,
             "ws_max_size": None,
-            "ws_skip_types": ["session.created"],
+            "ws_skip_types": ["session.created", "conversation.created"],
             "ws_json_type": "error",
             "ws_error_code": ws_error_code,
             "err_message": err_message,

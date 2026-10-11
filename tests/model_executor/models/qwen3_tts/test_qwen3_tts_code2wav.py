@@ -25,6 +25,7 @@ class _FakeDecoder(nn.Module):
         self.total_upsample = total_upsample
         self.decode_calls: list[dict[str, object]] = []
         self.batched_decode_calls: list[dict[str, object]] = []
+        self.batched_decode_codes: list[torch.Tensor] = []
         self.decode_codes: list[torch.Tensor] = []
         self.cudagraph_calls: list[dict[str, int | torch.device]] = []
 
@@ -64,6 +65,7 @@ class _FakeDecoder(nn.Module):
         left_context_size: int = 25,
         max_batch_size: int = 0,
     ) -> list[torch.Tensor]:
+        self.batched_decode_codes.append(codes.detach().cpu().clone())
         self.batched_decode_calls.append(
             {
                 "chunk_size": chunk_size,
@@ -203,6 +205,26 @@ def test_forward_uses_decoder_audio_contract_without_context():
     torch.testing.assert_close(audio, expected)
 
 
+def test_forward_reads_current_model_intermediate_buffer_for_full_payload():
+    """Full-payload sync mode must decode connector codec ids, not placeholders."""
+    model = _make_model()
+    placeholder_ids = torch.zeros(12, dtype=torch.long)
+    payload_codes = torch.arange(12, dtype=torch.long) + 17
+
+    model.forward(
+        input_ids=placeholder_ids,
+        runtime_additional_information=[],
+        model_intermediate_buffer=[
+            {
+                "codes": {"audio": payload_codes},
+                "meta": {"left_context_size": 0},
+            }
+        ],
+    )
+
+    torch.testing.assert_close(model.decoder.batched_decode_codes[-1], payload_codes.reshape(1, _NUM_QUANTIZERS, 6))
+
+
 @pytest.mark.parametrize("skipped_length", [0, 1], ids=["empty", "malformed"])
 def test_stateless_batch_uses_original_request_index_for_left_context(skipped_length):
     model = _make_model()
@@ -269,6 +291,31 @@ def test_request_aware_forward_passes_only_delta_frames_to_decoder():
         (1, _NUM_QUANTIZERS, 3),
         (1, _NUM_QUANTIZERS, 2),
     ]
+
+
+def test_forward_reports_the_codec_frames_past_the_left_context():
+    model = _make_model()
+
+    out = model.forward(
+        input_ids=torch.arange(12, dtype=torch.long),
+        runtime_additional_information=[{"meta": {"left_context_size": 2}}],
+    )
+
+    # Codebook-major ids [[0..5], [6..11]]: the four frames after the two context
+    # frames, one row of codebooks per frame.
+    frames = out.multimodal_outputs["codec_frames"][0]
+    torch.testing.assert_close(frames, torch.tensor([[2, 8], [3, 9], [4, 10], [5, 11]]))
+
+
+def test_request_aware_forward_reports_each_delta_frame():
+    model = _make_model(async_chunk=True)
+    info = [{"meta": {"request_id": "rid", "left_context_size": 0}}]
+
+    first = model.forward(input_ids=torch.arange(6, dtype=torch.long), runtime_additional_information=info)
+    second = model.forward(input_ids=torch.arange(4, dtype=torch.long), runtime_additional_information=info)
+
+    torch.testing.assert_close(first.multimodal_outputs["codec_frames"][0], torch.tensor([[0, 3], [1, 4], [2, 5]]))
+    torch.testing.assert_close(second.multimodal_outputs["codec_frames"][0], torch.tensor([[0, 2], [1, 3]]))
 
 
 def test_four_frame_first_chunk_uses_configured_initial_size_without_ramp():
@@ -730,3 +777,37 @@ def test_load_weights_uses_model_dtype_before_precomputing_caches(dtype):
     assert _load_weights_noop(model) == {"decoder.fake_weight"}
     assert model.decoder.weight.dtype is dtype
     assert cache_dtypes == [dtype]
+
+
+@pytest.mark.parametrize("capture_fails", [False, True])
+def test_decode_autotune_restores_process_flags(mocker, monkeypatch, capture_fails):
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark_limit", 5)
+    original = (torch.backends.cudnn.enabled, torch.backends.cudnn.deterministic, torch.backends.cudnn.allow_tf32)
+    model = _make_model(
+        async_chunk=True,
+        device=torch.device("cuda"),
+        stage_connector_config={"extra": {"decode_cudnn_benchmark": True}},
+    )
+
+    observed = []
+
+    def capture(**kwargs):
+        observed.append(
+            (
+                torch.backends.cudnn.benchmark,
+                torch.backends.cudnn.benchmark_limit,
+                torch.backends.cudnn.enabled,
+                torch.backends.cudnn.deterministic,
+                torch.backends.cudnn.allow_tf32,
+            )
+        )
+        if capture_fails:
+            raise RuntimeError("capture failed")
+
+    capture_mock = mocker.patch.object(model, "_maybe_enable_decoder_cudagraph", side_effect=capture)
+    _load_weights_noop(model)
+    capture_mock.assert_called_once()
+    assert observed == [(True, 10, *original)]
+    assert torch.backends.cudnn.benchmark is False
+    assert torch.backends.cudnn.benchmark_limit == 5
