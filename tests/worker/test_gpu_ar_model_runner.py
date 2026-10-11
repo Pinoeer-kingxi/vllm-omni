@@ -971,7 +971,6 @@ def test_request_local_snapshot_empty_handoff_stays_downstream_only(monkeypatch)
         num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
         query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
         prefix_cache_step_id=7,
-        excluded_output_req_ids=frozenset({"r2"}),
     )
 
     assert accumulated == [("r1", {}, request, progress)]
