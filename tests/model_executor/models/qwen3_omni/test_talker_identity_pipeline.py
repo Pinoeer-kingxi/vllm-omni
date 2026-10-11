@@ -134,6 +134,7 @@ def _finalize(config, payload, request=None):
 def test_source_and_consumer_use_their_own_configs_and_preserve_caller_salt_once(mocker):
     source_config, target_config = _config("thinker"), _config("talker")
     mocker.spy(source_config, "compute_hash")
+    mocker.spy(target_config, "compute_hash")
     source = _source(source_config)
     transfer = SimpleNamespace(vllm_config=source_config, _get_model_config=lambda: source_config.model_config)
     payload = _payload(source_config, source, transfer)
