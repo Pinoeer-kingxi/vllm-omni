@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.request import Request
 
 from vllm_omni.core.sched.input_finalization import install_request_input, prepare_request_input
+from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.inputs.processed_media import ProcessedMediaProvenance
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -28,6 +29,27 @@ def _request(embeds, tokens, mask):
         block_hasher=get_request_block_hasher(2, sha256),
         cache_salt="caller",
     )
+
+
+@pytest.mark.parametrize("resumable", [False, True])
+@pytest.mark.parametrize("conversion", ["from_request", "from_base"])
+def test_new_request_data_preserves_provenance_and_resumability(resumable, conversion):
+    from vllm.v1.core.sched.output import NewRequestData
+
+    request = _request(None, [1, 2], None)
+    provenance = ProcessedMediaProvenance((1, 2), (), ())
+    request.processed_media_provenance = provenance
+    request.resumable = resumable
+    block_ids = ([3],)
+    if conversion == "from_request":
+        data = OmniNewRequestData.from_request(request, block_ids)
+    else:
+        base = NewRequestData.from_request(request, block_ids)
+        data = OmniNewRequestData.from_base(base, request)
+    assert data.processed_media_provenance is provenance
+    assert data.resumable is resumable
+    assert data.prompt_token_ids == [1, 2]
+    assert data.block_ids == block_ids
 
 
 def test_replacement_installs_current_provenance_atomically_and_clears_old_proof():

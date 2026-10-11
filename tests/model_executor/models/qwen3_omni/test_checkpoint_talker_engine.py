@@ -7,7 +7,9 @@ verified local checkpoint, and isolate an idle GPU with CUDA_VISIBLE_DEVICES.
 These tests use the complete Talker transformer, native paged KV, runner and
 scheduler, but synthetic Thinker outputs. They are not pipeline/WER/perf tests.
 Exact cold/warm/resumed comparisons require VLLM_BATCH_INVARIANT=1 on the
-qualified BF16 GPU backend; ordinary batch-shape numerical drift remains a
+qualified BF16 GPU backend. Codec-only recovery does not require Code2Wav;
+audio comparisons also require its independent reduction-dtype fix.
+Ordinary batch-shape numerical drift remains a
 separate accuracy gate. Predictor compilation is disabled by default; set
 VLLM_OMNI_TEST_TALKER_COMPILE=1 to exercise its compiled path. Set
 VLLM_OMNI_TEST_TALKER_GRAPH=1 to also exercise the runner's decode/MTP graphs,
@@ -462,6 +464,32 @@ def test_full_checkpoint_mixed_batch_terminal_drain_keeps_survivor(talker_engine
     torch.testing.assert_close(
         _emitted_codes(outputs[survivor.request_id]), _emitted_codes(reference_outputs), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("evict_prefix", [False, True], ids=["prefix-retained", "prefix-evicted"])
+@torch.inference_mode()
+def test_full_checkpoint_codec_history_survives_preemption(talker_engine, evict_prefix, monkeypatch):
+    engine = talker_engine
+    if not engine.vllm_config.cache_config.enable_prefix_caching:
+        pytest.skip("request-local codec replay requires the guarded cache path")
+    runner = engine.model_executor.driver_worker.worker.model_runner
+    predict = runner._predict_talker_codes
+    predictor_rows = []
+
+    def count_prediction(input_ids, *args, **kwargs):
+        predictor_rows.append(input_ids.shape[0])
+        return predict(input_ids, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "_predict_talker_codes", count_prediction)
+    torch.manual_seed(321)
+    reference, reference_outputs, _, _ = _generate(engine, "codec-reference")
+    assert predictor_rows == [1] * 17
+    predictor_rows.clear()
+    torch.manual_seed(321)
+    resumed, resumed_outputs, _, _ = _generate(engine, "codec-resumed", preempt_after=12, evict_prefix=evict_prefix)
+    assert predictor_rows == [1] * 17, "recomputed codec inputs must not be sampled again"
+    assert list(resumed.output_token_ids) == list(reference.output_token_ids)
+    torch.testing.assert_close(_emitted_codes(resumed_outputs), _emitted_codes(reference_outputs), rtol=0, atol=0)
 
 
 def _generate_pair(engine, name, *, preempt=False, evict=False, reorder=False):
