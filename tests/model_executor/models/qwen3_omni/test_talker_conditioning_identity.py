@@ -7,9 +7,9 @@ from dataclasses import replace
 import pytest
 
 from vllm_omni.model_executor.models.qwen3_omni.talker_conditioning import (
-    TalkerCacheNamespace,
     TalkerProcessedMediaIdentity,
-    talker_conditioning_digest,
+    complete_talker_conditioning_digest,
+    thinker_conditioning_digest,
 )
 from vllm_omni.model_executor.models.qwen3_omni.talker_input_plan import plan_talker_prefill, talker_prefill_token_ids
 
@@ -41,12 +41,23 @@ def _conditioning():
         text_controls=(151671, 151672, 151673),
         codec_controls=(4203, 4204, 4205, 7, 4196, 4197),
         media_token_ids=(IMAGE, AUDIO, VIDEO),
-        namespace=TalkerCacheNamespace(
-            source_model="thinker-revision-A",
-            talker_model="talker-revision-A",
-            projection="projection-v1",
-        ),
+        source_model="thinker-revision-A",
+        source_adapter=None,
+        talker_model="talker-revision-A",
+        talker_adapter=None,
+        projection="projection-v1",
         processed_media=media,
+    )
+
+
+def _conditioning_digest(*, talker_model, talker_adapter, projection, codec_controls, **source):
+    return complete_talker_conditioning_digest(
+        source_digest=thinker_conditioning_digest(**source),
+        talker_model=talker_model,
+        talker_adapter=talker_adapter,
+        projection=projection,
+        text_controls=source["text_controls"],
+        codec_controls=codec_controls,
     )
 
 
@@ -78,7 +89,7 @@ def _request_hashes(conditioning, request_id):
         prompt_token_ids=token_ids,
         mm_features=[],
         cache_salt="caller",
-        conditioning_digest=talker_conditioning_digest(**conditioning),
+        conditioning_digest=_conditioning_digest(**conditioning),
         sampling_params=request.sampling_params,
     )
     install_request_input(request, candidate)
@@ -90,15 +101,15 @@ def test_equivalent_complete_conditioning_has_canonical_identity():
     first = _conditioning()
     second = _conditioning()
     second["processed_media"] = tuple(reversed(second["processed_media"]))
-    assert talker_conditioning_digest(**first) == talker_conditioning_digest(**second)
-    assert len(talker_conditioning_digest(**first)) == 64
+    assert _conditioning_digest(**first) == _conditioning_digest(**second)
+    assert len(_conditioning_digest(**first)) == 64
     assert _request_hashes(first, "producer-A") == _request_hashes(second, "different-consumer-B")
     # There is deliberately no request ID, generation, timestamp or decode
     # state argument. None of these can enter this fixed-input identity.
     for forbidden in ("request_id", "generation", "timestamp", "decode_flag"):
         with pytest.raises(TypeError):
             arguments = {**first, forbidden: "owner-only"}
-            talker_conditioning_digest(**arguments)
+            _conditioning_digest(**arguments)
 
 
 @pytest.mark.parametrize(
@@ -123,7 +134,7 @@ def test_equivalent_complete_conditioning_has_canonical_identity():
 )
 def test_each_effective_dependency_changes_identity(dependency):
     args = _conditioning()
-    before = talker_conditioning_digest(**args)
+    before = _conditioning_digest(**args)
     before_hashes = _request_hashes(args, "A")
     if dependency in {"system", "suffix"}:
         args["sequence_ids"][3 if dependency == "system" else -1] += 1
@@ -151,18 +162,18 @@ def test_each_effective_dependency_changes_identity(dependency):
             *args["processed_media"][1:],
         )
     else:
-        args["namespace"] = replace(args["namespace"], **{dependency: "different"})
-    assert talker_conditioning_digest(**args) != before
+        args[dependency] = "different"
+    assert _conditioning_digest(**args) != before
     assert _request_hashes(args, "B") != before_hashes
 
 
 def test_media_position_and_embedding_mask_are_part_of_identity():
     args = _conditioning()
-    before = talker_conditioning_digest(**args)
+    before = _conditioning_digest(**args)
     # Include the preceding text row in an explicit sparse placeholder range.
     item = replace(args["processed_media"][0], offset=6, length=2, is_embed=(False, True))
     args["processed_media"] = (item, *args["processed_media"][1:])
-    assert talker_conditioning_digest(**args) != before
+    assert _conditioning_digest(**args) != before
 
 
 @pytest.mark.parametrize("invalid", ["missing", "raw-dict", "label", "bad-mask", "wrong-modality", "outside"])
@@ -182,7 +193,7 @@ def test_media_requires_complete_processed_identity_and_valid_layout(invalid):
     else:
         args["processed_media"] = (replace(item, offset=len(args["prompt_ids"])), *rest)
     with pytest.raises(ValueError):
-        talker_conditioning_digest(**args)
+        _conditioning_digest(**args)
 
 
 def test_text_only_inputs_need_no_media_provenance():
@@ -190,11 +201,11 @@ def test_text_only_inputs_need_no_media_provenance():
     for index in (7, 8, 9):
         args["prompt_ids"][index] = args["sequence_ids"][index] = 20 + index
     args["processed_media"] = ()
-    assert talker_conditioning_digest(**args)
+    assert _conditioning_digest(**args)
 
 
 def test_sequence_must_include_the_declared_source_context():
     args = _conditioning()
     args["sequence_ids"][0] += 1
     with pytest.raises(ValueError, match="source prompt"):
-        talker_conditioning_digest(**args)
+        _conditioning_digest(**args)

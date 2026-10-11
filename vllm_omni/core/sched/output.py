@@ -33,6 +33,7 @@ class OmniNewRequestData(NewRequestData):
     external_req_id: str | None = None
     additional_information: AdditionalInformationPayload | dict[str, object] | None = None
     model_intermediate_buffer: dict[str, object] | None = None
+    resumable: bool = False
     processed_media_provenance: ProcessedMediaProvenance | None = None
 
     @classmethod
@@ -48,6 +49,7 @@ class OmniNewRequestData(NewRequestData):
             external_req_id=getattr(request, "external_req_id", None),
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            resumable=bool(getattr(request, "resumable", False)),
             processed_media_provenance=getattr(request, "processed_media_provenance", None),
         )
 
@@ -83,6 +85,7 @@ class OmniNewRequestData(NewRequestData):
             prefill_token_ids=prefill_token_ids,
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            resumable=bool(getattr(request, "resumable", False)),
             processed_media_provenance=getattr(request, "processed_media_provenance", None),
         )
 
