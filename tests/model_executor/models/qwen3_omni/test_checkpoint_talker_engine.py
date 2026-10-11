@@ -634,6 +634,31 @@ def test_full_checkpoint_new_prefill_preserves_pending_history(talker_engine, mo
         assert _emitted_codes(outputs[request.request_id]).shape == (request.num_prompt_tokens + 17, 16)
 
 
+@pytest.mark.parametrize("evict_prefix", [False, True], ids=["prefix-retained", "prefix-evicted"])
+@torch.inference_mode()
+def test_full_checkpoint_batched_codec_history_survives_preemption(talker_engine, evict_prefix):
+    engine = talker_engine
+    if not engine.vllm_config.cache_config.enable_prefix_caching:
+        pytest.skip("request-local codec replay requires the guarded cache path")
+    assert engine.reset_prefix_cache()
+    torch.manual_seed(321)
+    reference = _generate_pair(engine, "codec-batch-reference")
+    torch.manual_seed(321)
+    resumed = _generate_pair(engine, "codec-batch-resumed", preempt=True, evict=evict_prefix)
+    for (before, before_outputs), (after, after_outputs) in zip(reference, resumed, strict=True):
+        assert list(after.output_token_ids) == list(before.output_token_ids)
+        torch.testing.assert_close(_emitted_codes(after_outputs), _emitted_codes(before_outputs), rtol=0, atol=0)
+    # Reordering can change future global RNG draws, but never accepted codes.
+    torch.manual_seed(321)
+    reordered = _generate_pair(engine, "codec-batch-reordered", preempt=True, evict=True, reorder=True)
+    for (before, before_outputs), (after, after_outputs) in zip(reference, reordered, strict=True):
+        assert list(after.output_token_ids[:6]) == list(before.output_token_ids[:6])
+        prefix_end = before.num_prompt_tokens + 5
+        torch.testing.assert_close(
+            _emitted_codes(after_outputs)[:prefix_end], _emitted_codes(before_outputs)[:prefix_end], rtol=0, atol=0
+        )
+
+
 def test_full_checkpoint_two_live_requests_keep_batched_mtp(talker_engine, checkpoint_code2wav, cache_off_reference):
     engine = talker_engine
     assert engine.reset_prefix_cache()
