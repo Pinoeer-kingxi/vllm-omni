@@ -234,4 +234,8 @@ If the READ already completed, the test skips rather than claiming active-READ
 cancellation coverage. These tests validate the selected local transport; cross-node
 RDMA cancellation needs a separate run with the revised source.
 
+Active READ retirement with NIXL 1.5 / UCX 1.23 over TCP has emitted UCX
+`ucp_requests` pool warnings. Released connector records and successful survivor
+READs do not establish complete native backend cleanup; this remains a validation gap.
+
 For more details, refer to the [NIXL repository](https://github.com/ai-dynamo/nixl).
