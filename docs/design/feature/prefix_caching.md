@@ -237,7 +237,7 @@ From the repository root, with the local checkpoint in `MODEL_PATH`:
 ```bash
 PYTHONPATH="$PWD" VLLM_BATCH_INVARIANT=1 \
 vllm serve "$MODEL_PATH" --omni --port 8090 \
-  --stage-config-path tests/model_executor/models/qwen3_omni/talker_qualification.yaml
+  --deploy-config tests/model_executor/models/qwen3_omni/talker_qualification.yaml
 ```
 
 For stage-local recovery qualification on one idle GPU:
