@@ -299,7 +299,7 @@ class NixlConnector(OmniConnectorBase):
                     (
                         payload.agent
                         for key, payload in self._pending.items()
-                        if prefix is not None and _matches_payload_prefix(key, prefix)
+                        if prefix is not None and _matches_payload_prefix(key, prefix) and payload.agent is not None
                     ),
                     None,
                 )
@@ -571,7 +571,6 @@ class NixlConnector(OmniConnectorBase):
                 agent.deregister_memory(reg_descs)
                 pending.registrations.pop(0)
             with self._state_lock:
-                self._pending.pop(key)
                 pending.agent = None
                 pending.tensors.clear()
                 if (
@@ -582,7 +581,11 @@ class NixlConnector(OmniConnectorBase):
                 ):
                     # Retain at most one fully unregistered completed context.
                     self._idle_producer_agent = agent
+            # Prefix retirement must still observe this release until the local
+            # reference is dropped, including when sibling chunks share it.
             agent = None
+            with self._state_lock:
+                self._pending.pop(key)
         finally:
             with self._state_lock:
                 pending.releasing = None

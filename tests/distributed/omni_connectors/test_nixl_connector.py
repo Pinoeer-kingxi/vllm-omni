@@ -562,6 +562,79 @@ def test_context_retirement_allows_unrelated_request_progress(producer, monkeypa
     assert producer.put("0", "2", "blocked_0_0", torch.zeros(4))[0]
 
 
+def test_prefix_retirement_waits_for_sibling_ack_owner_release(producer, monkeypatch):
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _GET_META_MSG, _XFER_DONE_MSG
+
+    detached = threading.Event()
+    resume = threading.Event()
+    retiring = threading.Event()
+    retired = threading.Event()
+    storage_at_retirement = []
+    errors = []
+
+    class Agent(_FakeNixlAgent):
+        def __del__(self):
+            storage_at_retirement.append(source_ref() is not None)
+
+    monkeypatch.setattr(producer, "_agent_factory", lambda: Agent("shared"))
+    assert producer.put("0", "2", "shared_0_0", torch.ones(4))[0]
+    assert producer.put("0", "2", "shared_0_1", torch.ones(4))[0]
+    completing = producer._pending["shared_0_0"]
+    assert completing.agent is producer._pending["shared_0_1"].agent
+    source_ref = weakref.ref(producer._pending["shared_0_1"].tensors[0])
+    claim = {"key": "shared_0_0", "claim_id": "reader"}
+    metadata = msgspec.msgpack.decode(producer._handle_handshake_message(_GET_META_MSG + msgspec.msgpack.encode(claim)))
+    claim["generation"] = metadata["generation"]
+    lock = producer._state_lock
+
+    class ReleaseGate:
+        def __enter__(self):
+            lock.acquire()
+            if threading.current_thread() is cleanup:
+                retiring.set()
+
+        def __exit__(self, *exc):
+            lock.release()
+            if threading.current_thread() is ack and completing.agent is None and not detached.is_set():
+                detached.set()
+                resume.wait(5)
+
+    def complete():
+        try:
+            producer._handle_handshake_message(_XFER_DONE_MSG + msgspec.msgpack.encode(claim))
+        except BaseException as exc:
+            errors.append(exc)
+
+    def retire():
+        try:
+            producer.cleanup_prefix("shared_0_")
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            retired.set()
+
+    ack = threading.Thread(target=complete)
+    cleanup = threading.Thread(target=retire)
+    monkeypatch.setattr(producer, "_state_lock", ReleaseGate())
+    ack.start()
+    try:
+        assert detached.wait(2)
+        assert producer.put("0", "2", "shared_0_2", torch.ones(4))[0]
+        assert producer._pending["shared_0_2"].agent is producer._pending["shared_0_1"].agent
+        cleanup.start()
+        assert retiring.wait(2)
+        assert not retired.wait(0.1), "Prefix retirement ignored the sibling ACK's native owner"
+        assert source_ref() is not None
+    finally:
+        resume.set()
+        ack.join(3)
+        if cleanup.ident is not None:
+            cleanup.join(3)
+    assert not ack.is_alive() and not cleanup.is_alive() and not errors
+    assert storage_at_retirement == [True]
+    assert source_ref() is None and not producer._pending and not producer._registered_descs
+
+
 def test_expired_release_failure_does_not_reject_independent_put(producer, monkeypatch):
     observed = threading.Event()
     assert producer.put("0", "2", "expired_0_0", torch.ones(4))[0]
