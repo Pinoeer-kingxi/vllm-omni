@@ -3,7 +3,6 @@
 """Live small CPU predictor arithmetic, not a checkpoint/device qualification."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -59,7 +58,7 @@ def _talker(monkeypatch, dtype, num_groups):
 @pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
 def test_replay_matches_live_predictor_without_transformer_or_rng(
-    monkeypatch, model_dtype, input_dtype, batch_size, num_groups
+    mocker, monkeypatch, model_dtype, input_dtype, batch_size, num_groups
 ):
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(101)
@@ -70,7 +69,7 @@ def test_replay_matches_live_predictor_without_transformer_or_rng(
         state_after_sampling = torch.random.get_rng_state().clone()
         original_codes = codes.clone()
         original_sum = original_sum.clone()
-        forbidden = Mock(side_effect=AssertionError("replay must not sample or run the residual transformer"))
+        forbidden = mocker.Mock(side_effect=AssertionError("replay must not sample or run the residual transformer"))
         monkeypatch.setattr(model.code_predictor, "forward", forbidden)
         monkeypatch.setattr(model.code_predictor.model, "forward", forbidden)
         monkeypatch.setattr(model.code_predictor, "_sample_codes_gumbel", forbidden)
@@ -91,9 +90,9 @@ def test_replay_matches_live_predictor_without_transformer_or_rng(
 @pytest.mark.parametrize(
     "codes", [torch.zeros(2, 3), torch.zeros(2, 2, dtype=torch.long), torch.zeros(2, 3, 1, dtype=torch.long)]
 )
-def test_replay_rejects_wrong_tensor_contract_before_gather(monkeypatch, codes):
+def test_replay_rejects_wrong_tensor_contract_before_gather(mocker, monkeypatch, codes):
     model = _talker(monkeypatch, torch.float32, 3)
-    forbidden = Mock(side_effect=AssertionError("invalid replay must fail before gathering"))
+    forbidden = mocker.Mock(side_effect=AssertionError("invalid replay must fail before gathering"))
     monkeypatch.setattr(model.language_model.model.codec_embedding, "forward", forbidden)
     with pytest.raises(ValueError, match="complete int64"):
         model.replay_codec_embeddings(codes, dtype=torch.float32)
