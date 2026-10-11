@@ -3,6 +3,7 @@
 """Code2Wav must preserve its model dtype across overridden reductions."""
 
 from types import SimpleNamespace
+from weakref import ref
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@torch.inference_mode()
 def test_codec_mean_preserves_embedding_dtype_with_fp32_reduction(dtype, monkeypatch):
     model = object.__new__(Qwen3OmniMoeCode2Wav)
     nn.Module.__init__(model)
@@ -23,9 +25,12 @@ def test_codec_mean_preserves_embedding_dtype_with_fp32_reduction(dtype, monkeyp
     model.register_buffer("code_offset", torch.arange(3).reshape(1, 3, 1) * 8)
     model.upsample = nn.ModuleList()
     model.decoder = nn.ModuleList()
+    embedding_refs = []
+    model.code_embedding.register_forward_hook(lambda _module, _inputs, output: embedding_refs.append(ref(output)))
 
     def check_transformer_input(*, inputs_embeds):
         assert inputs_embeds.dtype == dtype
+        assert embedding_refs[-1]() is None
         return SimpleNamespace(last_hidden_state=inputs_embeds)
 
     model.pre_transformer = check_transformer_input
