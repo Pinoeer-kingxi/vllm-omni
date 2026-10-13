@@ -976,13 +976,25 @@ def test_request_local_snapshot_empty_handoff_stays_downstream_only(monkeypatch)
     assert accumulated == [("r1", {}, request, progress)]
 
 
-def test_request_local_snapshot_materializes_codes_once_at_flush():
+def test_request_local_snapshot_materializes_codes_once_at_flush(monkeypatch, mocker):
+    import vllm_omni.worker.gpu_ar_model_runner as module
+
     runner, _raw, request, progress = _make_request_local_snapshot_runner()
     stored = {"hidden": torch.tensor([[1.0]])}
-    entry: tuple[Any, ...] = ({}, stored, {}, request, progress)
+    snapshot = mocker.spy(module, "build_request_end_talker_codes")
+    sent = {}
+    runner._stage_id = 1
+    monkeypatch.setattr(runner, "send_full_payload_outputs", lambda *, scheduler_output, outputs: sent.update(outputs))
 
-    output, returned_request = GPUARModelRunner._materialize_full_payload_entry(runner, entry)
+    runner.accumulate_full_payload_output("r1", stored, request, owner=progress)
+    assert len(runner._pending_full_payload_send["r1"]) == 5
+    assert runner._pending_full_payload_send["r1"][4] is progress
+    snapshot.assert_not_called()
+    runner.flush_full_payload_outputs({"r1"})
+    output, returned_request = sent["r1"]
 
+    snapshot.assert_called_once_with(runner.model, request, owner=progress.owner)
+    assert runner._pending_full_payload_send == {}
     assert returned_request is request
     assert output["hidden"].tolist() == [[1.0]]
     assert output["codes.audio"].tolist() == [

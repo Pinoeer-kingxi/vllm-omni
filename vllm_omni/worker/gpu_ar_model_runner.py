@@ -1695,8 +1695,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         output, request = super()._materialize_full_payload_entry(entry)
         if not self._should_use_request_local_talker_snapshot():
             return output, request
-        owner = entry[4] if len(entry) > 4 else None
-        if owner is not None and getattr(owner, "retired", False):
+        # Cache-enabled handoff always captures progress in the accumulator's
+        # fifth element; legacy unowned entries cannot enter this gated path.
+        progress = entry[4]
+        if progress.retired:
             return output, request
         if request is None:
             raise ValueError("Talker request-end snapshot requires a retained request")
@@ -1704,7 +1706,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         output["codes.audio"] = build_request_end_talker_codes(
             self.model,
             request,
-            owner=getattr(owner, "owner", None),
+            owner=progress.owner,
         )
         return output, request
 
