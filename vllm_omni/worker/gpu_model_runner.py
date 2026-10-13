@@ -1917,7 +1917,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 nonlocal materialized_history
                 if materialized_history:
                     return
-                pending_talker_items: list[tuple[str, int, torch.Tensor, torch.Tensor | None, dict[str, Any]]] = []
+                # Talker has_preprocess selects the runner's embedding buffer
+                # above, including steps that contain only history rows.
+                assert inputs_embeds is not None
+                pending_talker_items: list[tuple[str, int, torch.Tensor, torch.Tensor, dict[str, Any]]] = []
                 for req_index in history_req_indices:
                     req_id = self.input_batch.req_ids[req_index]
                     req_infos = self.model_intermediate_buffer.get(req_id, {})
@@ -1930,7 +1933,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                             req_id,
                             num_computed_tokens,
                             preprocess_input_ids[s:e],
-                            inputs_embeds[s:e] if inputs_embeds is not None else None,
+                            inputs_embeds[s:e],
                             req_infos,
                         )
                     )
@@ -2047,15 +2050,13 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
     def _materialize_pending_talker_history(
         self,
-        items: list[tuple[str, int, torch.Tensor, torch.Tensor | None, dict[str, Any]]],
+        items: list[tuple[str, int, torch.Tensor, torch.Tensor, dict[str, Any]]],
     ) -> None:
         """Batch pending request-local Talker codec decisions for this step."""
         pending: list[tuple[int, Any]] = []
         primaries: list[torch.Tensor] = []
         hidden_rows: list[torch.Tensor] = []
         for req_id, row_start, input_ids, input_embeds, payload in items:
-            if input_embeds is None:
-                raise ValueError("Talker pending codec batching requires model input embeddings")
             req_state = self.requests.get(req_id)
             if req_state is None:
                 raise ValueError("Talker pending codec batching requires a retained request state")
