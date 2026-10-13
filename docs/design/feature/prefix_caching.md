@@ -218,6 +218,11 @@ fixed conditioning and these decisions without resampling. Replacement clears
 that history; resume requires the same content owner and accepted frontier.
 Codec history is not carried in client metadata or scheduler IPC.
 
+The recovery fixture and MTP graph path are CUDA-only qualification. NPU
+Talker prefix caching remains refused by the public guard; NPU replay and
+request-end payload construction are not qualified. This does not change
+cache-off NPU execution or the generic prefix-cache contracts.
+
 The test-only worker and deploy profile are checked in under
 `tests/model_executor/models/qwen3_omni/`. They bypass only the public Talker
 support refusal, retain the KV/layout/token-accounting checks, and do not

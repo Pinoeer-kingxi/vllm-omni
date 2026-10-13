@@ -475,6 +475,20 @@ def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
     assert int(info_r2["codes"]["audio"][0, 0]) == 1
 
 
+def test_talker_mtp_invocation_accepts_explicit_none_generators(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.talker_mtp = CaptureTalkerMTP()
+
+    embeds, codes = runner._invoke_talker_mtp(1, generators=None)
+
+    assert embeds.shape == (1, 4)
+    assert codes.shape == (1, 1)
+    assert runner.talker_mtp.calls[0]["generators"] is None
+
+
 def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 

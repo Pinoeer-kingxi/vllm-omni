@@ -2055,7 +2055,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # it manages its own device graphs internally (code_predictor has its
         # own bucket sizes).
         seeded = talker_kwargs.get("generator") is not None or any(
-            generator is not None for generator in talker_kwargs.get("generators", ())
+            generator is not None for generator in (talker_kwargs.get("generators") or ())
         )
         if not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls()) or seeded:
             _cudagraph_mode = CUDAGraphMode.NONE
