@@ -177,6 +177,14 @@ lookup entry asserts that provisional input cannot be used. A length-only
 producer notice also finalizes input when its length matches the placeholder.
 This generic protocol does not enable Qwen3-Omni Talker content identity.
 
+These scheduler, adapter and delivery contracts apply to every prefix-cache
+stage, not just Talker. A producer chooses one final-input notice: either
+length-only for an unchanged token domain, or IDs and length together for
+content-bearing input. A later notice cannot replace finalized IDs without an
+explicit replacement. Full-payload Thinker-to-Talker publishes IDs, length and
+source conditioning together; the receiver publishes their metadata and
+readiness only after the same payload is visible on all local TP ranks.
+
 The scheduler assigns an admission ID and content generation to each request.
 An accepted replacement emits `REPLACED` and increments the content generation;
 transport chunk counters and ordinary append/preemption do not increment it.
@@ -204,6 +212,11 @@ Complete prompt-only blocks may be shared; blocks containing generated tokens
 are private to their scheduler admission/content owner.
 
 Input identity alone does not make generated codec decisions replayable.
+With Talker prefix caching enabled, finalization requires verified complete
+source conditioning. Missing provenance fails that request; it does not fall
+back to placeholder IDs. Cache-off full-payload execution still uses the same
+row plan, but permits source conditioning without verified provenance. The
+row-plan path has CUDA and CPU coverage; NPU numerical parity is not qualified.
 The public Talker cache startup guard remains closed. The phase 1 candidate
 uses synchronous full-payload input, Talker TP/PP/PCP/DCP=1, no speculative
 decoding or external KV transfer, and same-worker recovery only.
@@ -225,6 +238,11 @@ decisions for N accepted primaries; the terminal primary has no next-input row.
 Retired owners cannot publish this snapshot. Connector-less delivery keeps its
 existing cached codec payload path, and same-owner abort cleanup preserves the
 transport's existing partial-output behavior.
+
+The recovery fixture and MTP graph path are CUDA-only qualification. NPU
+Talker prefix caching remains refused by the public guard; NPU replay and
+request-end payload construction are not qualified. This does not change
+cache-off NPU execution or the generic prefix-cache contracts.
 
 The test-only worker and deploy profile are checked in under
 `tests/model_executor/models/qwen3_omni/`. They bypass only the public Talker
