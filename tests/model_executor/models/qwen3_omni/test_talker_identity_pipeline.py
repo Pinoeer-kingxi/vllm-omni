@@ -131,6 +131,24 @@ def _finalize(config, payload, request=None):
     return request, coordinator, metadata
 
 
+@pytest.mark.parametrize("cache_enabled", [False, True])
+def test_full_payload_notice_finalizes_ids_and_conditioning_together(cache_enabled):
+    source_config = _config("thinker")
+    target_config = _config("talker", enabled=cache_enabled)
+    payload = _payload(source_config, _source(source_config))
+    request = _request(payload)
+    request._omni_input_finalized = False
+
+    request, _coordinator, metadata = _finalize(target_config, payload, request)
+
+    assert {"next_stage_prompt_ids", "next_stage_prompt_len", "next_stage_source_digest"} <= metadata.keys()
+    assert len(metadata["next_stage_prompt_ids"]) == metadata["next_stage_prompt_len"]
+    assert request._omni_input_finalized
+    assert request.prompt_token_ids == metadata["next_stage_prompt_ids"]
+    assert request._omni_conditioning_digest is not None
+    assert request.block_hashes
+
+
 def test_source_and_consumer_use_their_own_configs_and_preserve_caller_salt_once(mocker):
     source_config, target_config = _config("thinker"), _config("talker")
     mocker.spy(source_config, "compute_hash")

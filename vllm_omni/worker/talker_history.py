@@ -110,8 +110,8 @@ def collect_pending_talker_primary(
     sampling_params = state.sampling_params
     if sampling_params is None:
         raise ValueError("Talker pending codec input requires sampling params")
-    # There is no next input for a terminal primary. Under the supported sync
-    # scope the request finishes before another scheduled preprocess arrives.
+    # Sync update_from_output checks max_tokens unconditionally before the next
+    # schedule; ignore_eos/min_tokens only affect EOS/stop checks, not this cap.
     if len(accepted) >= sampling_params.max_tokens:
         raise ValueError("Talker pending codec input exceeds max_tokens")
     current_offset = pending_position - row_start
