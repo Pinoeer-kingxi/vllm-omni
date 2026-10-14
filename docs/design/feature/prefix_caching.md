@@ -373,6 +373,31 @@ accumulation receives the clipped rows; replacement/snapshot fields retain
 their existing policy. Sparse list-only audio payloads bypass the token
 delivery cursor because their emission does not follow scheduler token ranges.
 
+The adapter is the sole owner of started-request observations. Its single
+`translate_step` entry point captures an immutable `PrefixCacheStep`.
+Ordinary `EXTENDED` is represented by `step.extended_req_ids`, with token counts
+in `step.scheduled_tokens`, avoiding per-request event allocation on every step.
+After a control-only replacement, the first lookup still carries a payload
+event, including when it arrives through `scheduled_cached_reqs`.
+It covers ordinary decode, chunked prefill and IDs re-entering
+`scheduled_new_reqs`. `RESUMED` payloads follow the scheduler's cached-request
+order. Terminal events precede arrivals, so same-step ID reuse finishes the old request
+before `STARTED` classifies the new one. The manager applies captured ownership
+to write/resource and delivery progress; it does not reclassify arrivals from
+write-task state.
+`ABORTED` accepts explicit optional `discarded_req_ids` or `aborted_req_ids`.
+The current `OmniSchedulerOutput` and upstream scheduler contract produce
+neither field: the `discarded_req_ids` producer is proposed in
+[PR #7681](https://github.com/vllm-project/vllm-omni/pull/7681), which has not
+landed. Until that dependency lands, production terminals remain `FINISHED`.
+The adapter's synthetic-input tests cover optional-field interpretation and
+ABORTED-over-FINISHED precedence, not production cancellation delivery.
+When #7681 lands, test actual scheduler `finish_requests`/`schedule` output
+through the adapter for waiting/running cancellation, failure and normal finish.
+Constructing `discarded_req_ids` by hand does not validate that producer path.
+Hit payloads describe prefixes `[0, hit_end)`; Item 4 selects unseen delivery
+ranges from captured request progress, not from an arbitrary adapter hit range.
+
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
 - Immediate (`JOIN_NEXT_STEP`): save launches a whole-step device→host into
@@ -421,6 +446,21 @@ sid = cache.save_outputs(hidden, mm_outputs, num_tokens_unpadded=n,
                          num_tokens_padded=n_pad, write_layout=layout)
 outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 ```
+
+`new_step_starts` accepts only `PrefixCacheStep`; there is no bare-event or
+per-event count fallback. The runner builds the write layout from that step's
+captured counts. Before saving any rows, the manager cross-checks layout
+counts against the captured step for each prefix hit under `_state_lock`.
+A disagreement (including an omitted hit request) raises
+`OmniPrefixCacheUnmatchError` instead of merging into a wrongly sized buffer.
+
+Ordinary negative scheduled spans are normalized to zero (the runner's
+non-positive-span no-op contract). A negative count for a `STARTED` prefix
+hit raises before manager prefetch; write layouts still reject negative
+counts supplied independently. Runner initialization creates manager,
+adapter and view together; a partial unit fails before the forward.
+Shutdown stops the manager and clears the adapter, view, step snapshot and
+staged config together, releasing the view's reference to the input batch.
 
 Each step id is consumed exactly once. `req_ids` must be a subset of the save
 snapshot. At most `staging_depth` unused step ids may exist at once: every

@@ -5,14 +5,17 @@
 Naming aligns with vLLM's v1/core KV-cache design.
 """
 
+from __future__ import annotations
+
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
 
-from .adapter import PrefixCacheRequestOwner
+if TYPE_CHECKING:
+    from .adapter import PrefixCacheRequestOwner
 
 # Four identities (still str/int at runtime, not interchangeable):
 #   TensorName  which cached tensor (hidden / mm), not a prefix hash
@@ -77,7 +80,7 @@ class PrefixCacheConfig:
         block_size: int,
         scheduler_config: Any = None,
         model_config: Any = None,
-    ) -> "PrefixCacheConfig":
+    ) -> PrefixCacheConfig:
         """Size device→host staging from the running scheduler.
 
         A slot holds one *step* (the whole batch), not one request:
@@ -195,7 +198,7 @@ class ModelCachePolicy:
         return is_hidden_key(key) or key in self.deferred_keys
 
     @classmethod
-    def from_model(cls, model: Any) -> "ModelCachePolicy":
+    def from_model(cls, model: Any) -> ModelCachePolicy:
         """Shim over legacy per-model attributes (deprecation window)."""
         deferred = frozenset(getattr(model, "deferred_prefix_cache_mm_keys", ()) or ())
         return cls(
