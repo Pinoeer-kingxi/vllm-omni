@@ -238,4 +238,64 @@ Active READ retirement with NIXL 1.5 / UCX 1.23 over TCP has emitted UCX
 `ucp_requests` pool warnings. Released connector records and successful survivor
 READs do not establish complete native backend cleanup; this remains a validation gap.
 
+### Publication and synchronization fixture
+
+Run on Linux from the repository root with an idle CUDA GPU and the same source, runtime
+and UCX settings for each comparison:
+
+```bash
+: "${CUDA_VISIBLE_DEVICES:?Select an idle GPU}"
+UCX_TLS=tcp,cuda_copy,self UCX_RCACHE_MAX_UNRELEASED=1024 \
+  python benchmarks/distributed/omni_connectors/benchmark_nixl_publication.py \
+  --prefixes 64 --output publication.json
+```
+
+This fixture publishes ready 32 KiB tensors with retained independent prefixes,
+then sends metadata claims and completion ACKs without a payload READ. It reports
+put samples/P95, context count, thread/RSS changes and put latency with work on an
+unrelated CUDA stream. The ACKs are synthetic; this is not a transfer-throughput
+or serving benchmark. JSON records the connector hash and runtime settings.
+Use separate output paths; existing artifacts are not overwritten.
+
+### Cross-node active-READ cancellation fixture
+
+Use the same source and runtime on two nodes, with one idle GPU on each. Start
+the producer with its reachable IPv4 address:
+
+```bash
+: "${CUDA_VISIBLE_DEVICES:?Select an idle GPU}"
+: "${NIXL_PRODUCER_HOST:?Set the reachable producer address}"
+python benchmarks/distributed/omni_connectors/cross_node_nixl_cancellation.py \
+  producer --host "$NIXL_PRODUCER_HOST" --endpoint endpoint.json \
+  --output producer.json
+```
+
+On the consumer, set the ports from the producer's `endpoint.json`:
+
+```bash
+: "${CUDA_VISIBLE_DEVICES:?Select an idle GPU}"
+: "${NIXL_PRODUCER_HOST:?Set the reachable producer address}"
+: "${NIXL_PORT:?Set the producer metadata port}"
+: "${NIXL_CONTROL_PORT:?Set the producer control port}"
+python benchmarks/distributed/omni_connectors/cross_node_nixl_cancellation.py \
+  receiver --host "$NIXL_PRODUCER_HOST" --port "$NIXL_PORT" \
+  --control-port "$NIXL_CONTROL_PORT" --output receiver.json
+```
+
+The consumer observes a real 512 MiB native READ in `PROC` before requesting
+source retirement. It then checks destination cleanup, an independent request
+and same-key/new-generation reuse with exact tensor values. A READ that already
+completed cannot pass the active-cancellation check.
+
+Set `UCX_TLS` and `UCX_NET_DEVICES` for the intended transport on both nodes and
+capture their complete process logs with `UCX_LOG_LEVEL=info`. TCP/cuda_copy is
+not RDMA evidence. An RDMA result also requires a usable RDMA link on both peers
+and UCX logs showing the selected RMA lane; configured environment variables
+alone do not establish the transport or GPUDirect support. A zero process exit
+and empty connector records do not override UCX request-pool warnings.
+
+These are connector fixtures, not full-model serving qualification. The revised
+source still needs full-model cancellation integration, native UCX cleanup and
+real cross-node RDMA cancellation checks before those gaps can be closed.
+
 For more details, refer to the [NIXL repository](https://github.com/ai-dynamo/nixl).

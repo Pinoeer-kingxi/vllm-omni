@@ -9,11 +9,13 @@ the payload normalisation rather than any actual RDMA transfer.
 """
 
 import ctypes
+import subprocess
 import sys
 import threading
 import time
 import types
 import weakref
+from pathlib import Path
 from typing import Any
 
 import msgspec
@@ -26,6 +28,49 @@ from vllm_omni.data_entry_keys import HiddenStatesStruct, MetaStruct, OmniPayloa
 pytestmark = [pytest.mark.cpu, pytest.mark.parallel, pytest.mark.core_model]
 
 PORT = 47431
+
+
+@pytest.mark.parametrize(
+    "fixture,arguments,returncode,expected",
+    [
+        ("benchmark_nixl_publication.py", ["--help"], 0, "--prefixes"),
+        ("cross_node_nixl_cancellation.py", ["--help"], 0, "--control-port"),
+        (
+            "benchmark_nixl_publication.py",
+            ["--prefixes", "0", "--output", "unused.json"],
+            2,
+            "--prefixes must be positive",
+        ),
+        (
+            "benchmark_nixl_publication.py",
+            ["--prefixes", "1", "--num-threads", "-1", "--output", "unused.json"],
+            2,
+            "--num-threads must be non-negative",
+        ),
+        (
+            "cross_node_nixl_cancellation.py",
+            ["producer", "--host", "localhost", "--output", "unused.json"],
+            2,
+            "producer requires --endpoint",
+        ),
+        (
+            "cross_node_nixl_cancellation.py",
+            ["receiver", "--host", "localhost", "--port", "0", "--control-port", "1", "--output", "unused.json"],
+            2,
+            "receiver requires --port and --control-port in 1..65535",
+        ),
+    ],
+)
+def test_nixl_fixture_cli_validates_before_loading_native_sdk(fixture, arguments, returncode, expected):
+    root = Path(__file__).resolve().parents[3]
+    result = subprocess.run(
+        [sys.executable, "-I", str(root / "benchmarks/distributed/omni_connectors" / fixture), *arguments],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == returncode, result.stderr
+    assert expected in result.stdout + result.stderr
 
 
 def _wait_for_metadata(consumer, key, metadata=None, *, timeout=2.0):
