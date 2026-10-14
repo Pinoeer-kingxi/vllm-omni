@@ -187,7 +187,9 @@ of one payload does not stop the reaper or reject another request's publication.
 
 Receive cleanup releases handles, descriptor lists, remote agents and registrations
 in that order before acknowledging the source. Failed releases retain the remaining
-bundle for retry. A consumer with unfinished local transfers retains a strong
+bundle for retry. Overlapping GETs sharing a producer agent each hold a remote-agent
+lease; only the final owner disconnects it, including when a READ is deferred.
+A consumer with unfinished local transfers retains a strong
 reference to its connector and resources after `close()` returns. Permanently
 stuck local transfers can retain resources until process exit. Closing connectors
 reject new work and report unhealthy. Only trusted

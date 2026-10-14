@@ -106,6 +106,7 @@ class NixlConnector(OmniConnectorBase):
         self._active_gets: dict[str, int] = {}
         self._close_lock = threading.Lock()
         self._close_thread: threading.Thread | None = None
+        # One lease per GET, retained through deferred READ cleanup.
         self._remote_agents: list[str] = []
         self._metrics: dict[str, int] = {
             "puts": 0,
@@ -406,8 +407,9 @@ class NixlConnector(OmniConnectorBase):
 
             transfer.tensors = [self._allocate_tensor_from_spec(spec, metadata.get("kind")) for spec in tensor_specs]
             if descriptor_groups:
-                transfer.remote_agent = self._agent.add_remote_agent(metadata["agent_metadata"])
-                self._remote_agents.append(transfer.remote_agent)
+                with self._state_lock:
+                    transfer.remote_agent = self._agent.add_remote_agent(metadata["agent_metadata"])
+                    self._remote_agents.append(transfer.remote_agent)
             for descriptor_group in descriptor_groups:
                 remote_memory_type = descriptor_group["memory_type"]
                 indexed_regions = list(
@@ -662,9 +664,6 @@ class NixlConnector(OmniConnectorBase):
             # socket in the context is closed.
             self._safe_call(self._zmq_ctx.destroy, 0)
             self._zmq_ctx = None
-        for agent_name in list(self._remote_agents):
-            self._safe_call(self._agent.remove_remote_agent, agent_name)
-            self._remote_agents.remove(agent_name)
 
     def health(self) -> dict[str, Any]:
         return {
@@ -1049,13 +1048,13 @@ class NixlConnector(OmniConnectorBase):
             return
         if transfer.remote_agent is not None:
             try:
-                self._agent.remove_remote_agent(transfer.remote_agent)
+                with self._state_lock:
+                    if self._remote_agents.count(transfer.remote_agent) == 1:
+                        self._agent.remove_remote_agent(transfer.remote_agent)
+                    self._remote_agents.remove(transfer.remote_agent)
+                    transfer.remote_agent = None
             except Exception:
                 logger.debug("Failed to remove deferred NIXL remote agent", exc_info=True)
-            else:
-                if transfer.remote_agent in self._remote_agents:
-                    self._remote_agents.remove(transfer.remote_agent)
-                transfer.remote_agent = None
         transfer.registrations = self._release_owned_resources(self._agent.deregister_memory, transfer.registrations)
 
     @staticmethod

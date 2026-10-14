@@ -1465,6 +1465,83 @@ def test_close_keeps_active_get_completion_and_cleanup_alive(
         consumer.close()
 
 
+@pytest.mark.parametrize("defer_second", [False, True], ids=["completed", "deferred"])
+@pytest.mark.usefixtures("reliable_claim_queries")
+def test_overlapping_gets_keep_shared_remote_agent_until_last_release(
+    producer, consumer, ownership_copying_agent, monkeypatch, defer_second
+):
+    first_ready = threading.Event()
+    second_ready = threading.Event()
+    resume = threading.Event()
+    drained = threading.Event()
+    second_handle: list[Any] = []
+    received: dict[str, tuple[torch.Tensor, int] | None] = {}
+    removed: list[str] = []
+    wait = consumer._wait_for_transfer
+    transfer = consumer._agent.transfer
+
+    def wait_first(handle, key):
+        if key == "overlap_0_1" and defer_second:
+            raise TimeoutError("The second READ still owns its remote agent")
+        wait(handle, key)
+        if key == "overlap_0_0":
+            first_ready.set()
+            assert second_ready.wait(5)
+
+    def post(handle):
+        if threading.current_thread() is second:
+            second_handle.append(handle)
+            second_ready.set()
+            assert resume.wait(5)
+        transfer(handle)
+
+    monkeypatch.setattr(consumer, "_wait_for_transfer", wait_first)
+    monkeypatch.setattr(consumer._agent, "transfer", post)
+    monkeypatch.setattr(consumer._agent, "remove_remote_agent", removed.append)
+    monkeypatch.setattr(
+        consumer._agent,
+        "check_xfer_state",
+        lambda handle: "PROC"
+        if defer_second and second_handle and handle is second_handle[0] and not drained.is_set()
+        else "DONE",
+    )
+    for index in range(2):
+        assert producer.put("0", "1", f"overlap_0_{index}", torch.arange(4) + index)[0]
+    assert producer._pending["overlap_0_0"].agent is producer._pending["overlap_0_1"].agent
+    first = threading.Thread(target=lambda: received.update(first=consumer.get("0", "1", "overlap_0_0")))
+    second = threading.Thread(target=lambda: received.update(second=consumer.get("0", "1", "overlap_0_1")))
+    first.start()
+    try:
+        assert first_ready.wait(5)
+        second.start()
+        assert second_ready.wait(5)
+        first.join(5)
+        assert not first.is_alive()
+        assert received["first"] is not None
+        assert removed == [], "One GET disconnected the remote agent still owned by another GET"
+        resume.set()
+        second.join(5)
+        assert not second.is_alive()
+        torch.testing.assert_close(received["first"][0], torch.arange(4), rtol=0, atol=0)
+        if defer_second:
+            assert received["second"] is None
+            assert removed == [] and consumer._deferred_transfers
+            assert producer._pending["overlap_0_1"].claims
+            drained.set()
+            consumer.wait_for_cleanup("overlap_1_", receive_prefix="overlap_0_", deadline=time.monotonic() + 5)
+        else:
+            assert received["second"] is not None
+            torch.testing.assert_close(received["second"][0], torch.arange(4) + 1, rtol=0, atol=0)
+        assert removed == ["producer"]
+        assert not producer._pending and not consumer._deferred_transfers
+    finally:
+        resume.set()
+        drained.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+
+
 def test_deferred_transfer_is_retained_while_active(nixl_connector_cls):
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _DeferredTransfer
 
@@ -1481,6 +1558,7 @@ def test_deferred_transfer_is_retained_while_active(nixl_connector_cls):
         handles=["transfer"],
         remote_agent="producer",
     )
+    connector._remote_agents.append("producer")
     connector._defer_transfer(transfer)
     try:
         connector._reap_deferred_transfers()
@@ -1510,6 +1588,7 @@ def test_deferred_transfer_releases_exactly_once_after_done(nixl_connector_cls):
         handles=["transfer"],
         remote_agent="producer",
     )
+    connector._remote_agents.append("producer")
     connector._defer_transfer(transfer)
     try:
         connector._reap_deferred_transfers()
@@ -1640,6 +1719,7 @@ def test_close_returns_without_releasing_active_dma(nixl_connector_cls, poll_rai
         handles=["transfer"],
         remote_agent="producer",
     )
+    connector._remote_agents.append("producer")
     connector._defer_transfer(transfer)
     closing = threading.Thread(target=connector.close, daemon=True)
     try:

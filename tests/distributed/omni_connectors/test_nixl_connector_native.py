@@ -461,6 +461,66 @@ def test_native_close_keeps_inflight_get_completion_ack(monkeypatch):
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
 @pytest.mark.skipif(not _native_nixl_available(1), reason="requires NIXL and CUDA")
+def test_native_overlapping_gets_preserve_prepared_read(monkeypatch):
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
+
+    current_omni_platform.set_device(0)
+    first_ready = threading.Event()
+    second_ready = threading.Event()
+    resume = threading.Event()
+    received: dict[str, tuple[torch.Tensor, int] | None] = {}
+    reader_config = {"role": "receiver", "receive_device": "cuda:0", "metadata_query_timeout_ms": 5000}
+    with closing(NixlConnector({"role": "sender", "host": "127.0.0.1"})) as producer:
+        reader_config.update(sender_host=producer.host, sender_zmq_port=producer._zmq_port)
+        with closing(NixlConnector(reader_config)) as receiver:
+            wait = receiver._wait_for_transfer
+            transfer = receiver._agent.transfer
+
+            def wait_first(handle, key):
+                wait(handle, key)
+                if key == "overlap_0_0":
+                    first_ready.set()
+                    assert second_ready.wait(10)
+
+            def post(handle):
+                if threading.current_thread() is second:
+                    second_ready.set()
+                    assert resume.wait(10)
+                return transfer(handle)
+
+            monkeypatch.setattr(receiver, "_wait_for_transfer", wait_first)
+            monkeypatch.setattr(receiver._agent, "transfer", post)
+            for index in range(2):
+                assert producer.put("0", "2", f"overlap_0_{index}", torch.arange(32, device="cuda:0") + index)[0]
+            assert producer._pending["overlap_0_0"].agent is producer._pending["overlap_0_1"].agent
+            first = threading.Thread(target=lambda: received.update(first=receiver.get("0", "2", "overlap_0_0")))
+            second = threading.Thread(target=lambda: received.update(second=receiver.get("0", "2", "overlap_0_1")))
+            first.start()
+            try:
+                assert first_ready.wait(30)
+                second.start()
+                assert second_ready.wait(10)
+                first.join(10)
+                assert not first.is_alive() and received["first"] is not None
+                resume.set()
+                second.join(10)
+                assert not second.is_alive()
+                for index, name in enumerate(("first", "second")):
+                    result = received[name]
+                    assert result is not None, f"The overlapping {name} READ was invalidated"
+                    torch.testing.assert_close(result[0].cpu(), torch.arange(32) + index, rtol=0, atol=0)
+                assert not producer._pending and not producer._registered_descs
+                assert not receiver._deferred_transfers and not receiver._active_gets
+            finally:
+                resume.set()
+                first.join(10)
+                if second.ident is not None:
+                    second.join(10)
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@pytest.mark.skipif(not _native_nixl_available(1), reason="requires NIXL and CUDA")
 def test_native_final_ack_retries_deregistration_failure(monkeypatch):
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import (
         _ACK,
