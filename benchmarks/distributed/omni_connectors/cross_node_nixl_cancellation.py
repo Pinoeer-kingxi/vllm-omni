@@ -5,6 +5,7 @@
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -27,7 +28,10 @@ def main(args):
     else:
         config.update(role="receiver", sender_host=args.host, sender_zmq_port=args.port)
     connector = NixlConnector(config)
-    path = Path(__import__(NixlConnector.__module__, fromlist=["__file__"]).__file__)
+    path = Path(str(__import__(NixlConnector.__module__, fromlist=["__file__"]).__file__))
+    mapped = {line.split()[-1] for line in Path("/proc/self/maps").read_text().splitlines() if "/" in line}
+    plugins = sorted(path for path in mapped if Path(path).name == "libplugin_UCX.so")
+    libraries = sorted(path for path in mapped if Path(path).name.startswith(("libucp", "libuct", "libucs", "libucm")))
     report = {
         "role": args.role,
         "connector_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -38,6 +42,10 @@ def main(args):
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "ucx_tls": os.environ.get("UCX_TLS"),
         "ucx_net_devices": os.environ.get("UCX_NET_DEVICES"),
+        "nixl_version": importlib.metadata.version("nixl"),
+        "ucx_plugins": {plugin: hashlib.sha256(Path(plugin).read_bytes()).hexdigest() for plugin in plugins},
+        "ucx_libraries": {library: hashlib.sha256(Path(library).read_bytes()).hexdigest() for library in libraries},
+        "cancel_delay_ms": args.cancel_delay_ms,
         "scope": "Native connector cancellation; inspect UCX logs for actual transport. No model inference.",
     }
     try:
@@ -60,7 +68,6 @@ def main(args):
                     torch.arange(32, device="cuda", dtype=torch.int32),
                 )[0]
                 storage = weakref.ref(connector._pending["victim_0_0"].tensors[0])
-                native = weakref.ref(connector._pending["victim_0_0"].agent.agent)
                 with args.endpoint.open("x") as endpoint:
                     endpoint.write(
                         json.dumps(
@@ -76,6 +83,7 @@ def main(args):
                     with peer.makefile("rb") as messages:
                         assert messages.readline(64) == b"PROC\n", "Receiver must observe an actual pending READ"
                     assert connector._pending["victim_0_0"].claims
+                    native = weakref.ref(connector._pending["victim_0_0"].agent.agent)
                     started = time.monotonic()
                     assert connector.cleanup_prefix("victim_0_") == 1
                     report["cleanup_seconds"] = time.monotonic() - started
@@ -105,6 +113,8 @@ def main(args):
             wait = connector._wait_for_transfer
 
             def observe(handle, key):
+                if args.cancel_delay_ms:
+                    time.sleep(args.cancel_delay_ms / 1000)
                 state = connector._agent.check_xfer_state(handle)
                 report["state_before_cancel"] = state
                 print("LIVE READ BEFORE CANCEL", state, flush=True)
@@ -161,8 +171,11 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int)
     parser.add_argument("--control-port", type=int)
     parser.add_argument("--endpoint", type=Path)
+    parser.add_argument("--cancel-delay-ms", type=int, default=0, help="Let READ progress before checking PROC")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.cancel_delay_ms < 0:
+        parser.error("--cancel-delay-ms must be non-negative")
     if args.role == "producer" and args.endpoint is None:
         parser.error("producer requires --endpoint")
     if args.role == "receiver" and any(

@@ -59,6 +59,12 @@ PORT = 47431
             2,
             "receiver requires --port and --control-port in 1..65535",
         ),
+        (
+            "cross_node_nixl_cancellation.py",
+            ["receiver", "--host", "localhost", "--cancel-delay-ms", "-1", "--output", "unused.json"],
+            2,
+            "--cancel-delay-ms must be non-negative",
+        ),
     ],
 )
 def test_nixl_fixture_cli_validates_before_loading_native_sdk(fixture, arguments, returncode, expected):
@@ -82,6 +88,19 @@ def _wait_for_metadata(consumer, key, metadata=None, *, timeout=2.0):
             return resolved
         time.sleep(0.01)
     pytest.fail(f"Timed out waiting for metadata for {key!r}")
+
+
+def _claim(producer, key):
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _GET_META_MSG, _META_NOT_FOUND
+
+    reply = producer._handle_handshake_message(
+        _GET_META_MSG + msgspec.msgpack.encode({"key": key, "claim_id": "reader"})
+    )
+    return None if reply == _META_NOT_FOUND else msgspec.msgpack.decode(reply)
+
+
+def _fail_metadata():
+    raise RuntimeError("injected metadata publication failure")
 
 
 @pytest.mark.parametrize("misses", [0, 2])
@@ -298,6 +317,7 @@ def test_request_prefix_cleanup_retires_claimed_context_and_preserves_other_requ
     other_key = f"{other_request_id}_0_0"
     for key in ("req_0_0", "req_0_1", other_key):
         producer.put("0", "2", key, torch.ones(1))
+        assert consumer._resolve_metadata(key, None)
     metadata = consumer._resolve_metadata("req_0_1", None)
     assert producer._pending["req_0_0"].agent is producer._pending["req_0_1"].agent
     native = weakref.ref(producer._pending["req_0_0"].agent)
@@ -341,6 +361,7 @@ def test_cleanup_destroys_shared_context_before_releasing_all_source_storage(pro
         assert producer.put("0", "2", f"req_0_{chunk}", tensor)[0]
         tensors.append(weakref.ref(producer._pending[f"req_0_{chunk}"].tensors[0]))
         del tensor
+        assert _claim(producer, f"req_0_{chunk}")
     producer.cleanup_prefix("req_0_")
     assert destroyed == [True]
     assert all(tensor() is None for tensor in tensors)
@@ -350,9 +371,9 @@ def test_cleanup_destroys_shared_context_before_releasing_all_source_storage(pro
 def test_completed_context_reused_only_after_last_chunk_and_with_fresh_generation(producer, consumer):
     for chunk in range(2):
         assert producer.put("0", "2", f"req_0_{chunk}", torch.ones(4))[0]
-    agent = producer._pending["req_0_0"].agent
     first = consumer._resolve_metadata("req_0_0", None)
     second = consumer._resolve_metadata("req_0_1", None)
+    agent = producer._pending["req_0_0"].agent
     assert consumer._notify_transfer_done("req_0_0", first)
     idle_while_chunk_pending = producer._idle_producer_agent
     assert idle_while_chunk_pending is None
@@ -362,11 +383,13 @@ def test_completed_context_reused_only_after_last_chunk_and_with_fresh_generatio
     assert agent.registered == []
     assert producer.put("0", "2", "req_0_1", torch.zeros(4))[0]
     replacement = producer._pending["req_0_1"]
-    assert replacement.agent is agent
+    assert replacement.agent is None
     assert replacement.generation != second["generation"]
-    assert producer._idle_producer_agent is None
+    assert producer._idle_producer_agent is agent
     assert consumer._notify_transfer_done("req_0_1", second)
     assert producer._pending["req_0_1"] is replacement
+    assert consumer._resolve_metadata("req_0_1", None)
+    assert replacement.agent is agent and producer._idle_producer_agent is None
 
 
 def test_cuda_payload_ready_before_registration_and_publication(producer, monkeypatch):
@@ -378,38 +401,88 @@ def test_cuda_payload_ready_before_registration_and_publication(producer, monkey
             element_size=lambda: 4,
             get_device=lambda device=device: device.index,
             data_ptr=lambda: 1024,
+            is_contiguous=lambda: True,
         )
         for device in devices
     ]
     specs = [{"shape": [4], "dtype": "torch.float32", "device": str(device), "size": 16} for device in devices]
-    monkeypatch.setattr(producer, "_normalize_tensor_payload", lambda data: (tensors, specs))
+    monkeypatch.setattr(producer, "_is_tensor_payload", lambda data: True)
     synchronized: list[torch.device] = []
     monkeypatch.setattr(torch.accelerator, "synchronize", synchronized.append)
+
+    def normalize(data):
+        assert set(synchronized) == {torch.device("cuda:0"), torch.device("cuda:1")}
+        return tensors, specs
+
+    monkeypatch.setattr(producer, "_normalize_tensor_payload", normalize)
     agent = _FakeNixlAgent("ready-gpu-storage")
     register = agent.register_memory
 
     def register_ready(descs, backends=None):
         assert len(synchronized) == 2
         assert set(synchronized) == {torch.device("cuda:0"), torch.device("cuda:1")}
-        assert producer._published == {}
+        assert "req_0_0" in producer._published
         register(descs, backends)
 
     monkeypatch.setattr(agent, "register_memory", register_ready)
     monkeypatch.setattr(producer, "_agent_factory", lambda: agent)
-    assert producer.put("0", "2", "req_0_0", torch.ones(4))[0]
+    assert producer.put("0", "2", "req_0_0", tensors)[0]
     assert "req_0_0" in producer._published
+    assert producer._pending["req_0_0"].agent is None
+    assert _claim(producer, "req_0_0")
+
+
+@pytest.mark.parametrize("event_device", [None, "cuda:1", "not-an-event", "cuda:0"])
+@pytest.mark.parametrize("contiguous", [False, True])
+def test_ready_event_contract_and_copy_fence(producer, monkeypatch, event_device, contiguous):
+    calls = []
+    tensor = types.SimpleNamespace(
+        device=torch.device("cuda:0"),
+        numel=lambda: 4,
+        element_size=lambda: 4,
+        get_device=lambda: 0,
+        data_ptr=lambda: 1024,
+        is_contiguous=lambda: contiguous,
+    )
+
+    class Event:
+        device = torch.device(event_device) if event_device in ("cuda:0", "cuda:1") else None
+
+        def synchronize(self):
+            calls.append("source")
+
+    def normalize(data):
+        assert calls == ["source"]
+        calls.append("normalize")
+        return [tensor], [{"shape": [4], "dtype": "torch.float32", "device": "cuda:0", "size": 16}]
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device: types.SimpleNamespace(synchronize=lambda: calls.append("copy"))
+    )
+    monkeypatch.setattr(producer, "_is_tensor_payload", lambda data: True)
+    monkeypatch.setattr(producer, "_normalize_tensor_payload", normalize)
+    event = object() if event_device == "not-an-event" else Event()
+    success, _, metadata = producer.put("0", "2", "event_0_0", [tensor], ready_event=event)
+    if event_device != "cuda:0":
+        assert not success and metadata is None
+        assert calls == [] and not producer._pending
+    else:
+        assert success and metadata is not None
+        assert calls == ["source", "normalize"] + ([] if contiguous else ["copy"])
 
 
 @pytest.mark.usefixtures("reliable_claim_queries")
 def test_only_one_completed_context_retained_and_close_releases_it(producer, consumer):
     contexts = []
+    claims = {}
     for key in ("first_0_0", "second_0_0"):
         assert producer.put("0", "2", key, torch.ones(4))[0]
+        claims[key] = consumer._resolve_metadata(key, None)
         contexts.append(weakref.ref(producer._pending[key].agent))
     assert contexts[0]() is not contexts[1]()
     for key in ("first_0_0", "second_0_0"):
-        metadata = consumer._resolve_metadata(key, None)
-        assert consumer._notify_transfer_done(key, metadata)
+        assert consumer._notify_transfer_done(key, claims[key])
     assert producer._idle_producer_agent is contexts[0]()
     assert contexts[1]() is None
     assert producer._pending == producer._published == {}
@@ -423,11 +496,14 @@ def test_only_one_completed_context_retained_and_close_releases_it(producer, con
 @pytest.mark.parametrize("claimed", [False, True])
 def test_cancelled_context_is_destroyed_instead_of_reused(producer, consumer, claimed):
     assert producer.put("0", "2", "req_0_0", torch.ones(4))[0]
-    context = weakref.ref(producer._pending["req_0_0"].agent)
     if claimed:
         assert consumer._resolve_metadata("req_0_0", None) is not None
+        context = weakref.ref(producer._pending["req_0_0"].agent)
+    else:
+        assert producer._pending["req_0_0"].agent is None
     producer.cleanup_prefix("req_0_")
-    assert context() is None
+    if claimed:
+        assert context() is None
     assert producer._idle_producer_agent is None
 
 
@@ -467,8 +543,11 @@ def test_cleanup_rejects_partial_request_prefix(producer, prefix):
 
 
 def test_cleanup_registration_failure_preserves_owner_for_retry(producer, monkeypatch):
+    agent = _FakeNixlAgent("failed-claim")
+    monkeypatch.setattr(agent, "get_agent_metadata", _fail_metadata)
+    monkeypatch.setattr(producer, "_agent_factory", lambda: agent)
     producer.put("0", "1", "req_0_0", torch.ones(4))
-    agent = producer._pending["req_0_0"].agent
+    assert _claim(producer, "req_0_0") is None
     original = agent.deregister_memory
 
     def fail_registration(descs):
@@ -537,7 +616,7 @@ def test_final_ack_retries_failed_registration_release(producer, monkeypatch, re
     assert producer.put("0", "2", key, torch.zeros(4))[0]
     replacement = producer._pending[key]
     assert producer._handle_handshake_message(completion) == _ACK
-    assert producer._pending[key] is replacement and replacement.registrations
+    assert producer._pending[key] is replacement and replacement.agent is None
 
 
 @pytest.mark.parametrize("operation", ["put", "get", "ack"])
@@ -559,6 +638,7 @@ def test_context_retirement_allows_unrelated_request_progress(producer, monkeypa
 
     monkeypatch.setattr(producer, "_agent_factory", lambda: GatedAgent("blocked"))
     assert producer.put("0", "2", "blocked_0_0", torch.ones(4))[0]
+    assert _claim(producer, "blocked_0_0")
     source_ref = weakref.ref(producer._pending["blocked_0_0"].tensors[0])
     monkeypatch.setattr(producer, "_agent_factory", lambda: _FakeNixlAgent("other"))
     assert producer.put("0", "2", "other_0_0", torch.ones(4))[0]
@@ -624,6 +704,8 @@ def test_prefix_retirement_waits_for_sibling_ack_owner_release(producer, monkeyp
     monkeypatch.setattr(producer, "_agent_factory", lambda: Agent("shared"))
     assert producer.put("0", "2", "shared_0_0", torch.ones(4))[0]
     assert producer.put("0", "2", "shared_0_1", torch.ones(4))[0]
+    assert _claim(producer, "shared_0_0")
+    assert _claim(producer, "shared_0_1")
     completing = producer._pending["shared_0_0"]
     assert completing.agent is producer._pending["shared_0_1"].agent
     source_ref = weakref.ref(producer._pending["shared_0_1"].tensors[0])
@@ -665,6 +747,7 @@ def test_prefix_retirement_waits_for_sibling_ack_owner_release(producer, monkeyp
     try:
         assert detached.wait(2)
         assert producer.put("0", "2", "shared_0_2", torch.ones(4))[0]
+        assert _claim(producer, "shared_0_2")
         assert producer._pending["shared_0_2"].agent is producer._pending["shared_0_1"].agent
         cleanup.start()
         assert retiring.wait(2)
@@ -683,6 +766,10 @@ def test_prefix_retirement_waits_for_sibling_ack_owner_release(producer, monkeyp
 def test_expired_release_failure_does_not_reject_independent_put(producer, monkeypatch):
     observed = threading.Event()
     assert producer.put("0", "2", "expired_0_0", torch.ones(4))[0]
+    agent = _FakeNixlAgent("failed-claim")
+    monkeypatch.setattr(agent, "get_agent_metadata", _fail_metadata)
+    monkeypatch.setattr(producer, "_agent_factory", lambda: agent)
+    assert _claim(producer, "expired_0_0") is None
     pending = producer._pending["expired_0_0"]
     pending.deadline = 0
 
@@ -707,6 +794,10 @@ def test_lease_reaper_retries_release_failure_without_exiting(nixl_connector_cls
     attempts = []
     try:
         assert connector.put("0", "2", "expired_0_0", torch.ones(4))[0]
+        agent = _FakeNixlAgent("failed-claim")
+        monkeypatch.setattr(agent, "get_agent_metadata", _fail_metadata)
+        monkeypatch.setattr(connector, "_agent_factory", lambda: agent)
+        assert _claim(connector, "expired_0_0") is None
         pending = connector._pending["expired_0_0"]
         original_release = pending.agent.deregister_memory
 
@@ -739,7 +830,7 @@ def test_lease_reaper_retries_release_failure_without_exiting(nixl_connector_cls
         connector.close()
 
 
-def test_failed_first_publication_still_expires(nixl_connector_cls, monkeypatch):
+def test_failed_first_claim_registration_still_expires(nixl_connector_cls, monkeypatch):
     connector = nixl_connector_cls({"role": "sender", "host": "127.0.0.1", "lease_seconds": 0.01})
     agent = _FakeNixlAgent("failed-publication")
 
@@ -749,7 +840,8 @@ def test_failed_first_publication_still_expires(nixl_connector_cls, monkeypatch)
     monkeypatch.setattr(agent, "get_agent_metadata", fail_metadata)
     monkeypatch.setattr(connector, "_agent_factory", lambda: agent)
     try:
-        assert not connector.put("0", "2", "failed_0_0", torch.ones(4))[0]
+        assert connector.put("0", "2", "failed_0_0", torch.ones(4))[0]
+        assert _claim(connector, "failed_0_0") is None
         deadline = time.monotonic() + 2
         while connector._pending and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -1116,6 +1208,38 @@ def test_put_publishes_its_handshake_endpoint(producer):
 
 def test_agent_uses_strict_thread_synchronization(producer):
     assert producer._agent.config["sync_mode"] == "strict"
+    assert producer._agent.config["num_threads"] == 0
+
+
+@pytest.mark.parametrize("num_threads", [1, 4])
+def test_agent_preserves_explicit_worker_count(nixl_connector_cls, num_threads):
+    connector = nixl_connector_cls({"role": "receiver", "num_threads": num_threads})
+    try:
+        assert connector._agent.config["num_threads"] == num_threads
+    finally:
+        connector.close()
+
+
+def test_unclaimed_prefixes_do_not_create_native_contexts(producer, monkeypatch):
+    contexts = []
+
+    def create():
+        agent = _FakeNixlAgent("claimed")
+        contexts.append(agent)
+        return agent
+
+    monkeypatch.setattr(producer, "_agent_factory", create)
+    for prefix in range(16):
+        assert producer.put("0", "2", f"request{prefix}_0_0", torch.ones(4))[0]
+    assert contexts == [] and not producer._registered_descs
+    assert all(pending.agent is None for pending in producer._pending.values())
+    first = _claim(producer, "request0_0_0")
+    assert first and len(contexts) == 1
+    assert _claim(producer, "request0_0_0") == first
+    assert len(contexts) == 1 and len(producer._registered_descs) == 1
+    assert _claim(producer, "request1_0_0")
+    assert len(contexts) == 2
+    assert producer._pending["request0_0_0"].agent is not producer._pending["request1_0_0"].agent
 
 
 def test_handshake_serves_metadata_when_caller_has_none(producer, consumer):
@@ -1126,6 +1250,8 @@ def test_handshake_serves_metadata_when_caller_has_none(producer, consumer):
     # msgpack has no tuple type, so region descriptors arrive as lists; get()
     # re-tuples them before handing them to NIXL.
     assert resolved.pop("claim_id")
+    assert resolved.pop("agent_metadata")
+    assert "agent_metadata" not in published
     assert resolved == msgspec.msgpack.decode(msgspec.msgpack.encode(published))
     assert [tuple(region) for group in resolved["descriptor_groups"] for region in group["regions"]] == [
         region for group in published["descriptor_groups"] for region in group["regions"]
@@ -1321,7 +1447,7 @@ def test_lost_metadata_reply_retry_releases_source(producer, consumer, monkeypat
 @pytest.mark.usefixtures("reliable_claim_queries")
 def test_transfer_done_releases_the_producer_buffer(producer, consumer):
     _, _, metadata = producer.put("0", "1", "req-3", torch.arange(4, dtype=torch.float32))
-    assert producer._pending and producer._registered_descs
+    assert producer._pending and not producer._registered_descs
 
     metadata = consumer._resolve_metadata("req-3", metadata)
     consumer._notify_transfer_done("req-3", metadata)
@@ -1870,6 +1996,8 @@ def test_structured_payload_groups_descriptors_by_memory_type(producer, monkeypa
             "regions": metadata["descriptor_groups"][1]["regions"],
         },
     ]
+    assert not producer._registered_descs
+    assert _claim(producer, "req-mixed")
     assert len(producer._registered_descs) == 2
 
 
@@ -1912,8 +2040,9 @@ def test_partial_registration_failure_retains_storage_until_context_cleanup(prod
         {"meta": "value", "hidden": torch.ones(4, dtype=torch.float32)},
     )
 
-    assert success is False
-    assert metadata is None
+    assert success and metadata is not None
+    assert _claim(producer, "req-partial_0_0") is None
+    assert not producer._pending["req-partial_0_0"].claims
     assert producer._registered_descs == agent.registered
     assert len(producer._registered_descs) == 1
     assert producer._pending["req-partial_0_0"].tensors
@@ -1923,15 +2052,15 @@ def test_partial_registration_failure_retains_storage_until_context_cleanup(prod
     assert not producer._registered_descs
 
 
-def test_reusing_put_key_releases_previous_registration(producer):
+def test_reusing_unclaimed_put_key_releases_previous_storage(producer):
     producer.put("0", "1", "req-reuse", torch.zeros(2))
-    previous_registration = producer._registered_descs[0]
+    previous = weakref.ref(producer._pending["req-reuse"].tensors[0])
 
     producer.put("0", "1", "req-reuse", torch.ones(2))
 
-    assert previous_registration not in producer._registered_descs
-    assert len(producer._registered_descs) == 1
-    assert len(producer._registered_descs) == 1
+    assert previous() is None
+    assert not producer._registered_descs
+    torch.testing.assert_close(producer._pending["req-reuse"].tensors[0], torch.ones(2))
 
 
 def test_expired_snapshot_cannot_claim_replacement(producer):
@@ -2126,11 +2255,15 @@ def test_zero_byte_leaves_roundtrip_without_native_descriptors(
     ],
 )
 @pytest.mark.usefixtures("reliable_claim_queries")
-def test_invalid_empty_tensor_metadata_rejected_before_native_calls(producer, consumer, copying_native_agent, defect):
+def test_invalid_empty_tensor_metadata_rejected_before_native_calls(
+    producer, consumer, copying_native_agent, defect, monkeypatch
+):
     success, _, metadata = producer.put(
         "0", "1", "req-invalid-empty", [torch.empty((0, 2)), torch.tensor(3.0), torch.empty((1, 0))]
     )
     assert success
+    # Corrupt the received wire response, not the producer's internal state.
+    metadata = msgspec.msgpack.decode(msgspec.msgpack.encode(_claim(producer, "req-invalid-empty")))
     group = metadata["descriptor_groups"][0]
     region = group["regions"][0]
     if defect == "missing_groups":
@@ -2173,6 +2306,7 @@ def test_invalid_empty_tensor_metadata_rejected_before_native_calls(producer, co
         metadata["tensor_specs"][0]["dtype"] = "torch.not_a_dtype"
     elif defect == "bad_spec":
         metadata["tensor_specs"][0] = None
+    monkeypatch.setattr(consumer, "_query_metadata_at", lambda *args, **kwargs: metadata)
     assert consumer.get("0", "1", "req-invalid-empty", metadata) is None
     assert copying_native_agent == {"agents": [], "descs": [], "transfers": [], "released": []}
     assert consumer._agent.registered == []

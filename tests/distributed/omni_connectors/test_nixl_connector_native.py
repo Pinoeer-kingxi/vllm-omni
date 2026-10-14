@@ -36,6 +36,17 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _get_payload(receiver, key, metadata):
+    """Poll the bounded claim API, including first-claim native setup."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        result = receiver.get("0", "2", key, metadata)
+        if result is not None:
+            return result
+        time.sleep(0.01)
+    pytest.fail(f"No native payload for {key}")
+
+
 def _h3_conditioning(payload_kind: str, device: str = "cpu"):
     from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderConditioning
 
@@ -325,7 +336,7 @@ def _exit_after_native_read(metadata, status) -> None:
         os._exit(88)
 
     receiver._wait_for_transfer = exit_without_releasing
-    receiver.get("0", "2", "reader-loss_0_0", metadata)
+    _get_payload(receiver, "reader-loss_0_0", metadata)
     raise AssertionError("The receiver did not submit a native READ")
 
 
@@ -344,9 +355,7 @@ def test_native_reader_exit_reclaims_only_its_prefix_and_allows_key_reuse():
         del payload
         success, _, other_metadata = producer.put("0", "2", "survivor_0_0", torch.arange(32, device="cuda:0"))
         assert success
-        lost_agent = weakref.ref(producer._pending["reader-loss_0_0"].agent)
-        survivor_agent = producer._pending["survivor_0_0"].agent
-        assert lost_agent() is not survivor_agent
+        assert producer._pending["survivor_0_0"].agent is None
 
         context = mp.get_context("spawn")
         parent, child = context.Pipe(duplex=False)
@@ -366,15 +375,16 @@ def test_native_reader_exit_reclaims_only_its_prefix_and_allows_key_reuse():
             reader.close()
 
         assert producer._pending["reader-loss_0_0"].claims
+        lost_agent = weakref.ref(producer._pending["reader-loss_0_0"].agent)
         assert producer.cleanup_prefix("reader-loss_0_") == 1
         assert source_ref() is None and lost_agent() is None
-        assert producer._pending["survivor_0_0"].agent is survivor_agent
+        assert producer._pending["survivor_0_0"].agent is None
         success, _, reused_metadata = producer.put("0", "2", "reader-loss_0_0", torch.arange(32, device="cuda:0"))
         assert success
 
         with closing(NixlConnector({"role": "receiver", "receive_device": "cuda:0"})) as receiver:
             for key, wire in (("survivor_0_0", other_metadata), ("reader-loss_0_0", reused_metadata)):
-                received = receiver.get("0", "2", key, wire)
+                received = _get_payload(receiver, key, wire)
                 assert received is not None
                 torch.testing.assert_close(received[0].cpu(), torch.arange(32), rtol=0, atol=0)
         assert not producer._pending and not producer._registered_descs
@@ -383,25 +393,59 @@ def test_native_reader_exit_reclaims_only_its_prefix_and_allows_key_reuse():
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
 @pytest.mark.skipif(not _native_nixl_available(1), reason="requires NIXL and CUDA")
-def test_native_publication_waits_for_cuda_producer_stream():
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("explicit_event", [False, True])
+def test_native_publication_waits_for_cuda_producer_stream(strided, explicit_event):
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
 
     current_omni_platform.set_device(0)
     with closing(NixlConnector({"role": "sender", "host": "127.0.0.1"})) as producer:
-        payload = torch.zeros(32, device="cuda:0")
+        payload = torch.zeros(64 if strided else 32, device="cuda:0")
+        if strided:
+            payload = payload[::2]
+            # Warm the contiguous-copy allocation/kernel before scheduling the
+            # delayed writer; allocation can otherwise hide a missing fence.
+            payload.contiguous()
         torch.accelerator.synchronize()
         stream = torch.cuda.Stream(device=0)
+        ready = torch.cuda.Event()
         with torch.cuda.stream(stream):
             torch.cuda._sleep(100_000_000)
             payload.fill_(37)
-        success, _, metadata = producer.put("0", "2", "delayed_0_0", payload)
+            ready.record()
+        kwargs = {"ready_event": ready} if explicit_event else {}
+        success, _, metadata = producer.put("0", "2", "delayed_0_0", payload, **kwargs)
         assert success
         assert stream.query(), "Publication returned before producer work completed"
         with closing(NixlConnector({"role": "receiver", "receive_device": "cuda:0"})) as receiver:
-            received = receiver.get("0", "2", "delayed_0_0", metadata)
+            received = _get_payload(receiver, "delayed_0_0", metadata)
             assert received is not None
             torch.testing.assert_close(received[0].cpu(), torch.full((32,), 37.0), rtol=0, atol=0)
         assert not producer._pending and not producer._registered_descs
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@pytest.mark.skipif(not _native_nixl_available(1), reason="requires NIXL and CUDA")
+def test_native_ready_event_does_not_wait_for_unrelated_stream():
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
+
+    current_omni_platform.set_device(0)
+    with closing(NixlConnector({"role": "sender", "host": "127.0.0.1"})) as producer:
+        payload = torch.arange(32, device="cuda:0")
+        ready = torch.cuda.Event()
+        ready.record()
+        ready.synchronize()
+        unrelated = torch.cuda.Stream()
+        with torch.cuda.stream(unrelated):
+            torch.cuda._sleep(500_000_000)
+        assert producer.put("0", "2", "ready_0_0", payload, ready_event=ready)[0]
+        assert not unrelated.query(), "A payload event must not fence independent CUDA work"
+        unrelated.synchronize()
+        with closing(NixlConnector({"role": "receiver", "receive_device": "cuda:0"})) as receiver:
+            result = _get_payload(receiver, "ready_0_0", producer._published["ready_0_0"])
+            assert result is not None
+            torch.testing.assert_close(result[0].cpu(), torch.arange(32), rtol=0, atol=0)
 
 
 @pytest.mark.advanced_model
@@ -492,7 +536,6 @@ def test_native_overlapping_gets_preserve_prepared_read(monkeypatch):
             monkeypatch.setattr(receiver._agent, "transfer", post)
             for index in range(2):
                 assert producer.put("0", "2", f"overlap_0_{index}", torch.arange(32, device="cuda:0") + index)[0]
-            assert producer._pending["overlap_0_0"].agent is producer._pending["overlap_0_1"].agent
             first = threading.Thread(target=lambda: received.update(first=receiver.get("0", "2", "overlap_0_0")))
             second = threading.Thread(target=lambda: received.update(second=receiver.get("0", "2", "overlap_0_1")))
             first.start()
@@ -594,6 +637,8 @@ def test_native_context_retirement_allows_other_requests(monkeypatch):
         factory = producer._agent_factory
         monkeypatch.setattr(producer, "_agent_factory", lambda: GatedOwner(factory()))
         assert producer.put("0", "2", "blocked_0_0", torch.ones(32, device="cuda:0"))[0]
+        claim = {"key": "blocked_0_0", "claim_id": "blocked-reader"}
+        assert producer._handle_handshake_message(_GET_META_MSG + msgspec.msgpack.encode(claim))
         source_ref = weakref.ref(producer._pending["blocked_0_0"].tensors[0])
         monkeypatch.setattr(producer, "_agent_factory", factory)
         other_payload = torch.arange(32, device="cuda:0")
@@ -640,7 +685,11 @@ def test_native_context_retirement_allows_other_requests(monkeypatch):
 @hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
 @pytest.mark.skipif(not _native_nixl_available(1), reason="requires NIXL and CUDA")
 def test_native_expired_release_failure_is_retried(monkeypatch):
-    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import (
+        _GET_META_MSG,
+        _META_NOT_FOUND,
+        NixlConnector,
+    )
 
     current_omni_platform.set_device(0)
     observed = threading.Event()
@@ -648,7 +697,24 @@ def test_native_expired_release_failure_is_retried(monkeypatch):
     retried = threading.Event()
     attempts = []
     with closing(NixlConnector({"role": "sender", "host": "127.0.0.1"})) as producer:
+        factory = producer._agent_factory
+
+        def fail_metadata():
+            raise RuntimeError("injected native metadata failure")
+
+        def create():
+            agent = factory()
+            monkeypatch.setattr(agent, "get_agent_metadata", fail_metadata)
+            return agent
+
+        monkeypatch.setattr(producer, "_agent_factory", create)
         assert producer.put("0", "2", "expired_0_0", torch.ones(32, device="cuda:0"))[0]
+        assert (
+            producer._handle_handshake_message(
+                _GET_META_MSG + msgspec.msgpack.encode({"key": "expired_0_0", "claim_id": "reader"})
+            )
+            == _META_NOT_FOUND
+        )
         pending = producer._pending["expired_0_0"]
         original_release = pending.agent.deregister_memory
 
@@ -688,7 +754,9 @@ def _receive_during_prefix_retirement(metadata, status, inspect_read, resume_rea
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
 
     current_omni_platform.set_device(1)
-    with closing(NixlConnector({"role": "receiver", "receive_device": "cuda:1"})) as receiver:
+    # This probe gates DMA retirement, not the scheduler's bounded polling API.
+    config = {"role": "receiver", "receive_device": "cuda:1", "metadata_query_timeout_ms": 5000}
+    with closing(NixlConnector(config)) as receiver:
         wait = receiver._wait_for_transfer
 
         def observe(handle, key):
@@ -705,7 +773,7 @@ def _receive_during_prefix_retirement(metadata, status, inspect_read, resume_rea
             assert bool((result[0] == 0.25).all()), "A drained READ observed reclaimed source storage"
         status.send(("read_result", "drained" if result is not None else "aborted"))
         for key, wire, offset in status.recv():
-            received = receiver.get("0", "2", key, wire)
+            received = _get_payload(receiver, key, wire)
             assert received is not None
             torch.testing.assert_close(received[0].cpu(), torch.arange(32) + offset, rtol=0, atol=0)
         receiver.wait_for_cleanup("live_2_", receive_prefix="live_0_", deadline=time.monotonic() + 10)

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Measure native publication overhead with ready tensors, without payload READs."""
+"""Measure publication, claim and native READ costs with ready CUDA tensors."""
 
 import argparse
 import hashlib
@@ -47,21 +47,36 @@ def main(args):
     config = {"role": "sender", "host": "127.0.0.1", "backends": ["UCX"]}
     if args.num_threads is not None:
         config["num_threads"] = args.num_threads
-    with closing(NixlConnector(config)) as source:
+    with (
+        closing(NixlConnector(config)) as source,
+        closing(
+            NixlConnector({"role": "receiver", "receive_device": "cuda:0", "metadata_query_timeout_ms": 5000})
+        ) as receiver,
+    ):
         tensors = [torch.full((8192,), float(i), device="cuda") for i in range(args.prefixes)]
         torch.accelerator.synchronize()
+        ready = torch.cuda.Event()
+        ready.record()
+        ready.synchronize()
+        put_kwargs = {"ready_event": ready} if args.ready_event else {}
         assert source.put("0", "2", "warm_0_0", tensors[0])[0]
-        complete(source, "warm_0_0")
+        assert receiver.get("0", "2", "warm_0_0", source._published["warm_0_0"]) is not None
         baseline = resources()
         durations = []
         for index, tensor in enumerate(tensors):
             start = time.perf_counter()
-            assert source.put("0", "2", f"burst{index}_0_0", tensor)[0]
+            assert source.put("0", "2", f"burst{index}_0_0", tensor, **put_kwargs)[0]
             durations.append((time.perf_counter() - start) * 1000)
         peak = resources()
-        contexts = len({id(getattr(payload, "agent", source._agent)) for payload in source._pending.values()})
+        contexts = len({id(payload.agent) for payload in source._pending.values() if payload.agent is not None})
+        reads = []
         for index in range(args.prefixes):
-            complete(source, f"burst{index}_0_0")
+            key = f"burst{index}_0_0"
+            start = time.perf_counter()
+            received = receiver.get("0", "2", key, source._published[key])
+            reads.append((time.perf_counter() - start) * 1000)
+            assert received is not None
+            torch.testing.assert_close(received[0].cpu(), tensors[index].cpu(), rtol=0, atol=0)
         assert not source._pending and not source._registered_descs
         unrelated = torch.cuda.Stream()
         coupled = []
@@ -71,7 +86,7 @@ def main(args):
                 torch.cuda._sleep(100_000_000)
             start = time.perf_counter()
             key = f"interference{repeat}_0_0"
-            assert source.put("0", "2", key, tensors[0])[0]
+            assert source.put("0", "2", key, tensors[0], **put_kwargs)[0]
             interference.append((time.perf_counter() - start) * 1000)
             coupled.append(unrelated.query())
             unrelated.synchronize()
@@ -80,8 +95,12 @@ def main(args):
         result = {
             "prefixes": args.prefixes,
             "num_threads": args.num_threads,
+            "ready_event": args.ready_event,
             "publication_p95_ms": sorted(durations)[math.ceil(0.95 * len(durations)) - 1],
             "publication_samples_ms": durations,
+            "claim_read_ack_p95_ms": sorted(reads)[math.ceil(0.95 * len(reads)) - 1],
+            "claim_read_ack_samples_ms": reads,
+            "put_read_ack_p95_ms": sorted(a + b for a, b in zip(durations, reads))[math.ceil(0.95 * len(reads)) - 1],
             "producer_contexts_peak": contexts,
             "resources_warm": baseline,
             "resources_peak": peak,
@@ -98,9 +117,9 @@ def main(args):
             "ucx_tls": os.environ.get("UCX_TLS"),
             "ucx_net_devices": os.environ.get("UCX_NET_DEVICES"),
             "gpu": current_omni_platform.get_device_name(0),
-            "scope": "Native registrations and control messages; no payload READ or model inference",
+            "scope": "Ready 32 KiB payloads: put, claim, exact native READ and ACK; no model inference",
         }
-    source_path = Path(__import__(NixlConnector.__module__, fromlist=["__file__"]).__file__)
+    source_path = Path(str(__import__(NixlConnector.__module__, fromlist=["__file__"]).__file__))
     result["source_sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
     with Path(args.output).open("x") as output:
         output.write(json.dumps(result, indent=2) + "\n")
@@ -111,6 +130,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prefixes", type=int, required=True)
     parser.add_argument("--num-threads", type=int)
+    parser.add_argument("--ready-event", action="store_true", help="Use the producer's recorded readiness event")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     if args.prefixes < 1:
