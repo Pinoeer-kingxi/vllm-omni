@@ -1381,6 +1381,90 @@ def test_failed_listener_initialization_can_release_partial_resources(producer, 
     assert connector._zmq_ctx is None
 
 
+@pytest.mark.parametrize("outcome", ["completed-read", "deferred-read", "lost-metadata", "lost-metadata-finalizing"])
+def test_close_keeps_active_get_completion_and_cleanup_alive(
+    producer, consumer, ownership_copying_agent, monkeypatch, outcome
+):
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _RETAINED_PRODUCERS
+
+    entered = threading.Event()
+    resume = threading.Event()
+    state = ["PROC"]
+    received = []
+
+    def wait(handle, key):
+        entered.set()
+        assert resume.wait(5), "The test did not release the active get"
+        if outcome == "deferred-read":
+            raise TimeoutError("READ still owns its destination")
+        state[0] = "DONE"
+
+    monkeypatch.setattr(consumer._agent, "check_xfer_state", lambda handle: state[0], raising=False)
+    monkeypatch.setattr(consumer, "_wait_for_transfer", wait)
+    if outcome == "lost-metadata-finalizing":
+        finish = consumer._finish_receive_transfer
+
+        def finish_receive(transfer):
+            entered.set()
+            assert resume.wait(5)
+            return finish(transfer)
+
+        monkeypatch.setattr(consumer, "_finish_receive_transfer", finish_receive)
+    messages: list[bytes] = []
+
+    def receive():
+        reply = producer._handle_handshake_message(messages[-1])
+        if outcome.startswith("lost-metadata") and len(messages) == 1:
+            if outcome == "lost-metadata":
+                entered.set()
+                assert resume.wait(5)
+            raise zmq.Again()
+        return reply
+
+    socket = types.SimpleNamespace(send=messages.append, recv=receive)
+    monkeypatch.setattr(consumer, "_get_req_socket", lambda *args: socket)
+    success, _, metadata = producer.put("0", "1", "close-active_0_0", torch.arange(4))
+    assert success
+    worker = threading.Thread(target=lambda: received.append(consumer.get("0", "1", "close-active_0_0", metadata)))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        context = consumer._zmq_ctx
+        consumer.close()
+        assert consumer._close_thread is not None
+        assert consumer._zmq_ctx is context and not context.closed
+        assert consumer in _RETAINED_PRODUCERS
+        assert consumer.health()["status"] == "unhealthy"
+        with pytest.raises(RuntimeError, match="closed"):
+            consumer.get("0", "1", "not-admitted")
+        resume.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        if outcome == "deferred-read":
+            assert received == [None]
+            assert consumer._deferred_transfers
+            assert producer._pending
+            state[0] = "DONE"
+        elif outcome == "completed-read":
+            assert received[0] is not None
+            torch.testing.assert_close(received[0][0], torch.arange(4), rtol=0, atol=0)
+        else:
+            assert received == [None]
+        consumer._close_thread.join(5)
+        assert not consumer._close_thread.is_alive()
+        assert consumer._closed and consumer._zmq_ctx is None
+        assert not consumer._active_gets and not consumer._deferred_transfers
+        assert not consumer._agent.registered
+        assert consumer not in _RETAINED_PRODUCERS
+        assert not producer._pending and not producer._registered_descs
+    finally:
+        resume.set()
+        worker.join(5)
+        state[0] = "DONE"
+        consumer._reap_deferred_transfers()
+        consumer.close()
+
+
 def test_deferred_transfer_is_retained_while_active(nixl_connector_cls):
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _DeferredTransfer
 

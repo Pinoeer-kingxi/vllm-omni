@@ -381,11 +381,10 @@ class NixlConnector(OmniConnectorBase):
         get_key: str,
         metadata: dict[str, Any] | None = None,
     ) -> tuple[Any, int] | None:
-        if self._closed or getattr(self, "_closing", False):
-            raise RuntimeError("Cannot get data: NixlConnector is closed")
-
         transfer = _DeferredTransfer(tensors=[], source_key=get_key)
         with self._state_lock:
+            if self._closed or getattr(self, "_closing", False):
+                raise RuntimeError("Cannot get data: NixlConnector is closed")
             self._active_gets[get_key] = self._active_gets.get(get_key, 0) + 1
         try:
             metadata = self._resolve_metadata(get_key, metadata)
@@ -474,6 +473,8 @@ class NixlConnector(OmniConnectorBase):
             ) or not self._finish_receive_transfer(transfer):
                 self._defer_transfer(transfer)
             with self._state_lock:
+                if self._closed or getattr(self, "_closing", False):
+                    self.abandon_get(get_key)
                 self._active_gets[get_key] -= 1
                 if not self._active_gets[get_key]:
                     del self._active_gets[get_key]
@@ -621,10 +622,10 @@ class NixlConnector(OmniConnectorBase):
     def _close_once(self) -> None:
         if self._closed:
             return
-        self._closed = True
         # Stop private source contexts before releasing their storage. Local
         # READ buffers remain owned until their handles can be released below.
         with self._state_lock:
+            self._closed = True
             payloads = dict(self._pending)
             idle_agent = self._idle_producer_agent
             self._idle_producer_agent = None
@@ -647,23 +648,21 @@ class NixlConnector(OmniConnectorBase):
                 return
             setattr(self, thread_name, None)
         self._reap_deferred_transfers()
-        if self._deferred_transfers or self._abandoned_queries:
-            _RETAINED_PRODUCERS.add(self)
-            self._closed = False
-            self._closing = True
-            if self._close_thread is None:
-                logger.warning("NIXL close deferred: local DMA resources retained for automatic cleanup")
-            return
+        with self._state_lock:
+            if self._active_gets or self._deferred_transfers or self._abandoned_queries:
+                _RETAINED_PRODUCERS.add(self)
+                self._closed = False
+                self._closing = True
+                if self._close_thread is None:
+                    logger.warning("NIXL close deferred: local DMA resources retained for automatic cleanup")
+                return
         if self._zmq_ctx is not None:
             # destroy() rather than term(): REQ sockets live in thread-local
             # caches this thread cannot reach, and term() blocks until every
             # socket in the context is closed.
             self._safe_call(self._zmq_ctx.destroy, 0)
             self._zmq_ctx = None
-        deferred_agents = {
-            transfer.remote_agent for transfer in self._deferred_transfers if transfer.remote_agent is not None
-        }
-        for agent_name in [agent for agent in self._remote_agents if agent not in deferred_agents]:
+        for agent_name in list(self._remote_agents):
             self._safe_call(self._agent.remove_remote_agent, agent_name)
             self._remote_agents.remove(agent_name)
 

@@ -109,8 +109,10 @@ Parameters:
 - `transfer_timeout_s`: how long a `get()` waits for its `READ` to complete
   (default 300). A timeout does not prove DMA has stopped. Buffers and registrations
   remain owned until native handles can be released. `close()` polls remaining
-  transfers once and returns without releasing active DMA resources. A serialized
-  background closer retries cleanup; no second call is required.
+  transfers once and returns without releasing active DMA resources. In-flight
+  `get()` calls retain the completion-ACK channel until their READs and unresolved
+  metadata claims have been cleaned up. A serialized background closer retries
+  cleanup; no second call is required.
   `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` overrides it.
 
 ### Diffusion worker integration

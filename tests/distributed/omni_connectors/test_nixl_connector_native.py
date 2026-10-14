@@ -407,6 +407,60 @@ def test_native_publication_waits_for_cuda_producer_stream():
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
 @pytest.mark.skipif(not _native_nixl_available(1), reason="requires NIXL and CUDA")
+def test_native_close_keeps_inflight_get_completion_ack(monkeypatch):
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
+
+    current_omni_platform.set_device(0)
+    entered = threading.Event()
+    resume = threading.Event()
+    received = []
+    reader_config = {"role": "receiver", "receive_device": "cuda:0", "metadata_query_timeout_ms": 5000}
+    with closing(NixlConnector({"role": "sender", "host": "127.0.0.1"})) as producer:
+        with closing(NixlConnector(reader_config)) as receiver:
+            wait = receiver._wait_for_transfer
+
+            def observe(handle, key):
+                wait(handle, key)
+                entered.set()
+                assert resume.wait(10), "The test did not release the completed native READ"
+
+            monkeypatch.setattr(receiver, "_wait_for_transfer", observe)
+            success, _, metadata = producer.put("0", "2", "close-live_0_0", torch.arange(32, device="cuda:0"))
+            assert success
+            worker = threading.Thread(
+                target=lambda: received.append(receiver.get("0", "2", "close-live_0_0", metadata))
+            )
+            worker.start()
+            try:
+                assert entered.wait(30)
+                assert producer._pending["close-live_0_0"].claims
+                receiver.close()
+                assert receiver._close_thread is not None
+                resume.set()
+                worker.join(10)
+                assert not worker.is_alive()
+                assert received[0] is not None
+                torch.testing.assert_close(received[0][0].cpu(), torch.arange(32), rtol=0, atol=0)
+                receiver._close_thread.join(10)
+                assert not receiver._close_thread.is_alive()
+                assert receiver._closed and receiver._zmq_ctx is None
+                assert not receiver._active_gets and not receiver._deferred_transfers
+                assert not producer._pending and not producer._registered_descs
+            finally:
+                resume.set()
+                worker.join(10)
+        success, _, replacement = producer.put("0", "2", "close-live_0_0", torch.arange(32, device="cuda:0") + 7)
+        assert success and replacement["generation"] != metadata["generation"]
+        with closing(NixlConnector(reader_config)) as reader:
+            payload = reader.get("0", "2", "close-live_0_0", replacement)
+            assert payload is not None
+            torch.testing.assert_close(payload[0].cpu(), torch.arange(32) + 7, rtol=0, atol=0)
+        assert not producer._pending and not producer._registered_descs
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@pytest.mark.skipif(not _native_nixl_available(1), reason="requires NIXL and CUDA")
 def test_native_final_ack_retries_deregistration_failure(monkeypatch):
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import (
         _ACK,
