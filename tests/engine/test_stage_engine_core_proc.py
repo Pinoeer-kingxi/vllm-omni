@@ -5,14 +5,30 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
+from vllm.v1.request import RequestStatus
 
-from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc, _bind_first_audio_sink
+from vllm_omni.engine.stage_engine_core_proc import (
+    StageEngineCoreProc,
+    _bind_first_audio_sink,
+    _extend_handshake_timeout,
+)
 from vllm_omni.worker_v2.first_audio_sender import supports_in_process_first_audio
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_ordered_abort_supports_scheduler_without_overflow_fences(mocker):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    engine.scheduler = mocker.Mock(spec=Scheduler)
+
+    engine._handle_client_request(EngineCoreRequestType.ABORT, ["request"])
+
+    engine.scheduler.finish_requests.assert_called_once_with(["request"], RequestStatus.FINISHED_ABORTED)
 
 
 class WrappedUniProcExecutor(UniProcExecutor):
@@ -157,3 +173,12 @@ def test_non_talker_stage_keeps_native_request_hasher():
     engine.request_block_hasher = original = object()
     engine._init_talker_request_hasher()
     assert engine.request_block_hasher is original
+
+
+@pytest.mark.parametrize(("timeout_s", "expected_minutes"), [(900.0, 15), (901.0, 16), (60.0, 5)])
+def test_handshake_wait_is_extended_but_never_shortened(monkeypatch, timeout_s, expected_minutes) -> None:
+    import vllm.v1.engine.core as engine_core_module
+
+    monkeypatch.setattr(engine_core_module, "HANDSHAKE_TIMEOUT_MINS", 5)
+    _extend_handshake_timeout(timeout_s)
+    assert engine_core_module.HANDSHAKE_TIMEOUT_MINS == expected_minutes
