@@ -254,7 +254,6 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     serving.model_config = SimpleNamespace(async_chunk=True)
     serving._tts_model_type = "higgs_audio_v3"
     serving._get_tts_adapter = lambda: Adapter()
-    serving._track_ref_audio_artifact_warmup = lambda *args, **kwargs: None
     serving._speech_output_policies = {}
 
     _, stage_sampling_params, _ = asyncio.run(serving._prepare_speech_generation(request, request_id="speech-test"))
@@ -635,6 +634,7 @@ def test_replacement_during_builder_filters_only_retired_payload(monkeypatch, ac
     from vllm_omni.core.prefix_cache.adapter import (
         PrefixCacheEventKind,
         PrefixCacheRequestEvent,
+        PrefixCacheStep,
     )
 
     runner = _make_async_output_runner(engine_output_type="latent")
@@ -678,14 +678,17 @@ def test_replacement_during_builder_filters_only_retired_payload(monkeypatch, ac
             try:
                 assert built.wait(5)
                 manager.new_step_starts(
-                    [
-                        PrefixCacheRequestEvent(
-                            "r1",
-                            PrefixCacheEventKind.REPLACED,
-                            owner=PrefixCacheRequestOwner(1, 1),
-                            lookup_complete=False,
-                        )
-                    ]
+                    PrefixCacheStep(
+                        (
+                            PrefixCacheRequestEvent(
+                                "r1",
+                                PrefixCacheEventKind.REPLACED,
+                                owner=PrefixCacheRequestOwner(1, 1),
+                                lookup_complete=False,
+                            ),
+                        ),
+                        (),
+                    )
                 )
             finally:
                 release.set()
@@ -2250,6 +2253,7 @@ class TestDownstreamPayloadMemoization:
 
     def _runner(self, stages):
         runner = object.__new__(GPUARModelRunner)
+        runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
         runner._downstream_payload_cache = {}
         runner._request_final_stage_id = lambda rid: stages[rid]
         return runner
@@ -2396,6 +2400,7 @@ class TestPreferModelSamplerNoneFallback:
         expected = {
             "audio8_tts",
             "cosyvoice3",
+            "fish_omni",  # Returns None only for an empty batch.
             "glm_tts",
             "higgs_audio_v2",
             "higgs_audio_v3",

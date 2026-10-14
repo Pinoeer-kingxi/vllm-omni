@@ -590,6 +590,7 @@ def test_retired_output_does_not_mutate_reused_request_or_drop_surviving_batch_m
     scheduler.running.append(survivor)
     scheduler.chunk_transfer_adapter = None
     scheduler._pending_finish_reqs = []
+    scheduler._held_token_ids = {}
     scheduler.recompute_kv_load_failures = False
     scheduler._first_chunk_express = False
     scheduler._express_min_slack_s = 0
@@ -688,6 +689,8 @@ def test_control_only_step_reaches_real_executor_and_runner_before_zero_return(m
     runner._warmup_state_cleared = True
     runner.model = SimpleNamespace()
     runner.omni_prefix_cache = cache
+    runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
+    runner._prefix_cache_group_view = SimpleNamespace()
     runner.kv_transfer_manager = SimpleNamespace(handle_finished_requests_kv_transfer=lambda **kwargs: None)
     runner.kv_caches = []
     runner.cache_config = SimpleNamespace(block_size=4, cache_dtype="auto")
