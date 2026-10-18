@@ -139,6 +139,10 @@ propagate worker exceptions rather than returning `{"supported": False}`.
 When a request has multiple final output stages, only the last abort message
 is request-terminal. Output-processor abort state is committed only after the
 physical EngineCore abort succeeds.
+An abort failure still attempts the other stages and replicas. The request
+remains closed to admission while unacknowledged stages drain; their natural
+terminals permit cleanup without publishing a normal completion. Correlated
+abort failure also reports a request-scoped error to unblock its output stream.
 Changes that cross into stage runtime or public error behavior require review
 from that contract's owners.
 

@@ -3,15 +3,18 @@
 """Real orchestrator and StagePool logic with lightweight engine clients (L1)."""
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs, FinishReason
 
+from tests.engine.test_async_omni_engine_input import _FakeHub, _replica, _RoundRobinLB
 from tests.engine.test_orchestrator import (
     FakeOutputProcessor,
     FakePromptRequest,
+    FakeRunningCounter,
     FakeStageClient,
     _build_request_output,
     _build_stage_pools,
@@ -26,11 +29,16 @@ from tests.engine.test_orchestrator import (
 from vllm_omni.config.stage_config import PipelineConfig, StagePipelineConfig
 from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine import OmniEngineCoreOutput
-from vllm_omni.engine.messages import ErrorMessage, StageSubmissionMessage
+from vllm_omni.engine.messages import AbortRequestMessage, ErrorMessage, StageSubmissionMessage
 from vllm_omni.engine.omni_engine_base import OmniEngineBase
-from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState, StreamingSegmentState
+from vllm_omni.engine.stage_pool import RequestClosedError
+from vllm_omni.entrypoints.async_omni_base import AsyncOmniBase
+from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import OmniBase
 from vllm_omni.entrypoints.utils import get_final_stage_id_for_e2e
+from vllm_omni.metrics.stats import OrchestratorAggregator
+from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 configured_orchestrator_factory = orchestrator_factory
@@ -534,7 +542,7 @@ async def test_reordered_route_starts_at_admitted_nonzero_entry(mocker, async_ch
 @pytest.mark.asyncio
 async def test_closing_request_does_not_consume_its_abort_snapshot(mocker):
     orch, state, _ = _direct_orchestrator()
-    state.closing = True
+    state.closing = "aborting"
     orch.request_states["healthy"] = OrchestratorRequestState(request_id="healthy", final_stage_id=2)
     raw = EngineCoreOutputs(
         outputs=[OmniEngineCoreOutput(request_id=key, new_token_ids=[1]) for key in ("r", "healthy")]
@@ -545,3 +553,283 @@ async def test_closing_request_does_not_consume_its_abort_snapshot(mocker):
     assert filtered is not raw
     assert [output.request_id for output in filtered.outputs] == ["healthy"]
     assert [output.request_id for output in raw.outputs] == ["r", "healthy"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transitions", [None, ((0, 2), (2, 1))])
+async def test_prewarm_reuses_replica_selected_by_waiting_bridge(monkeypatch, transitions):
+    orch, state, clients = _direct_orchestrator(transitions, async_chunk=True)
+    _, bridge, receiver = orch._request_stage_path(state)
+    pool = orch.stage_pools[bridge]
+    pool.stage_vllm_config.model_config.async_chunk = False
+    replicas = [clients[bridge], FakeStageClient()]
+    addresses = ["tcp://127.0.0.1:50101", "tcp://127.0.0.1:50102"]
+    for replica_id, client in enumerate(replicas):
+        pool.add_client(addresses[replica_id], client, replica_id=replica_id)
+        monkeypatch.setattr(
+            client,
+            "get_payload_sender_info",
+            lambda port=50101 + replica_id: {"host": "127.0.0.1", "zmq_port": port},
+            raising=False,
+        )
+    orch.stage_pools[0].select_replica_id("r")
+    hub = _FakeHub([])
+    pool.attach_hub(hub)
+    pool.attach_load_balancer(_RoundRobinLB())
+    entered = {name: asyncio.Event() for name in ("bridge-submit", "prewarm")}
+    release = {name: asyncio.Event() for name in entered}
+    sleep = asyncio.sleep
+
+    async def wait_for_capacity(delay):
+        task = asyncio.current_task()
+        assert task is not None
+        name = task.get_name()
+        if name in entered:
+            entered[name].set()
+            await release[name].wait()
+        else:
+            await sleep(delay)
+
+    monkeypatch.setattr("vllm_omni.engine.stage_pool.asyncio.sleep", wait_for_capacity)
+    state.stage_submit_ts[bridge] = 1.0
+    submit = asyncio.create_task(
+        pool.submit_initial("r", state, _processed_request("r", state.sampling_params_list[bridge])),
+        name="bridge-submit",
+    )
+    prewarm = None
+    try:
+        await asyncio.wait_for(entered["bridge-submit"].wait(), 1)
+        prewarm = asyncio.create_task(
+            orch._prewarm_async_chunk_stages("r", FakePromptRequest("r", [1, 2], False), state), name="prewarm"
+        )
+        await asyncio.wait_for(entered["prewarm"].wait(), 1)
+        hub._replicas = [replace(_replica(address), stage_id=bridge) for address in addresses]
+        release["bridge-submit"].set()
+        selected = await asyncio.wait_for(submit, 1)
+        release["prewarm"].set()
+        assert await asyncio.wait_for(prewarm, 1)
+        assert pool.get_bound_replica_id("r") == selected
+        advertised = clients[receiver].add_request_calls[0][0].payload_sender_info
+        assert advertised == replicas[selected].get_payload_sender_info()
+        await orch._cleanup_request_ids(["r"], abort=True)
+        assert replicas[selected].abort_calls == [["r"]]
+        assert not replicas[1 - selected].abort_calls
+    finally:
+        for task in (submit, prewarm):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(*(task for task in (submit, prewarm) if task is not None), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_prewarm_does_not_bind_bridge_only_stages():
+    orch, state, _ = _direct_orchestrator(None, async_chunk=True)
+    orch.stage_pools[0].select_replica_id("r")
+    for pool in orch.stage_pools[1:]:
+        pool.stage_vllm_config.model_config.async_chunk = False
+    assert await orch._prewarm_async_chunk_stages("r", FakePromptRequest("r", [1, 2], False), state)
+    assert all(pool.get_bound_replica_id("r") is None for pool in orch.stage_pools[1:])
+    assert not state.stage_submit_ts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transitions", [None, ((0, 2),), ((0, 2), (2, 1))])
+@pytest.mark.parametrize("fail_first", [False, True])
+@pytest.mark.parametrize("finish_during_abort", [False, True])
+async def test_abort_failure_drains_without_resuming_or_leaking_request(
+    monkeypatch, mocker, transitions, fail_first, finish_during_abort
+):
+    orch, state, clients = _direct_orchestrator(transitions, async_chunk=True)
+    orch._running_counter = FakeRunningCounter()
+    orch._register_running_request(state)
+    release_resources = mocker.spy(orch, "_release_stage_transfer_resources")
+    path = orch._request_stage_path(state)
+    failed_stage = path[0] if fail_first else path[-1]
+    for sid in path:
+        clients[sid].final_output = True
+        processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
+        orch.stage_pools[sid]._output_processor = processor
+        request = _processed_request(f"internal-r-{sid}", state.sampling_params_list[sid])
+        request.external_req_id = "r"
+        await orch.stage_pools[sid].submit_initial("r", state, request)
+        state.stage_submit_ts[sid] = 1.0
+    failed_pool = orch.stage_pools[failed_stage]
+    processor = failed_pool.output_processor
+    healthy = OrchestratorRequestState(
+        request_id="healthy",
+        entry_stage_id=failed_stage,
+        final_stage_id=failed_stage,
+        final_output_stage_ids={failed_stage},
+        sampling_params_list=state.sampling_params_list,
+        stage_submit_ts={failed_stage: 1.0},
+    )
+    orch.request_states["healthy"] = healthy
+    orch._register_running_request(healthy)
+    request = _processed_request("internal-healthy", state.sampling_params_list[failed_stage])
+    request.external_req_id = "healthy"
+    await failed_pool.submit_initial("healthy", healthy, request)
+
+    async def terminal(request_id):
+        terminals: set[str] = set()
+        processed = await orch._process_llm_stage_outputs(
+            failed_stage,
+            0,
+            EngineCoreOutputs(
+                outputs=[
+                    OmniEngineCoreOutput(
+                        request_id=request_id,
+                        new_token_ids=[],
+                        finish_reason=FinishReason.STOP,
+                    )
+                ]
+            ),
+            terminals,
+        )
+        await orch._handle_processed_outputs(failed_stage, 0, processed)
+        await orch._finish_raw_terminal_requests(failed_stage, 0, terminals)
+
+    async def fail_abort(request_ids):
+        if finish_during_abort:
+            await terminal(f"internal-r-{failed_stage}")
+            assert "r" in orch.request_states
+        raise RuntimeError("abort transport failed")
+
+    monkeypatch.setattr(clients[failed_stage], "abort_requests_async", fail_abort)
+    await orch._handle_abort(AbortRequestMessage(request_ids=["r"], rpc_id="abort-r"))
+    assert not orch.rpc_async_queue.get_nowait().success
+    for sid in set(path) - {failed_stage}:
+        assert clients[sid].abort_calls == [[f"internal-r-{sid}"]]
+        assert orch.stage_pools[sid].get_bound_replica_id("r") is None
+    if not finish_during_abort:
+        assert state.closing
+        assert orch._running_counter.value == 2
+        release_resources.assert_not_called()
+        with pytest.raises(RequestClosedError, match="r"):
+            await failed_pool.submit_initial("r", state, request)
+        await terminal(f"internal-r-{failed_stage}")
+    assert "r" not in orch.request_states
+    assert orch._running_counter.value == 1
+    release_resources.assert_called_once_with(["r"])
+    assert all(pool.get_bound_replica_id("r") is None for pool in orch.stage_pools)
+    assert f"internal-r-{failed_stage}" not in processor.request_states
+    assert "internal-healthy" in processor.request_states
+    assert failed_pool.get_bound_replica_id("healthy") == 0
+    error = orch.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage) and error.request_id == "r" and not error.fatal
+    assert orch.output_async_queue.empty()
+    await terminal("internal-healthy")
+    assert orch.output_async_queue.get_nowait().request_id == "healthy"
+    assert not orch.request_states
+    assert not processor.request_states
+    assert orch._running_counter.value == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_abort_waits_for_each_remaining_stage(monkeypatch):
+    orch, state, clients = _direct_orchestrator()
+    state.stage_submit_ts = {0: 1.0, 2: 1.0}
+    for sid in (0, 2):
+        processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
+        orch.stage_pools[sid]._output_processor = processor
+        request = _processed_request("r", state.sampling_params_list[sid])
+        request.external_req_id = "r"
+        await orch.stage_pools[sid].submit_initial("r", state, request)
+
+    async def fail_abort(request_ids):
+        raise RuntimeError("abort failed")
+
+    for sid in (0, 2):
+        monkeypatch.setattr(clients[sid], "abort_requests_async", fail_abort)
+    await orch._handle_abort(AbortRequestMessage(request_ids=["r"], rpc_id="abort-r"))
+    assert not orch.rpc_async_queue.get_nowait().success
+    for sid in (2, 0):
+        terminals: set[str] = set()
+        await orch._process_llm_stage_outputs(
+            sid,
+            0,
+            EngineCoreOutputs(
+                outputs=[
+                    OmniEngineCoreOutput(
+                        request_id="r",
+                        new_token_ids=[],
+                        finish_reason=FinishReason.STOP,
+                    )
+                ]
+            ),
+            terminals,
+        )
+        await orch._finish_raw_terminal_requests(sid, 0, terminals)
+        assert ("r" in orch.request_states) == (sid == 2)
+    assert all(not orch.stage_pools[sid].output_processor.request_states for sid in (0, 2))
+    assert all(pool.get_bound_replica_id("r") is None for pool in orch.stage_pools)
+
+
+@pytest.mark.asyncio
+async def test_abort_failure_on_one_replica_does_not_skip_other_replicas(monkeypatch):
+    orch, state, clients = _direct_orchestrator()
+    pool = orch.stage_pools[2]
+    pool._output_processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
+    pool.add_client("other", FakeStageClient(final_output=True), replica_id=1)
+    for replica_id, request_id in enumerate(("r", "other")):
+        request = _processed_request(request_id, state.sampling_params_list[2])
+        request.external_req_id = request_id
+        await pool.submit_initial(request_id, state, request, pinned_replica_id=replica_id)
+
+    async def fail_abort(request_ids):
+        raise RuntimeError("abort failed")
+
+    monkeypatch.setattr(clients[2], "abort_requests_async", fail_abort)
+    with pytest.raises(RuntimeError, match="abort failed"):
+        await pool.abort_requests(["r", "other"])
+    assert pool.get_bound_replica_id("r") == 0
+    assert pool.get_bound_replica_id("other") is None
+    assert set(pool.output_processor.request_states) == {"r"}
+    assert pool.clients[1].abort_calls == [["other"]]
+
+
+@pytest.mark.asyncio
+async def test_draining_streaming_request_ignores_processed_segment_stop(monkeypatch):
+    orch, state, clients = _direct_orchestrator(async_chunk=True)
+    state.streaming.enabled = True
+    state.stage_submit_ts[2] = 1.0
+    orch.stage_pools[2].select_replica_id("r")
+
+    async def fail_abort(request_ids):
+        raise RuntimeError("abort failed")
+
+    monkeypatch.setattr(clients[2], "abort_requests_async", fail_abort)
+    await orch._handle_abort(AbortRequestMessage(request_ids=["r"], rpc_id="abort-r"))
+    state.streaming.segments[2] = StreamingSegmentState(finished=True)
+    await orch._route_output(2, 0, _build_request_output("r"), state, None)
+    assert orch.request_states["r"] is state
+    assert 2 not in state.finished_stage_ids
+    state.streaming.segments[2] = StreamingSegmentState(finished=False)
+    await orch._route_output(2, 0, _build_request_output("r"), state, None)
+    assert "r" not in orch.request_states
+
+
+@pytest.mark.asyncio
+async def test_abort_failure_unblocks_frontend_output_stream(monkeypatch):
+    orch, state, clients = _direct_orchestrator()
+    orch.stage_pools[2].select_replica_id("r")
+    state.stage_submit_ts[2] = 1.0
+    frontend = object.__new__(AsyncOmniBase)
+    frontend.request_states = {"r": ClientRequestState("r", queue=orch.output_async_queue, final_stage_id=2)}
+    stream = frontend._process_orchestrator_results("r", OrchestratorAggregator(3, False, 1.0, 2), 2, {}, 1.0)
+    waiting = asyncio.create_task(anext(stream))
+
+    async def fail_abort(request_ids):
+        raise RuntimeError("abort transport failed")
+
+    abort = clients[2].abort_requests_async
+    monkeypatch.setattr(clients[2], "abort_requests_async", fail_abort)
+    try:
+        await orch._handle_abort(AbortRequestMessage(request_ids=["r"], rpc_id="abort-r"))
+        with pytest.raises(RuntimeError, match="abort transport failed"):
+            await asyncio.wait_for(waiting, 1)
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await stream.aclose()
+        monkeypatch.setattr(clients[2], "abort_requests_async", abort)
+        await orch._cleanup_request_ids(["r"], abort=True)

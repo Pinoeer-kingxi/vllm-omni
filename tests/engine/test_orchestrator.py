@@ -238,6 +238,7 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
 
 class FakeOutputProcessor:
     def __init__(self, *, request_outputs: list[Any] | None = None) -> None:
+        self.request_states: dict[str, Any] = {}
         self.request_outputs = list(request_outputs or [])
         self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.abort_calls: list[list[str]] = []

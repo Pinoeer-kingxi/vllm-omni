@@ -361,32 +361,29 @@ class StagePool:
                 raise StageUnavailableError(f"stage {self.stage_id} bound replica {bound} is unavailable")
             return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
 
-        # 1. Sticky: previously bound and still serviceable?
-        bound_addr = self._affinity.get(request_id)
-        if bound_addr is not None:
-            replica_id = self._serviceable_replica_id_for_addr(bound_addr)
-            if replica_id is not None:
-                return replica_id
-            if request_state is not None:
-                raise StageUnavailableError(f"stage {self.stage_id} bound replica is no longer serviceable")
-            # Bound replica is gone or DOWN — fall through to re-select.
-            self._affinity.pop(request_id, None)
-
-        # 2. Inherited affinity (CFG companion sharing a parent request_id).
-        if affinity_request_id is not None:
-            parent_addr = self._affinity.get(affinity_request_id)
-            if parent_addr is not None:
-                replica_id = self._serviceable_replica_id_for_addr(parent_addr)
-                if replica_id is not None:
-                    self._affinity[request_id] = parent_addr
-                    return replica_id
-
-        # 3. Fresh pick: poll hub + LB with bounded wait.
         task = task or Task(request_id=request_id)
         deadline = _time.monotonic() + self.DISPATCH_WAIT_TIMEOUT_S
         while True:
             if request_state is not None and request_state.closing:
                 raise RequestClosedError(request_id)
+            # Another admission can establish affinity while this pick waits.
+            bound_addr = self._affinity.get(request_id)
+            if bound_addr is not None:
+                replica_id = self._serviceable_replica_id_for_addr(bound_addr)
+                if replica_id is not None:
+                    return replica_id
+                if request_state is not None:
+                    raise StageUnavailableError(f"stage {self.stage_id} bound replica is no longer serviceable")
+                self._affinity.pop(request_id, None)
+
+            if affinity_request_id is not None:
+                parent_addr = self._affinity.get(affinity_request_id)
+                if parent_addr is not None:
+                    replica_id = self._serviceable_replica_id_for_addr(parent_addr)
+                    if replica_id is not None:
+                        self._affinity[request_id] = parent_addr
+                        return replica_id
+
             candidates = self._collect_serviceable_replicas()
             if candidates:
                 # LB chose an index *into our candidates list*.
@@ -1365,6 +1362,8 @@ class StagePool:
             request_ids_by_replica.setdefault(replica_id, []).append(request_id)
 
         abort_outputs: list[tuple[str, Any]] = []
+        aborted_request_ids: list[str] = []
+        abort_error: Exception | None = None
         is_diffusion = self.stage_type == "diffusion"
         for replica_id, replica_request_ids in request_ids_by_replica.items():
             # Orchestrator ids are OP external ids; EngineCore may use a
@@ -1395,14 +1394,24 @@ class StagePool:
                         engine_abort_ids = list(aborted)
             client = self.clients[replica_id]
             if client is not None:
-                await client.abort_requests_async(engine_abort_ids)
+                try:
+                    await client.abort_requests_async(engine_abort_ids)
+                except Exception as exc:
+                    logger.warning("[StagePool-%s] abort failed on replica %s: %r", self.stage_id, replica_id, exc)
+                    if abort_error is None:
+                        abort_error = exc
+                    continue
             # An evicted engine cannot produce further output. Release its
             # retained processor state without sending another abort RPC.
             if not is_diffusion and self._output_processor is not None:
                 commit = getattr(self._output_processor, "commit_aborted_request_state", None)
                 if callable(commit):
                     commit(replica_request_ids, internal=False)
+            aborted_request_ids.extend(replica_request_ids)
 
+        if abort_error is not None:
+            self.release_bindings(aborted_request_ids)
+            raise abort_error
         return abort_outputs
 
     def schedule_release_request_resources(self, request_ids: list[str]) -> None:

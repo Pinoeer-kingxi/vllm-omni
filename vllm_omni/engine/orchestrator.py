@@ -24,7 +24,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import janus
 import torch
@@ -250,8 +250,8 @@ class OrchestratorRequestState:
     final_output_stage_ids: set[int] = field(default_factory=set)
     finished_stage_ids: set[int] = field(default_factory=set)
     pending_final_output: OutputMessage | None = None
-    # Stops admission while stage aborts yield to other orchestrator tasks.
-    closing: bool = False
+    # Failed aborts stay closed to admission until their remaining stages drain.
+    closing: Literal["aborting", "draining"] | None = None
 
     # Wall-clock timestamp when the client-facing engine request was accepted.
     request_timestamp: float = 0.0
@@ -696,6 +696,8 @@ class OrchestratorBase:
             logger.exception("[Orchestrator] Abort failed for request(s) %s", request_ids)
             if msg.rpc_id is None:
                 raise
+            for request_id in request_ids:
+                await self.output_async_queue.put(ErrorMessage(request_id=request_id, error=error))
         if msg.rpc_id is not None:
             # Always emit a result when rpc_id is set so CorrelatedRpcClient
             # waiters are unblocked even on failure.
@@ -721,8 +723,14 @@ class OrchestratorBase:
         if not request_ids:
             return []
         abort_outputs: list[OutputMessage] = []
+        abort_error: Exception | None = None
         for pool in self.stage_pools:
-            stage_outputs = await pool.abort_requests(request_ids) or []
+            try:
+                stage_outputs = await pool.abort_requests(request_ids) or []
+            except Exception as exc:
+                if abort_error is None:
+                    abort_error = exc
+                continue
             if bool(getattr(pool, "final_output", False)) and getattr(pool, "stage_type", None) != "diffusion":
                 final_output_type = getattr(pool.stage_client, "final_output_type", None) or "text"
                 for orch_req_id, request_output in stage_outputs:
@@ -752,6 +760,8 @@ class OrchestratorBase:
                         )
                     )
             pool.release_bindings(request_ids)
+        if abort_error is not None:
+            raise abort_error
         abort_outputs.sort(key=lambda output: self._stage_routing.stage_order.index(output.stage_id))
         last_index_by_req: dict[str, int] = {}
         for index, output_msg in enumerate(abort_outputs):
@@ -884,17 +894,24 @@ class OrchestratorBase:
         ``_finish_raw_terminal_requests`` once routing is done.
         """
         pool = self.stage_pools[stage_id]
-        if any(
-            (state := self.request_states.get(eco.request_id)) is not None and state.closing
-            for eco in raw_outputs.outputs
-        ):
-            # Leave the processor's abort snapshot intact while abort RPCs yield.
+        kept = []
+        for eco in raw_outputs.outputs:
+            state = self.request_states.get(eco.request_id)
+            if state is None:
+                processor_state = pool.output_processor.request_states.get(eco.request_id)
+                if processor_state is not None:
+                    state = self.request_states.get(processor_state.external_req_id)
+            if state is not None and state.closing:
+                # Preserve the abort snapshot, but retain terminals that arrive
+                # before an in-flight abort reports failure.
+                if eco.finish_reason is not None and not getattr(eco, "is_segment_finished", False):
+                    state.finished_stage_ids.add(stage_id)
+                    raw_terminal_request_ids.add(state.request_id)
+            else:
+                kept.append(eco)
+        if len(kept) != len(raw_outputs.outputs):
             raw_outputs = copy.copy(raw_outputs)
-            raw_outputs.outputs = [
-                eco
-                for eco in raw_outputs.outputs
-                if (state := self.request_states.get(eco.request_id)) is None or not state.closing
-            ]
+            raw_outputs.outputs = kept
         await self._route_upstream_first_audio(stage_id, replica_id, raw_outputs)
         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
 
@@ -1855,10 +1872,17 @@ class OrchestratorBase:
                     cleanup_ids.append(cid)
         for request_id in cleanup_ids:
             if (state := self.request_states.get(request_id)) is not None:
-                state.closing = True
+                state.closing = "aborting"
         abort_outputs: list[OutputMessage] = []
         if abort:
-            abort_outputs = await self._abort_request_ids(cleanup_ids)
+            try:
+                abort_outputs = await self._abort_request_ids(cleanup_ids)
+            except Exception:
+                for request_id in cleanup_ids:
+                    if (state := self.request_states.get(request_id)) is not None:
+                        state.closing = "draining"
+                        await self._finish_draining_request(state)
+                raise
         self._release_request_bindings(cleanup_ids)
         self._release_stage_transfer_resources(cleanup_ids)
         for request_id in cleanup_ids:
@@ -1870,6 +1894,18 @@ class OrchestratorBase:
                 self._running_counter.decrement()
                 req_state.running_counter_registered = False
         return abort_outputs
+
+    async def _finish_draining_request(self, state: OrchestratorRequestState) -> None:
+        pending_stages = {
+            pool.stage_id for pool in self.stage_pools if pool.get_bound_replica_id(state.request_id) is not None
+        } & state.stage_submit_ts.keys()
+        if not pending_stages <= state.finished_stage_ids:
+            return
+        # A failed abort retains its processor snapshot until a natural terminal.
+        for pool in self.stage_pools:
+            if pool.stage_type == "llm" and pool.get_bound_replica_id(state.request_id) is not None:
+                pool.output_processor.abort_requests([state.request_id], internal=False)
+        await self._cleanup_request_ids([state.request_id])
 
     async def _apply_raw_terminal_stage_finish(
         self,
@@ -1950,7 +1986,11 @@ class OrchestratorBase:
         pool = self.stage_pools[stage_id]
         for request_id in request_ids:
             req_state = self.request_states.get(request_id)
-            if req_state is None or req_state.closing or req_state.session_owned:
+            if req_state is None:
+                continue
+            if req_state.closing == "draining":
+                await self._finish_draining_request(req_state)
+            if req_state.closing or req_state.session_owned:
                 continue
             pending = req_state.pending_final_output
             if pending is not None:
@@ -2021,12 +2061,16 @@ class OrchestratorBase:
         stage_metrics: Any,
     ) -> None:
         """Route a processed output: send to frontend and/or forward."""
+        segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
         if req_state.closing:
+            if output.finished and not segment_finished:
+                req_state.finished_stage_ids.add(stage_id)
+                if req_state.closing == "draining":
+                    await self._finish_draining_request(req_state)
             return
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
-        segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
         # CFG companion: stash output so parent can bundle [parent, *companions]
         # into source_outputs for the bridge (e.g. thinker2imagegen).
         if finished and self._cfg_tracker.is_companion(req_id):
@@ -3110,6 +3154,8 @@ class OrchestratorBase:
                 return False
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
+            if not self._stage_receives_async_chunks(next_stage_id):
+                continue
             for route_stage_id in (source_stage_id, next_stage_id):
                 try:
                     pinned_replica_id = self._session_route(route_stage_id, req_state)
@@ -3125,8 +3171,6 @@ class OrchestratorBase:
                     return False
             if req_state.closing or self.request_states.get(request_id) is not req_state:
                 return False
-            if not self._stage_receives_async_chunks(next_stage_id):
-                continue
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             _t_submit_start = _time.perf_counter()
