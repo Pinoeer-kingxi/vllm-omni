@@ -36,10 +36,18 @@ metadata query per scheduler poll (10ms by default), which prevents an unavailab
 producer from blocking unrelated requests. The regular transfer-completion handshake
 keeps the configured transfer timeout.
 
-Numeric payload keys of one request/stage prefix share a private producer agent
-while pending. CUDA preparation is synchronized before publication because native
-READs do not inherit PyTorch stream dependencies. A connector may retain one
+Unclaimed payloads retain tensors without creating a native producer context.
+The first claim registers storage before returning descriptors. Claimed numeric
+payload keys of one request/stage prefix share a private producer agent; live
+claims of different prefixes never share it. A connector may retain one fully
 unregistered agent after normal completion; cancelled agents are retired.
+
+CUDA source writes are synchronized before normalization, then any contiguous
+copies finish before publication. Native READs do not inherit PyTorch stream
+dependencies. By default, `put()` synchronizes each payload device. A caller
+that knows the writer streams may pass a recorded `ready_event` covering all
+source writes on the payload's single CUDA device. This waits for that event
+instead of unrelated device work; storage must not be modified after handoff.
 
 ## Installation
 
@@ -98,13 +106,16 @@ Parameters:
   Intermediate NIXL stages retain their incoming receiver configuration and a
   separate outgoing bind configuration, so one worker can receive and publish.
 - `backends`: NIXL backends to register memory with. Defaults to `["UCX"]`.
+- `num_threads`: UCX worker-pool size. Defaults to `0`, NIXL's single-worker
+  progress-thread mode; explicit positive values enable its worker pool.
 - `receive_device`: forces where received tensors land. By default the consumer
   keeps the producer's device *type* but uses its own current device of that type.
 - `memory_type`: overrides the NIXL memory type, otherwise `DRAM` for CPU tensors
   and `VRAM` for accelerator tensors.
-- `lease_seconds`: how long a `put()` payload stays registered while waiting to be
+- `lease_seconds`: how long a `put()` payload retains storage while waiting to be
   read (default 3600). The consumer reports completion, so this only bounds payloads
-  nobody has claimed. An internal reaper releases only unclaimed registrations.
+  nobody has claimed. An internal reaper releases unclaimed storage and any
+  partial registrations left by a failed first claim.
   `VLLM_OMNI_NIXL_LEASE_S` overrides it.
 - `transfer_timeout_s`: how long a `get()` waits for its `READ` to complete
   (default 300). A timeout does not prove DMA has stopped. Buffers and registrations
@@ -209,12 +220,20 @@ An [independent H100 review](https://github.com/vllm-project/vllm-omni/pull/8744
 of commit `7ec25991` measured publication of ready 32 KiB tensors with 64 retained
 prefixes: put P95 increased from 0.238 ms on the base to 1554.224 ms, with 315
 additional threads. This fixture performs no payload READ or model inference.
-The lifecycle fixes retain the per-prefix context policy and device-wide CUDA
-readiness fence; they do not establish that this publication overhead is resolved.
-The fence precedes normalization so a contiguous copy cannot read unfinished
-producer writes. Any copy launched by normalization completes before publication.
-Payloads can be written on non-current streams, so narrowing that fence requires
-an explicit producer-readiness contract rather than assuming the current stream.
+Lazy registration avoids native contexts for unclaimed prefixes and permits
+sequential claims to reuse the idle agent. Cold claims still pay context creation;
+concurrent claims of different prefixes still require separate contexts. The
+default CUDA fence remains conservative; the optional recorded-event contract
+does not assume that the current stream owns all writes.
+
+At the earlier `9ffc6136` candidate, four matched A6000 runs of 64 ready 32 KiB payloads include actual claim/READ/ACK
+and exact-value checks. Against the previous request-isolated implementation,
+put+READ+ACK P95 falls from 559.85–661.52 ms to 3.80–4.40 ms. Unclaimed producer
+contexts fall from 64 to 0 and added native threads from 315 to 0. The event path
+avoids waiting for unrelated stream work; callers without an event retain the
+device fence. These warmed, sequential connector measurements do not qualify
+cold/concurrent claims or full-serving performance. The last pair covers the
+immutable publication-metadata snapshot implementation.
 
 ## Validation
 
@@ -245,6 +264,17 @@ RDMA cancellation needs a separate run with the revised source.
 Active READ retirement with NIXL 1.5 / UCX 1.23 over TCP has emitted UCX
 `ucp_requests` pool warnings. Released connector records and successful survivor
 READs do not establish complete native backend cleanup; this remains a validation gap.
+The NIXL PEER force-close change alone does not close it: a 100 ms delayed,
+still-`PROC` 512 MiB inter-node READ reproduces warnings on both peers. An isolated
+NIXL error-request-release fix and UCX internal-request auto-release fix are
+dependency candidates, not changes to the installed SDK. Local GPU READ/close
+and live retirement checks pass with those candidates. A local two-GPU TCP run
+also reaches `PROC` then `NIXL_ERR_REMOTE_DISCONNECT`: storage is released,
+survivor delivery and key reuse pass, and neither peer logs pool warnings.
+This covers one error-completion run with isolated native dependencies, not a
+fix shipped by this PR. READs which finish by draining do not cover that path.
+The failing inter-node case and RDMA still require separate qualification;
+RDMA hardware is unavailable.
 
 ### Publication and synchronization fixture
 
@@ -259,10 +289,12 @@ UCX_TLS=tcp,cuda_copy,self UCX_RCACHE_MAX_UNRELEASED=1024 \
 ```
 
 This fixture publishes ready 32 KiB tensors with retained independent prefixes,
-then sends metadata claims and completion ACKs without a payload READ. It reports
-put samples/P95, context count, thread/RSS changes and put latency with work on an
-unrelated CUDA stream. The ACKs are synthetic; this is not a transfer-throughput
-or serving benchmark. JSON records the connector hash and runtime settings.
+then performs sequential native READs and checks exact tensor values. It reports
+put and claim/READ/ACK samples/P95, their summed latency, context count and
+thread/RSS changes. The unrelated-stream probe measures publication only and
+uses synthetic completion ACKs. Add `--ready-event` to exercise the explicit
+readiness contract. This is not a serving benchmark; JSON records the connector
+hash and runtime settings.
 Use separate output paths; existing artifacts are not overwritten.
 
 ### Cross-node active-READ cancellation fixture

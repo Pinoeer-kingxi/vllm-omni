@@ -138,7 +138,7 @@ class NixlConnector(OmniConnectorBase):
                     sync_mode=sync_mode,
                 )
             else:
-                num_threads = int(self.config.get("num_threads", 4))
+                num_threads = int(self.config.get("num_threads", 0))
                 agent_config = nixl_agent_config(
                     num_threads=num_threads,
                     capture_telemetry=False,
@@ -250,6 +250,8 @@ class NixlConnector(OmniConnectorBase):
         to_stage: str,
         put_key: str,
         data: Any,
+        *,
+        ready_event: torch.cuda.Event | None = None,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         if self._closed or getattr(self, "_closing", False):
             raise RuntimeError("Cannot put data: NixlConnector is closed")
@@ -257,18 +259,20 @@ class NixlConnector(OmniConnectorBase):
         try:
             kind = _KIND_TENSORS
             if self._is_tensor_payload(data):
-                tensors, tensor_specs = self._normalize_tensor_payload(data)
+                raw_tensors = [data] if isinstance(data, torch.Tensor) else list(data)
             elif self._contains_tensor(data):
                 skeleton, payload_tensors = self._extract_tensor_leaves(data)
                 header = self.serialize_obj(skeleton)
                 header_tensor = torch.frombuffer(header, dtype=torch.uint8).clone().contiguous()
-                tensors, tensor_specs = self._normalize_tensor_payload([header_tensor, *payload_tensors])
+                raw_tensors = [header_tensor, *payload_tensors]
                 kind = _KIND_STRUCTURED
             else:
                 payload = self.serialize_obj(data)
                 tensor = torch.frombuffer(payload, dtype=torch.uint8).clone().contiguous()
-                tensors, tensor_specs = self._normalize_tensor_payload(tensor)
+                raw_tensors = [tensor]
                 kind = _KIND_OBJECT
+
+            tensors, tensor_specs = self._normalize_tensor_payload(raw_tensors, ready_event=ready_event)
 
             grouped_tensors: dict[str, list[tuple[int, torch.Tensor]]] = {}
             for tensor_index, tensor in enumerate(tensors):
@@ -289,38 +293,19 @@ class NixlConnector(OmniConnectorBase):
                     raise RuntimeError("Cannot publish data: NixlConnector is closed")
                 if put_key in self._pending:
                     raise RuntimeError(f"Cannot replace active NIXL payload {put_key}")
-                parts = put_key.rsplit("_", 1)
-                prefix = f"{parts[0]}_" if len(parts) == 2 and parts[1].isdigit() else None
-                agent = next(
-                    (
-                        payload.agent
-                        for key, payload in self._pending.items()
-                        if prefix is not None and _matches_payload_prefix(key, prefix) and payload.agent is not None
-                    ),
-                    None,
-                )
-                if agent is None:
-                    agent = self._idle_producer_agent
-                    self._idle_producer_agent = None
-                    if agent is None:
-                        agent = self._agent_factory()
                 pending = _PendingPayload(
                     tensors=tensors,
                     registrations=[],
-                    agent=agent,
+                    agent=None,
                     deadline=time.monotonic() + self._lease_seconds,
                 )
-                # Record ownership before registration; failed puts retain any
-                # partially registered resources for the same cleanup boundary.
+                # Unclaimed payloads own storage, not a native context.
                 self._pending[put_key] = pending
                 self._lease_wakeup.set()
                 descriptor_groups = []
                 for memory_type, indexed_tensors in grouped_tensors.items():
                     tensor_indices = [tensor_index for tensor_index, _ in indexed_tensors]
                     regions = [self._tensor_region(tensor) for _, tensor in indexed_tensors]
-                    reg_descs = agent.get_reg_descs(regions, memory_type)
-                    agent.register_memory(reg_descs, backends=self._backends)
-                    pending.registrations.append(reg_descs)
                     descriptor_groups.append(
                         {
                             "memory_type": memory_type,
@@ -332,7 +317,6 @@ class NixlConnector(OmniConnectorBase):
                 metadata = {
                     "schema_version": _SCHEMA_VERSION,
                     "kind": kind,
-                    "agent_metadata": agent.get_agent_metadata(),
                     "descriptor_groups": descriptor_groups,
                     "tensor_specs": tensor_specs,
                     "size": size,
@@ -839,6 +823,18 @@ class NixlConnector(OmniConnectorBase):
                     or ((self._closed or getattr(self, "_closing", False)) and claim not in pending.claims)
                 ):
                     return _META_NOT_FOUND
+                if "agent_metadata" not in metadata:
+                    try:
+                        agent_metadata = self._register_claimed_payload(key, pending, metadata)
+                    except Exception:
+                        # No descriptor or claim escaped. Keep partially
+                        # registered storage until lease/request retirement.
+                        self._published.pop(key, None)
+                        self._metrics["errors"] += 1
+                        logger.error("NIXL registration failed for claimed payload %s", key, exc_info=True)
+                        return _META_NOT_FOUND
+                    metadata = {**metadata, "agent_metadata": agent_metadata}
+                    self._published[key] = metadata
                 # Publish ownership before descriptors can leave this lock.
                 # Failed/lost replies retain the claim conservatively.
                 reply = msgspec.msgpack.encode({**metadata, "claim_id": claim})
@@ -867,6 +863,34 @@ class NixlConnector(OmniConnectorBase):
             return _ACK
         logger.warning("NixlConnector handshake received an unknown message")
         return _META_NOT_FOUND
+
+    def _register_claimed_payload(self, key: str, pending: _PendingPayload, metadata: dict[str, Any]) -> bytes:
+        """Register under the claim lock, before any native descriptor escapes."""
+        groups = metadata["descriptor_groups"]
+        if not groups:
+            return b""
+        parts = key.rsplit("_", 1)
+        prefix = f"{parts[0]}_" if len(parts) == 2 and parts[1].isdigit() else None
+        agent = next(
+            (
+                payload.agent
+                for other_key, payload in self._pending.items()
+                if prefix is not None and _matches_payload_prefix(other_key, prefix) and payload.agent is not None
+            ),
+            None,
+        )
+        if agent is None:
+            agent = self._idle_producer_agent
+            self._idle_producer_agent = None
+            if agent is None:
+                agent = self._agent_factory()
+        pending.agent = agent
+        for group in groups:
+            regions = [self._tensor_region(pending.tensors[index]) for index in group["tensor_indices"]]
+            registration = agent.get_reg_descs(regions, group["memory_type"])
+            agent.register_memory(registration, backends=self._backends)
+            pending.registrations.append(registration)
+        return agent.get_agent_metadata()
 
     def _get_req_socket(self, zmq_addr: str, timeout_ms: int | None = None) -> zmq.Socket:
         """Return a thread-local REQ socket so concurrent calls never interleave."""
@@ -1185,11 +1209,19 @@ class NixlConnector(OmniConnectorBase):
         return skeleton
 
     @staticmethod
-    def _normalize_tensor_payload(payload: Any) -> tuple[list[torch.Tensor], list[dict[str, Any]]]:
+    def _normalize_tensor_payload(
+        payload: Any, *, ready_event: torch.cuda.Event | None = None
+    ) -> tuple[list[torch.Tensor], list[dict[str, Any]]]:
         tensors = [payload] if isinstance(payload, torch.Tensor) else list(payload)
         # A contiguous copy must read completed writes, including on other streams.
-        for device in {tensor.device for tensor in tensors if tensor.device.type == "cuda" and tensor.numel()}:
-            torch.accelerator.synchronize(device)
+        devices = {tensor.device for tensor in tensors if tensor.device.type == "cuda" and tensor.numel()}
+        if ready_event is None:
+            for device in devices:
+                torch.accelerator.synchronize(device)
+        else:
+            if not isinstance(ready_event, torch.cuda.Event) or devices != {ready_event.device}:
+                raise ValueError("ready_event must be recorded on the payload's single CUDA device")
+            ready_event.synchronize()
         normalized: list[torch.Tensor] = []
         specs: list[dict[str, Any]] = []
         for tensor in tensors:
