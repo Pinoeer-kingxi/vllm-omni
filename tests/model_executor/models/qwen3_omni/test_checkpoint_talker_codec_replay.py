@@ -19,6 +19,7 @@ from torch import nn
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
 from vllm.sampling_params import SamplingParams
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
 from vllm_omni.model_executor.models.common.qwen3_code_predictor import CodePredictorWrapper, CodePredictorWrapperConfig
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_talker import Qwen3OmniMoeTalkerForConditionalGeneration
@@ -27,7 +28,12 @@ from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.talker_history import bind_talker_history, preprocess_talker_history
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.cuda, pytest.mark.omni]
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.cpu,
+    pytest.mark.omni,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
+]
 
 
 @pytest.fixture(scope="module")

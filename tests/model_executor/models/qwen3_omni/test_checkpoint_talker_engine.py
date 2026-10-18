@@ -35,6 +35,7 @@ from vllm.v1.engine.core import EngineCore
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.request import RequestStatus
 
+from tests.helpers.mark import hardware_marks
 from tests.model_executor.models.qwen3_omni.qualification_worker import (
     qualification_prefix_config as _qualification_prefix_config,
 )
@@ -48,7 +49,7 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.request import OmniRequest
 from vllm_omni.worker import gpu_ar_model_runner, gpu_model_runner
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.omni]
+pytestmark = [pytest.mark.core_model, pytest.mark.omni, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 @pytest.fixture(
