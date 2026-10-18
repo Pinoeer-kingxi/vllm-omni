@@ -626,8 +626,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         self._should_accumulate_full_payload_output_cached = result
         return result
 
-    @staticmethod
-    def _materialize_full_payload_entry(entry: _FullPayloadEntry) -> tuple[dict[str, Any], Any]:
+    def _materialize_full_payload_entry(self, entry: _FullPayloadEntry) -> tuple[dict[str, Any], Any]:
         output = dict(entry.latest)
         for k, tensors in entry.chunks.items():
             if tensors:
