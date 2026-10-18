@@ -700,6 +700,7 @@ def thinker2talker_full_payload(
         assistant_token_id=config.assistant_token_id,
         embedding_rows=emb_rows,
         hidden_rows=hid_rows,
+        sequence_ids=all_token_ids,
     )
     talker_ids = talker_prefill_token_ids(
         row_plan,

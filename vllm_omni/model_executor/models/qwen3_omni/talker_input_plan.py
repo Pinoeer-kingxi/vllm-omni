@@ -6,6 +6,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from .tool_speech import spoken_span_end
+
 
 @dataclass(frozen=True)
 class TalkerPrefillPart:
@@ -60,6 +62,7 @@ def plan_talker_prefill(
     assistant_token_id: int = 77091,
     embedding_rows: int | None = None,
     hidden_rows: int | None = None,
+    sequence_ids: Sequence[int] | None = None,
 ) -> tuple[TalkerPrefillPart, ...]:
     """Retain users and the final assistant's nine-row bootstrap.
 
@@ -87,6 +90,8 @@ def plan_talker_prefill(
         elif role == assistant_token_id:
             if index == len(starts) - 1:
                 end = min(end, embedding_rows)
+                if sequence_ids is not None:
+                    end = spoken_span_end(sequence_ids, start, end)
                 if end - start < 3:
                     raise ValueError("Talker assistant bootstrap requires a three-token header")
                 parts.append(TalkerPrefillPart("assistant", start, end))

@@ -75,7 +75,6 @@ from vllm_omni.model_executor.models.qwen3_omni.talker_input_plan import (
     read_talker_prefill_plan,
     talker_prefill_token_ids,
 )
-from vllm_omni.model_executor.models.qwen3_omni.tool_speech import spoken_span_end
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
 from vllm_omni.platforms import current_omni_platform
@@ -1437,6 +1436,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         target_len = thinker_result_ids.shape[-1]
         device = input_ids.device if input_ids is not None else thinker_embed.device
         plan = row_plan
+        sequence_ids = None
+        if plan is None or identity_ids is None:
+            sequence_ids = (
+                thinker_result_ids_cpu if thinker_result_ids_cpu is not None else thinker_result_ids
+            ).reshape(-1).tolist()
         if plan is None:
             if input_ids is None:
                 raise ValueError("Talker prefill requires prompt IDs or a fixed row plan")
@@ -1449,11 +1453,12 @@ class Qwen3OmniMoeForConditionalGeneration(
                 assistant_token_id=self.config.assistant_token_id,
                 embedding_rows=thinker_embed.shape[0],
                 hidden_rows=thinker_hidden.shape[0],
+                sequence_ids=sequence_ids,
             )
         if identity_ids is None:
             identity_ids = talker_prefill_token_ids(
                 plan,
-                (thinker_result_ids_cpu if thinker_result_ids_cpu is not None else thinker_result_ids).tolist(),
+                sequence_ids,
                 tts_pad_token_id=self.config.tts_pad_token_id,
                 tts_bos_token_id=self.config.tts_bos_token_id,
             )
@@ -1489,7 +1494,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                 )
                 talker_input_embeds.append(talker_user_part)
             else:
-                segment_end_index = spoken_span_end(result_ids.reshape(-1).tolist(), im_start_index, segment_end_index)
                 talker_assistant_embeds, trailing_text_hidden = self._get_talker_assistant_parts(
                     im_start_index,
                     segment_end_index,
