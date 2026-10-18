@@ -1059,9 +1059,11 @@ def test_request_local_snapshot_materializes_codes_once_at_flush(monkeypatch, mo
 
 def test_request_local_snapshot_materialize_drops_retired_owner():
     runner, _raw, request, progress = _make_request_local_snapshot_runner()
+    runner.accumulate_full_payload_output("r1", {}, request, owner=progress)
+    entry = runner._pending_full_payload_send.pop("r1")
     progress.retired = True
 
-    assert GPUARModelRunner._materialize_full_payload_entry(runner, ({}, {}, {}, request, progress))[0] == {}
+    assert runner._materialize_full_payload_entry(entry)[0] == {}
 
 
 def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatch):
