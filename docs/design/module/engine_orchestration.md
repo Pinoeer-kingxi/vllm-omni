@@ -137,10 +137,12 @@ child must drop `parent_requests` once no children remain. EngineCore control
 RPCs (`sleep` / `wake_up` / `pause_scheduler` / `resume_scheduler`) must
 propagate worker exceptions rather than returning `{"supported": False}`.
 When a request has multiple final output stages, only the last abort message
-is request-terminal. Output-processor abort state is committed only after the
-physical EngineCore abort succeeds or a natural terminal confirms stage completion.
+is request-terminal. Output-processor abort state is committed after the stage
+client's abort call succeeds or a natural terminal confirms stage completion.
+For AR clients, a successful call confirms message submission, not EngineCore
+completion or physical release of transport buffers.
 An abort failure still attempts the other stages and replicas. The request
-remains closed to admission while unacknowledged stages drain; their natural
+remains closed to admission while stages with failed abort calls drain; their natural
 terminals permit cleanup without publishing a normal completion. Correlated
 abort failure also reports a request-scoped error to unblock its output stream.
 Changes that cross into stage runtime or public error behavior require review

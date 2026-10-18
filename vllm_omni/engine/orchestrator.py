@@ -3050,6 +3050,8 @@ class OrchestratorBase:
                         # Rendering may have cached media before validation or
                         # request conversion failed, without returning mm_features.
                         await asyncio.to_thread(self._clear_stage_input_cache, next_logical)
+                    if req_state.closing or self.request_states.get(req_id) is not req_state:
+                        return
                     # A forwarded input rejected by this stage fails only its request.
                     logger.warning(
                         "[Orchestrator] req=%s: stage-%s rejected the forwarded input: %s", req_id, next_logical, exc
