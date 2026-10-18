@@ -177,6 +177,7 @@ def input_failure_scheduler(request, mocker):
     scheduler._prefix_cache_step_sequence = 0
     scheduler._prefix_cache_pending_replacements = []
     scheduler._prefix_cache_pending_terminal_owners = {}
+    scheduler._discarded_req_ids = set()
     scheduler._omits_kv_transfer_cache = {}
     scheduler._omni_kv_config = {}
     scheduler._new_prompt_len_snapshot = {}

@@ -48,6 +48,7 @@ def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARS
     sched._prefix_cache_step_sequence = 0
     sched._prefix_cache_pending_replacements = []
     sched._prefix_cache_pending_terminal_owners = {}
+    sched._discarded_req_ids = set()
     sched._new_prompt_len_snapshot = {}
     sched._hold_payloadless_outputs = False
     sched.vllm_config = SimpleNamespace(

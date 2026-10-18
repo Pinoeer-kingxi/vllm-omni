@@ -2153,3 +2153,44 @@ def test_full_payload_replace_overrides_codec_validity_accumulation():
         output, actual_request = host._materialize_full_payload_entry(host._pending_full_payload_send["r"])
         assert output["meta.codec_frame_valid"].tolist() == valid
         assert actual_request is request
+
+
+@pytest.mark.parametrize("cleanup_first", [False, True])
+def test_discarded_full_payload_never_reaches_send_or_reused_id(cleanup_first, mocker):
+    from dataclasses import replace
+
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+    host = MixinHost()
+    host.init_omni_connectors(_make_model_config())
+    host._full_payload_replace_keys_cached = frozenset()
+    send = mocker.patch.object(host, "send_full_payload_outputs")
+    try:
+        for req_id in ("cancelled", "healthy"):
+            state = CachedRequestState(
+                req_id=req_id,
+                prompt_token_ids=[1, 2],
+                mm_features=[],
+                sampling_params=SamplingParams(max_tokens=2),
+                generator=None,
+                block_ids=([],),
+                num_computed_tokens=2,
+                output_token_ids=[3],
+            )
+            host.accumulate_full_payload_output(req_id, {"codes.audio": torch.ones(1, 2)}, state)
+        if cleanup_first:
+            host.cleanup_finished_request("cancelled", discard_payload=True)
+        host.flush_full_payload_outputs({"cancelled", "healthy"}, discarded_req_ids={"cancelled"})
+        assert not host._pending_full_payload_send
+        send.assert_called_once()
+        assert set(send.call_args.kwargs["outputs"]) == {"healthy"}
+
+        reused = replace(state, req_id="cancelled", output_token_ids=[4])
+        host.accumulate_full_payload_output("cancelled", {"codes.audio": torch.zeros(1, 2)}, reused)
+        host.flush_full_payload_outputs({"cancelled"})
+        assert send.call_count == 2
+        actual, _ = send.call_args.kwargs["outputs"]["cancelled"]
+        assert actual["codes.audio"].tolist() == [[0.0, 0.0]]
+    finally:
+        host.shutdown_omni_connectors()

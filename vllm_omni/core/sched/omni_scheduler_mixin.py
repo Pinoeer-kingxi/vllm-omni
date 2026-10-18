@@ -185,6 +185,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         self._prefix_cache_step_sequence = 0
         self._prefix_cache_pending_replacements: list[PrefixCacheRequestEvent] = []
         self._prefix_cache_pending_terminal_owners: dict[str, PrefixCacheRequestOwner] = {}
+        self._discarded_req_ids: set[str] = set()
 
     def _get_local_prefix_cache_hit(self, request: Request) -> tuple[KVCacheBlocks, int, int, bool]:
         # Downstream requests initially carry length-only placeholders. Readiness
@@ -216,6 +217,12 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
 
     def _record_prefix_cache_finished(self, request: Request) -> None:
         self._prefix_cache_pending_terminal_owners[request.request_id] = self._prefix_cache_owner(request)
+        if request.status in (
+            RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_ERROR,
+            RequestStatus.FINISHED_IGNORED,
+        ):
+            self._discarded_req_ids.add(request.request_id)
 
     def _has_pending_prefix_cache_work(self) -> bool:
         # Pending lifecycle work must reach execute_model even if admission
@@ -811,8 +818,11 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             if request_id in self.requests
         ]
         pending_prewarms.clear()
+        discarded_req_ids = self._discarded_req_ids & base.finished_req_ids
+        self._discarded_req_ids.difference_update(discarded_req_ids)
         return OmniSchedulerOutput(
             **base_data,
+            discarded_req_ids=discarded_req_ids,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
             pending_input_registrations=pending_input_registrations,
             data_plane_terminal_req_ids=data_plane_terminal_req_ids,

@@ -741,7 +741,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         self._pending_full_payload_send[req_id] = _FullPayloadEntry(chunks, latest, request, owner)
 
-    def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
+    def flush_full_payload_outputs(
+        self, finished_req_ids: set[str], *, discarded_req_ids: set[str] | None = None
+    ) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
         pending_req_ids = set(self._pending_full_payload_send.keys())
         if not (finished_req_ids & pending_req_ids):
@@ -756,6 +758,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         to_send: dict[str, tuple[Any, Any]] = {}
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
+            if discarded_req_ids is not None and req_id in discarded_req_ids:
+                continue
             if entry is not None:
                 owner = entry.progress
                 if owner is not None and owner.retired:

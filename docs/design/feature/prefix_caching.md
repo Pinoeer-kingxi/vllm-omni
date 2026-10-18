@@ -356,16 +356,17 @@ order. Terminal events precede arrivals, so same-step ID reuse finishes the old 
 before `STARTED` classifies the new one. The manager applies captured ownership
 to write/resource and delivery progress; it does not reclassify arrivals from
 write-task state.
-`ABORTED` accepts explicit optional `discarded_req_ids` or `aborted_req_ids`.
-The current `OmniSchedulerOutput` and upstream scheduler contract produce
-neither field: the `discarded_req_ids` producer is proposed in
-[PR #7681](https://github.com/vllm-project/vllm-omni/pull/7681), which has not
-landed. Until that dependency lands, production terminals remain `FINISHED`.
-The adapter's synthetic-input tests cover optional-field interpretation and
-ABORTED-over-FINISHED precedence, not production cancellation delivery.
-When #7681 lands, test actual scheduler `finish_requests`/`schedule` output
-through the adapter for waiting/running cancellation, failure and normal finish.
-Constructing `discarded_req_ids` by hand does not validate that producer path.
+`OmniSchedulerOutput.discarded_req_ids` carries cancelled, failed and ignored
+requests, using the terminal contract from
+[PR #7681](https://github.com/vllm-project/vllm-omni/pull/7681). The scheduler
+captures the classification before removing a request and emits it with that
+request's finished notification. The adapter translates these terminals to
+`ABORTED`; normal completion remains `FINISHED`. Both full-payload flush and
+worker cleanup discard cancelled output instead of sending a partial result.
+CPU regressions use the real AR/generation schedulers, waiting/running requests
+and executor serialization before translating the output; they do not inject
+the cancellation field by hand. Native device cancellation remains a separate
+qualification boundary.
 Hit payloads describe prefixes `[0, hit_end)`; Item 4 selects unseen delivery
 ranges from captured request progress, not from an arbitrary adapter hit range.
 
