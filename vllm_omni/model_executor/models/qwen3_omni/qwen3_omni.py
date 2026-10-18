@@ -1194,29 +1194,10 @@ class Qwen3OmniMoeForConditionalGeneration(
             row_end=end_index if row_plan is not None else None,
         )
 
-        # Queue trailing_text_hidden for decode (drop first for next steps),
-        try:
-            if isinstance(trailing_text_hidden, torch.Tensor) and trailing_text_hidden.numel() > 0:
-                if trailing_text_hidden.ndim == 2:
-                    rem_tail = trailing_text_hidden
-                elif trailing_text_hidden.ndim == 1:
-                    rem_tail = torch.zeros(
-                        0,
-                        trailing_text_hidden.shape[0],
-                        dtype=trailing_text_hidden.dtype,
-                        device=trailing_text_hidden.device,
-                    )
-                else:
-                    # compatible with old shape [1,S,D]
-                    rem_tail = trailing_text_hidden.squeeze(0)
-                if rem_tail.shape[0] > 0:
-                    update_dict.setdefault("hidden_states", {})["trailing_text"] = rem_tail.detach()
-            # Persist the same normalized pad row used for bootstrap assembly.
-            # Aggregated source snapshots can contain many rows; replay expects
-            # one fallback text row that can expand across long evictions.
-            update_dict.setdefault("embed", {})["tts_pad_projected"] = self.tts_pad_embed.reshape(1, 1, -1).detach()
-        except Exception:
-            pass
+        if trailing_text_hidden is not None:
+            update_dict.setdefault("hidden_states", {})["trailing_text"] = trailing_text_hidden.detach()
+        # Bootstrap assembly normalizes aggregated source PAD snapshots to one row.
+        update_dict.setdefault("embed", {})["tts_pad_projected"] = self.tts_pad_embed.reshape(1, 1, -1).detach()
         update_dict.setdefault("meta", {})["prefill_consumed_text_tokens"] = 1
         self._talker_cache_thinker_decode_embeds(embed, update_dict)
 
@@ -1275,7 +1256,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         mask test on device ids is a host sync that stalls the Talker batch.
 
         Returns:
-            (input_ids, input_embeds) for talker
+            (input_ids, input_embeds, trailing_text_hidden) for talker
         """
         target_len = thinker_result_ids.shape[-1]
         device = input_ids.device if input_ids is not None else thinker_embed.device
@@ -1343,12 +1324,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     tts_eos_embed,
                 )
                 talker_input_embeds.append(talker_assistant_embeds[first:last])
-                # capture trailing text hidden for decode steps
-                try:
-                    if isinstance(trailing_text_hidden, torch.Tensor):
-                        trailing_text_hidden_all = trailing_text_hidden
-                except Exception:
-                    pass
+                trailing_text_hidden_all = trailing_text_hidden
         talker_input_embed = torch.cat([embed.to(device) for embed in talker_input_embeds], dim=0)
         talker_input_id = to_device_nonblocking(torch.tensor(identity_ids[row_start:row_end], dtype=torch.long), device)
 

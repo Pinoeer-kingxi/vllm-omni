@@ -128,7 +128,7 @@ def _sampled_token_embed(thinker_embed: Mapping[str, Any], request: Any) -> torc
     return sampled.detach().cpu()
 
 
-def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | str = "cuda") -> int:
+def _compute_talker_prompt_ids_length(info: OmniPayload) -> int:
     ids = info.get("ids", {})
     return sum(part.num_rows for part in plan_talker_prefill(ids["prompt"], len(ids["all"])))
 
@@ -730,7 +730,7 @@ def thinker2talker_token_only(
         thinker_sequences = prompt_token_ids + output_ids
         thinker_input_ids = prompt_token_ids
         info_for_len: OmniPayload = {"ids": {"all": thinker_sequences, "prompt": thinker_input_ids}}
-        prompt_len = _compute_talker_prompt_ids_length(info_for_len, device="cpu")
+        prompt_len = _compute_talker_prompt_ids_length(info_for_len)
         # Keep this fallback until the connector reliably preserves voice metadata.
         additional_information = to_dict(
             OmniPayloadStruct(
