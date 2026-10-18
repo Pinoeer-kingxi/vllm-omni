@@ -10,7 +10,6 @@ additional_information. Every other path submits the plain placeholder.
 
 from __future__ import annotations
 
-import asyncio
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -19,6 +18,7 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS
 from vllm_omni.engine.duplex.contracts import DuplexFence, DuplexStageRequestContext, DuplexStageSubmission
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrchestratorRequestState
@@ -52,7 +52,6 @@ class _FakePool:
 
     stage_type = "llm"
     final_output = True
-    num_replicas = 1
 
     def __init__(self, role: str, stage_client: Any = None) -> None:
         self.stage_client = stage_client if stage_client is not None else SimpleNamespace()
@@ -64,13 +63,10 @@ class _FakePool:
     def live_replica_ids(self) -> list[int]:
         return [0]
 
-    def available_replica_ids(self) -> list[int]:
-        return [0]
-
-    async def pick(self, request_id, *, request_state=None):
+    async def pick(self, request_id, *, request_state):
         return 0
 
-    async def submit_initial(self, request_id, _req_state, request, prompt_text=None):
+    async def submit_initial(self, request_id, _req_state, request, prompt_text=None, expected_replica_id=None):
         self.submitted.append(request)
         return 0
 
@@ -88,14 +84,10 @@ def _orchestrator(payload_func: Any = None, cls: type[Orchestrator] = Orchestrat
     """Thinker -> Talker (no payload hook) -> Code2Wav (``payload_func``, if any)."""
     code2wav_client = None if payload_func is None else _client(payload_func)
     orchestrator = object.__new__(cls)
-    Orchestrator.__init__(
-        orchestrator,
-        request_async_queue=asyncio.Queue(),
-        output_async_queue=asyncio.Queue(),
-        rpc_async_queue=asyncio.Queue(),
-        stage_pools=[_FakePool("sender"), _FakePool("receiver"), _FakePool("receiver", code2wav_client)],
-        async_chunk=True,
-    )
+    orchestrator.stage_pools = [_FakePool("sender"), _FakePool("receiver"), _FakePool("receiver", code2wav_client)]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
+    orchestrator.async_chunk = True
+    orchestrator.request_states = {}
     orchestrator._emit_tx_edge = lambda **_kwargs: None
     return orchestrator
 
@@ -208,9 +200,9 @@ async def test_prewarm_submits_plain_placeholder(case: dict[str, Any], expected_
         final_stage_id=2,
         session_owned=case.get("session_owned", False),
     )
-    orchestrator.request_states["req"] = req_state
     streaming = case.get("streaming", False)
     req_state.streaming.enabled = streaming
+    orchestrator.request_states[req_state.request_id] = req_state
     stage0_kwargs = case.get("stage0", {"resumable": False})
 
     prewarmed = await orchestrator._prewarm_async_chunk_stages(
@@ -260,6 +252,7 @@ async def test_add_request_attaches_payload_once_and_streaming_update_does_not(m
 @pytest.mark.asyncio
 async def test_duplex_session_submit_does_not_request_payload(mocker) -> None:
     orchestrator = _orchestrator(cls=DuplexOrchestrator)
+    orchestrator.replica_placement = None
     prewarm = mocker.AsyncMock(return_value=True)
     orchestrator._prewarm_async_chunk_stages = prewarm  # type: ignore[method-assign]
     sampling_params = tuple(_sampling_params())

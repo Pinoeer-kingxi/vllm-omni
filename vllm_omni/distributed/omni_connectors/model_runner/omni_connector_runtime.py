@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import (
     ConnectorSpec,
@@ -53,12 +52,6 @@ def _should_create_payload_connector(model_config: Any) -> bool:
     Sender edges may instead be owned solely by KV transfer. Receivers still
     need a connector even though they do not declare a downstream payload hook.
     """
-    if getattr(model_config, "async_chunk", False) and not uses_native_mrv2_data_plane(
-        model_config, use_v2_model_runner=getattr(model_config, "use_v2_model_runner", False)
-    ):
-        # The scheduler's chunk adapter owns V1 transport. Creating another
-        # runner connector duplicates its endpoint and payload ownership.
-        return False
     if get_stage_connector_role(model_config) != "sender":
         return True
 
@@ -687,11 +680,7 @@ class _OmniConnectorRuntimeMixin:
         return fallback_req_id
 
     def _resolve_next_stage_id(self, model_config: Any) -> int | None:
-        """Determine the downstream stage ID from connector config.
-
-        Falls back to ``stage_id + 1`` when the config does not specify
-        a ``to_stage`` explicitly.
-        """
+        """Read the downstream endpoint projected from the pipeline route."""
         return get_stage_connector_peer(model_config, self._stage_id, "to_stage")
 
     @staticmethod

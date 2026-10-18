@@ -47,7 +47,6 @@ def _bare_plane(*, delivery_timeout_s=1.0, shutdown_timeout_s=1.0):
         _native_output_error=None,
         _native_output_error_lock=threading.Lock(),
         _native_output_closed=False,
-        model_config=SimpleNamespace(stage_connector_config={"from_stage": None}),
         _native_outputs_in_flight=defaultdict(int),
         _native_terminal_pending=set(),
         _async_chunk=True,
@@ -106,6 +105,7 @@ def test_full_payload_waits_for_terminal_and_last_deferred_frame(plane):
 
     [(snapshot, payload)] = plane.record.batches[0]
     assert snapshot.is_finished()
+    assert snapshot.aborted is False
     assert snapshot.output_token_ids == [21, 2150]
     torch.testing.assert_close(payload["codes.audio"], torch.cat([first, last]))
     torch.testing.assert_close(payload["codes.ref"], ref)
@@ -123,6 +123,7 @@ def test_full_payload_abort_discards_partial_and_late_outputs(plane):
     assert plane.abort_requests({"internal"}) == 1
     [(snapshot, payload)] = plane.record.batches[0]
     assert snapshot.is_finished() and payload is None
+    assert snapshot.aborted is True
     assert _complete(plane, [{"codes.audio": torch.tensor([[3, 4]])}]) == 0
     assert len(plane.record.batches) == 1
     assert not plane._pending_full_payload_send
@@ -259,108 +260,6 @@ def _stop_save_thread(plane):
     plane._save_work_available.set()
     plane._save_thread.join(timeout=2)
     assert not plane._save_thread.is_alive()
-
-
-def test_pipeline_release_preserves_legacy_backend_and_retires_request(plane):
-    connector = SimpleNamespace(cleanup=lambda request_id: None)
-    plane.register_request(_new_request("external", "external"))
-    _start_save_thread(plane, connector)
-    try:
-        plane.release_request_resources(["external"])
-        assert "external" not in plane._native_requests
-        assert not plane._pending_save_reqs
-        assert not plane._pending_save_counts
-    finally:
-        _stop_save_thread(plane)
-
-
-def test_pipeline_release_without_a_transport_owner(plane):
-    plane._omni_connector = None
-    plane.release_request_resources(["external"])
-
-
-def test_pipeline_release_fences_scheduler_terminal_arriving_later(plane):
-    plane._omni_connector = SimpleNamespace(cleanup_prefix=lambda prefix: 0)
-    plane._stage_id = 0
-    plane._lock = threading.Lock()
-    plane._pending_save_reqs = {}
-    plane._pending_save_counts = defaultdict(int)
-    plane._save_work_available = threading.Event()
-    plane.register_request(_new_request("external", "external"))
-    plane.reserve_outputs(["external"])
-
-    _start_save_thread(plane, plane._omni_connector)
-    try:
-        plane.release_request_resources(["external"])
-    finally:
-        _stop_save_thread(plane)
-
-    assert not plane._native_requests
-    assert plane.record.cleaned == ["external"]
-    assert len(plane.record.batches) == 1
-    assert plane.record.batches[0][0][0].is_finished()
-    assert plane.abort_requests({"external"}) == 0
-    assert _complete(plane, [{"codes.audio": "late"}], req="external") == 0
-    assert len(plane.record.batches) == 1
-    assert not plane._pending_save_reqs
-    assert not plane._pending_save_counts
-
-
-def test_pipeline_release_waits_for_queued_payloads_and_uses_external_prefix(raw_plane):
-    connector = _gated_connector()
-    reclaimed = threading.Event()
-    prefixes = []
-
-    def cleanup_prefix(prefix):
-        prefixes.append(prefix)
-        reclaimed.set()
-
-    connector.cleanup_prefix = cleanup_prefix
-    _start_save_thread(raw_plane, connector)
-    try:
-        request = SimpleNamespace(request_id="external")
-        raw_plane._enqueue_chunk_payload(request, {"c": 1}, wait_for_delivery=False)
-        raw_plane._enqueue_chunk_payload(request, {"c": 2}, wait_for_delivery=False)
-        assert connector.put_started.wait(timeout=1)
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            release = executor.submit(raw_plane.release_request_resources, ["external"])
-            assert not reclaimed.is_set()
-            assert not release.done()
-            connector.release.set()
-            release.result(timeout=2)
-        assert reclaimed.is_set()
-        assert connector.put_keys == ["external_0_0", "external_0_1"]
-        assert prefixes == ["external_0_"]
-    finally:
-        connector.release.set()
-        _stop_save_thread(raw_plane)
-    assert not raw_plane._pending_save_reqs
-    assert not raw_plane._pending_save_counts
-
-
-@pytest.mark.parametrize("failure_method", ["cleanup_prefix", "wait_for_cleanup"])
-def test_pipeline_release_failure_is_reported_and_retry_is_request_scoped(raw_plane, failure_method):
-    connector = _gated_connector()
-    connector.cleanup_prefix = lambda prefix: None
-    connector.wait_for_cleanup = lambda prefix, **kwargs: None
-
-    def fail(*args, **kwargs):
-        raise TimeoutError("READ claim remains active")
-
-    original = getattr(connector, failure_method)
-    setattr(connector, failure_method, fail)
-    _start_save_thread(raw_plane, connector)
-    try:
-        with pytest.raises(TimeoutError, match="READ claim remains active"):
-            raw_plane.release_request_resources(["external"])
-        assert not raw_plane._pending_save_reqs
-        assert not raw_plane._pending_save_counts
-        assert not raw_plane._delivery_manager.is_quarantined
-        setattr(connector, failure_method, original)
-        raw_plane.release_request_resources(["external"])
-        assert not raw_plane._pending_save_counts
-    finally:
-        _stop_save_thread(raw_plane)
 
 
 class _Output:
@@ -778,3 +677,59 @@ def test_payload_builders_see_stage_model_config(monkeypatch):
 
     assert plane._get_model_config() is model_config
     assert _get_accept_hidden_layer_index(plane) == 24
+
+
+@pytest.mark.parametrize("factory", ["from_base", "from_request"])
+def test_native_request_preserves_streaming_flag_and_reference_audio(plane, factory):
+    from vllm.v1.core.sched.output import NewRequestData
+
+    from vllm_omni.core.sched.output import OmniNewRequestData
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import tts2code2wav_async_chunk
+
+    base = NewRequestData(
+        req_id="internal",
+        prompt_token_ids=[0, 0],
+        mm_features=[],
+        sampling_params=SamplingParams(stop_token_ids=[6561]),
+        pooling_params=None,
+        block_ids=([],),
+        num_computed_tokens=0,
+        lora_request=None,
+    )
+    owner = SimpleNamespace(
+        **vars(base),
+        request_id="internal",
+        external_req_id="voice",
+        resumable=True,
+        model_intermediate_buffer={"codes": {"ref": [0.1, -0.1]}, "meta": {"ref_audio_sr": 16000}},
+    )
+    data = (
+        OmniNewRequestData.from_base(base, owner)
+        if factory == "from_base"
+        else OmniNewRequestData.from_request(owner, ([],), prefill_token_ids=[0, 0])
+    )
+    plane.register_request(data)
+    state = plane._native_requests["internal"]
+    assert state.resumable is True
+    state.accept_tokens([6561])
+    snapshot = state.snapshot(include_token_history=True, sampled_token_ids=[6561])
+    payload = tts2code2wav_async_chunk(
+        SimpleNamespace(),
+        {"codes": {"audio": torch.arange(7)}, "meta": {"native_duplex": True, "turn_end": True}},
+        snapshot,
+    )
+    assert payload is not None and payload.meta.last_chunk is True
+    assert payload.meta.ref_audio_sr == 16000
+    torch.testing.assert_close(payload.codes.ref, torch.tensor([0.1, -0.1]))
+
+
+def test_native_snapshot_distinguishes_fresh_samples_from_ledger_tail(plane):
+    plane.register_request(_new_request())
+    _complete(plane, [{"codes.audio": torch.tensor([[1]])}], token=2150)
+    first = plane.record.batches[-1][0][0]
+    assert first.sampled_token_ids == [2150]
+    plane.complete_outputs(req_ids=["internal"], inter_stage_outputs=[{"meta.turn_end": True}], sampled_token_ids=[[]])
+    next_snapshot = plane.record.batches[-1][0][0]
+    assert next_snapshot.last_output_token_id == 2150
+    assert next_snapshot.sampled_token_ids == []
+    assert first.sampled_token_ids == [2150]

@@ -1385,27 +1385,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             return True
 
         request_id = task["request_id"]
-        if prefix := task.get("release_prefix"):
-            completion = task["release_completion"]
-            release_error = None
-            try:
-                cleanup = getattr(connector, "cleanup_prefix", None)
-                if callable(cleanup):
-                    cleanup(prefix)
-                # Legacy backends keep their existing per-payload lifecycle.
-                # Completing this marker still fences the local send queue.
-                wait = getattr(connector, "wait_for_cleanup", None)
-                if callable(wait):
-                    wait(prefix, receive_prefix=task["receive_prefix"], deadline=task["release_deadline"])
-            except Exception as error:
-                release_error = error
-            finally:
-                self._decrement_pending_save_count(request_id)
-            if release_error is not None:
-                completion.set_exception(release_error)
-            else:
-                completion.set_result(None)
-            return True
         payload_data = task.get("data")
         if payload_data is None and task.get("request") is not None:
             payload_data = self._build_custom_process_payload(

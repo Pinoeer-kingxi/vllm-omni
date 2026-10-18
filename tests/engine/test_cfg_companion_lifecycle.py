@@ -18,6 +18,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -95,7 +96,7 @@ class _FakePool:
     def release_bindings(self, request_ids):
         pass
 
-    async def release_request_resources(self, request_ids):
+    def schedule_release_request_resources(self, request_ids):
         pass
 
 
@@ -115,15 +116,12 @@ def _make_orchestrator(num_stages: int = 2) -> Orchestrator:
     return orch
 
 
-def _req_state(final_stage_id: int = 1, request_id: str = "p") -> OrchestratorRequestState:
+def _req_state(final_stage_id: int = 1) -> OrchestratorRequestState:
     return OrchestratorRequestState(
-        request_id=request_id,
+        request_id="p",
         final_stage_id=final_stage_id,
-        stage_submit_ts={},
-        sampling_params_list=[SimpleNamespace(output_kind=None)] * (final_stage_id + 1),
-        running_counter_registered=False,
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(final_stage_id + 1)],
         prompt={"prompt": "x"},
-        pipeline_timings={},
     )
 
 
@@ -133,7 +131,7 @@ async def test_kv_ready_does_not_mark_companion_done():
     output (set_companion_output) may. Guards the original race."""
     orch = _make_orchestrator()
     orch._cfg_tracker.register_companion("p", "neg", "p__neg")
-    orch.request_states["p__neg"] = _req_state(request_id="p__neg")
+    orch.request_states["p__neg"] = _req_state()
 
     raw = SimpleNamespace(request_id="p__neg", kv_transfer_params={"kv_ready": True})
     await orch._handle_kv_ready_raw_outputs(0, SimpleNamespace(outputs=[raw]))

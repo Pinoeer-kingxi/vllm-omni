@@ -44,6 +44,17 @@ def _make_async_omni(*, num_stages: int = 1, stage_type: str = "diffusion") -> A
     return omni
 
 
+@pytest.mark.asyncio
+async def test_playback_feedback_maps_session_id_and_ignores_finished_session(mocker) -> None:
+    omni = _make_async_omni()
+    omni.request_states.pop("external-abc-uuid-2")
+    rpc = mocker.patch.object(omni, "_engine_core_rpc", new=mocker.AsyncMock())
+    await omni.update_streaming_playback("external-abc", 0.5)
+    rpc.assert_awaited_once_with("update_streaming_playback", stage_ids=[0], args=("external-abc-uuid-1", 0.5))
+    await omni.update_streaming_playback("finished", 9.0)
+    assert rpc.await_count == 1
+
+
 def _prompt_interaction(prompt: str = "new prompt", transition_chunks: int | None = None) -> OmniInteractionPrompt:
     interaction: OmniInteractionPrompt = {"event_id": "ui-update-1", "event": {"prompt": prompt}}
     if transition_chunks is not None:
@@ -66,18 +77,6 @@ async def test_submit_interaction_async_maps_external_to_internal_id() -> None:
         "external-abc-uuid-1",
         interaction=_prompt_interaction(transition_chunks=2),
     )
-
-
-@pytest.mark.asyncio
-async def test_submit_interaction_async_ignores_requests_pending_cleanup() -> None:
-    omni = _make_async_omni()
-    closed = omni.request_states["external-abc-uuid-1"]
-    closed.cleanup_pending = True
-    await omni.submit_interaction_async("external-abc", interaction=_prompt_interaction())
-    omni.engine.submit_interaction_async.assert_awaited_once_with(
-        "external-abc-uuid-2", interaction=_prompt_interaction()
-    )
-    assert omni.request_states["external-abc-uuid-1"] is closed
 
 
 @pytest.mark.asyncio
@@ -111,18 +110,11 @@ async def test_submit_interaction_async_rejects_negative_transition_chunks() -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pending_cleanup", [False, True])
-async def test_submit_interaction_async_rejects_inactive_request(pending_cleanup) -> None:
+async def test_submit_interaction_async_rejects_inactive_request() -> None:
     omni = _make_async_omni()
-    if pending_cleanup:
-        for state in omni.request_states.values():
-            state.cleanup_pending = True
-        request_id = "external-abc"
-    else:
-        omni.request_states.clear()
-        request_id = "missing"
+    omni.request_states.clear()
     with pytest.raises(ValueError, match="No active request"):
-        await omni.submit_interaction_async(request_id, interaction=_prompt_interaction(transition_chunks=2))
+        await omni.submit_interaction_async("missing", interaction=_prompt_interaction(transition_chunks=2))
 
 
 @pytest.mark.asyncio

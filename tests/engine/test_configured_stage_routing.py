@@ -18,6 +18,7 @@ from tests.engine.test_orchestrator import (
     _engine_core_outputs,
     _enqueue_add_request,
     _get_output_message,
+    _processed_request,
     _shutdown_orchestrator,
     _wait_for,
     orchestrator_factory,
@@ -25,7 +26,6 @@ from tests.engine.test_orchestrator import (
 from vllm_omni.config.stage_config import PipelineConfig, StagePipelineConfig
 from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine import OmniEngineCoreOutput
-from vllm_omni.engine.errors import ResourceReleaseError
 from vllm_omni.engine.messages import ErrorMessage, StageSubmissionMessage
 from vllm_omni.engine.omni_engine_base import OmniEngineBase
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
@@ -88,7 +88,7 @@ async def test_bridge_sender_is_bound_before_receiver_prewarm(mocker, transition
         mocker.patch.object(
             client, "get_payload_sender_info", create=True, return_value={"host": "127.0.0.1", "zmq_port": 50051 + rid}
         )
-    configs = [
+    configs: list[object] = [
         SimpleNamespace(
             model_config=SimpleNamespace(
                 max_model_len=64,
@@ -156,28 +156,6 @@ async def test_endpoint_completion_waits_for_other_selected_output(transitions, 
     assert intermediate.stage_id == other and not intermediate.finished
     assert terminal.stage_id == endpoint and terminal.finished
     assert orch.output_async_queue.empty() and "r" not in orch.request_states
-
-
-@pytest.mark.asyncio
-async def test_abort_retry_preserves_earlier_stage_tokens_after_later_stage_abort_failure(mocker):
-    orch, state, clients = _direct_orchestrator(((0, 2), (2, 1)))
-    clients[2].final_output = True
-    state.final_output_stage_ids = {1, 2}
-    for sid in (1, 2):
-        pool = orch.stage_pools[sid]
-        pool.select_replica_id("r")
-        pool.output_processor.request_outputs = [_build_request_output("r", token_ids=[sid], finished=False)]
-    abort = mocker.patch.object(
-        clients[2], "abort_requests_async", side_effect=[RuntimeError("stage abort failed"), None]
-    )
-    with pytest.raises(RuntimeError, match="stage abort failed"):
-        await orch._cleanup_request_ids(["r"], abort=True)
-    assert orch.stage_pools[1].get_bound_replica_id("r") is None
-    outputs = await orch._cleanup_request_ids(["r"], abort=True)
-    assert [(msg.stage_id, msg.finished) for msg in outputs] == [(2, False), (1, True)]
-    assert [list(msg.engine_outputs.outputs[0].token_ids) for msg in outputs] == [[2], [1]]
-    assert clients[1].abort_calls == [["r"]] and abort.await_count == 2
-    assert "r" not in orch.request_states
 
 
 @pytest.mark.asyncio
@@ -251,30 +229,8 @@ async def test_empty_diffusion_inputs_fail_only_request(mocker, transitions, emp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("empty_inputs", [None, []])
-async def test_empty_diffusion_cleanup_failure_keeps_request_closed(mocker, empty_inputs):
-    orch, state, clients = _direct_orchestrator()
-    clients[2].stage_type = "diffusion"
-    clients[2].custom_process_input_func = mocker.Mock(return_value=empty_inputs)
-    mocker.patch.object(orch, "_release_stage_transfer_resources", side_effect=ResourceReleaseError("release failed"))
-
-    await orch._forward_to_next_stage("r", 0, _build_request_output("r"), state)
-
-    assert orch.output_async_queue.get_nowait().finished
-    error = orch.output_async_queue.get_nowait()
-    assert isinstance(error, ErrorMessage) and not error.fatal and error.request_id == "r"
-    assert orch.request_states["r"] is state and state.closing
-    assert not clients[2].add_request_calls
-    assert orch.rpc_async_queue.empty()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("event_driven", ["0", "1"])
 @pytest.mark.parametrize("transitions", [((0, 2),), ((0, 2), (2, 1))])
-async def test_configured_route_runs_through_real_loop(
-    monkeypatch, configured_orchestrator_factory, event_driven, transitions
-):
-    monkeypatch.setenv("VLLM_OMNI_EVENT_DRIVEN_ORCH", event_driven)
+async def test_configured_route_runs_through_real_loop(configured_orchestrator_factory, transitions):
     order = (0, 2) if len(transitions) == 1 else (0, 2, 1)
     final = order[-1]
     clients = [
@@ -315,7 +271,7 @@ async def test_async_prewarm_uses_actual_edge_and_sender(mocker):
     assert not clients[1].add_request_calls
     request = clients[2].add_request_calls[0][0]
     assert request.payload_sender_info == {"source": 0}
-    sender.assert_called_once_with(0, request_id="r")
+    sender.assert_called_once_with(0, request_id="r", req_state=state)
     assert emit.call_args.kwargs["from_stage"] == 0
     assert emit.call_args.kwargs["to_stage"] == 2
     assert set(state.stage_submit_ts) == {2}
@@ -501,3 +457,91 @@ def test_frontend_rejects_outputs_only_available_on_inactive_stages(modalities, 
         get_final_stage_id_for_e2e(modalities, default_modalities, stages, stage_order=(0, 2))
     assert get_final_stage_id_for_e2e(None, ["text", "audio"], stages, stage_order=(0, 2)) == 2
     assert get_final_stage_id_for_e2e(modalities, ["text", "audio"], stages) == (1 if modalities == ["audio"] else 2)
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_waiting_for_replica_stops_old_request_admission():
+    orch, state, clients = _direct_orchestrator(async_chunk=True)
+    pool = orch.stage_pools[2]
+    pool.add_client("tcp://127.0.0.1:5555", clients[2], replica_id=0)
+    polled = asyncio.Event()
+
+    def no_replicas(_stage_id):
+        polled.set()
+        return SimpleNamespace(replicas=[])
+
+    pool.attach_hub(SimpleNamespace(get_replicas_for_stage=no_replicas))
+    pool.attach_load_balancer(SimpleNamespace(select=lambda task, replicas: 0))
+    task = asyncio.create_task(
+        orch._prewarm_async_chunk_stages(
+            "r", FakePromptRequest(request_id="r", prompt_token_ids=[1], resumable=False), state
+        )
+    )
+    await asyncio.wait_for(polled.wait(), timeout=1)
+    await orch._cleanup_request_ids(["r"], abort=True)
+    new_state = OrchestratorRequestState(request_id="r")
+    orch.request_states["r"] = new_state
+    pool.bind("r", "tcp://127.0.0.1:5555")
+    assert not await asyncio.wait_for(task, timeout=1)
+    assert orch.request_states["r"] is new_state
+    assert pool.get_bound_replica_id("r") == 0
+    assert not clients[2].add_request_calls
+    await orch._cleanup_request_ids(["r"])
+
+
+@pytest.mark.asyncio
+async def test_lost_preselected_replica_cannot_be_reselected():
+    orch, state, clients = _direct_orchestrator(async_chunk=True)
+    pool = orch.stage_pools[2]
+    pool.add_client("replica-1", FakeStageClient(final_output=True), replica_id=1)
+    assert await pool.pick("r", request_state=state) == 0
+    pool.evict_replica(0)
+    assert not await orch._dispatch_or_fail_request(
+        lambda: pool.submit_initial("r", state, SimpleNamespace()),
+        req_id="r",
+        stage_id=2,
+        operation="bridge submission",
+    )
+    assert isinstance(orch.output_async_queue.get_nowait(), ErrorMessage)
+    assert "r" not in orch.request_states
+    assert not pool.clients[1].add_request_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_chunk", [False, True])
+async def test_reordered_route_starts_at_admitted_nonzero_entry(mocker, async_chunk):
+    orch, _, clients = _direct_orchestrator(((0, 2), (2, 1)), async_chunk=async_chunk)
+    orch.request_states.clear()
+    processed = _processed_request("r", SamplingParams(max_tokens=1))
+    build_entry = mocker.patch.object(orch, "_build_entry_stage_request", return_value=processed)
+    await orch._handle_add_request(
+        _submission(
+            entry_stage_id=2,
+            final_stage_id=1,
+            final_output_stage_ids=[1],
+            prompt={"prompt_token_ids": [1, 2]},
+        )
+    )
+    state = orch.request_states["r"]
+    assert orch._request_stage_path(state) == (2, 1)
+    build_entry.assert_awaited_once()
+    assert clients[2].add_request_calls[0][0] is processed
+    assert not clients[0].add_request_calls
+    assert bool(clients[1].add_request_calls) is async_chunk
+    await orch._cleanup_request_ids(["r"], abort=True)
+
+
+@pytest.mark.asyncio
+async def test_closing_request_does_not_consume_its_abort_snapshot(mocker):
+    orch, state, _ = _direct_orchestrator()
+    state.closing = True
+    orch.request_states["healthy"] = OrchestratorRequestState(request_id="healthy", final_stage_id=2)
+    raw = EngineCoreOutputs(
+        outputs=[OmniEngineCoreOutput(request_id=key, new_token_ids=[1]) for key in ("r", "healthy")]
+    )
+    process = mocker.patch.object(orch.stage_pools[0], "process_llm_raw_outputs", return_value=[])
+    await orch._process_llm_stage_outputs(0, 0, raw, set())
+    filtered = process.call_args.args[1]
+    assert filtered is not raw
+    assert [output.request_id for output in filtered.outputs] == ["healthy"]
+    assert [output.request_id for output in raw.outputs] == ["r", "healthy"]

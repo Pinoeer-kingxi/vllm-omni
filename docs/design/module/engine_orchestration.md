@@ -78,9 +78,9 @@ the boundary affected by the in-flight stage client/process refactor in
 [#5441](https://github.com/vllm-project/vllm-omni/pull/5441). Names and
 responsibilities proposed only by that PR are not current contracts.
 
-The orchestration loop also has an opt-in event-driven mode
-(`VLLM_OMNI_EVENT_DRIVEN_ORCH=1`, default off except for Qwen3-TTS) proposed in
-[#5221](https://github.com/vllm-project/vllm-omni/pull/5221). It changes poll
+The orchestration loop is event-driven by default, as proposed in
+[#5221](https://github.com/vllm-project/vllm-omni/pull/5221);
+`VLLM_OMNI_EVENT_DRIVEN_ORCH=0` selects the legacy 1 ms poll loop. The mode changes poll
 cadence only: the routing, ordering, and terminal-state contracts below hold
 identically on both loops.
 
@@ -89,6 +89,11 @@ identically on both loops.
 This document owns `AsyncOmniEngine`, `Orchestrator`, request-state creation,
 cross-stage routing, output ordering, companion tracking, control/RPC
 correlation, cancellation propagation, and terminal-state convergence.
+
+After configuration resolution, the engine retains the effective `PipelineConfig`,
+including injected stages such as ForcedAligner. Stage startup and orchestration
+read transitions from that same configuration; the registered pipeline is not
+modified.
 
 It does not own stage placement, replica selection, stage-process startup,
 payload schemas, public protocol rendering, connector transport, or semantic
@@ -136,20 +141,6 @@ is request-terminal. Output-processor abort state is committed only after the
 physical EngineCore abort succeeds.
 Changes that cross into stage runtime or public error behavior require review
 from that contract's owners.
-
-### Request cleanup
-
-Cleanup closes request admission before stopping stages and releasing transport
-resources. Queued release markers follow pending publications. Backends exposing
-`wait_for_cleanup` confirm their ownership drain; other backends retain their
-existing physical-release contract. V1 async chunks use the scheduler adapter,
-while native MRv2 payloads use the worker data plane.
-
-Terminal success and abort acknowledgement wait for cleanup. A failed release
-reports a request-scoped error and retains the closed state and public request-ID
-mapping for retry. Concurrent callers join the same cleanup operation; cancelling
-a joining caller does not cancel its owner. CFG ownership remains registered
-until the parent and companions finish cleanup.
 
 ## Promotion gate
 

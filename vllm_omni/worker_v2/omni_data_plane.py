@@ -5,8 +5,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import defaultdict, deque
-from concurrent.futures import Future
+from collections import defaultdict
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from queue import Full, Queue
@@ -17,10 +16,6 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import OmniPayload, flatten_payload, unflatten_payload
-from vllm_omni.distributed.omni_connectors.utils.config import (
-    REQUEST_RESOURCE_RELEASE_TIMEOUT_S,
-    get_stage_connector_peer,
-)
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     should_accumulate_full_payload_output,
@@ -38,12 +33,17 @@ class _NativeRequestState:
     external_req_id: str
     prompt_token_ids: list[int]
     additional_information: Any = None
+    model_intermediate_buffer: Any = None
     sampling_params: Any = None
     num_computed_tokens: int = 0
     resumable: bool = False
     output_token_ids: list[int] = field(default_factory=list)
     finished: bool = False
     output_stopped: bool = False
+    # Set by ``abort_requests``: the scheduler ended the request outside its
+    # own output (cancel, error or a parked close), so the runner has no
+    # finish reason. MiniCPM-o duplex Talkers only end this way.
+    aborted: bool = False
 
     def accept_tokens(self, token_ids: list[int]) -> None:
         """Fence publications past the sampled stop, before scheduler ACK.
@@ -68,7 +68,7 @@ class _NativeRequestState:
                 self.output_stopped = True
                 break
 
-    def snapshot(self, *, include_token_history: bool) -> SimpleNamespace:
+    def snapshot(self, *, include_token_history: bool, sampled_token_ids: list[int] | None = None) -> SimpleNamespace:
         prompt = list(self.prompt_token_ids) if include_token_history else []
         output = list(self.output_token_ids) if include_token_history else []
         finished = self.finished
@@ -81,10 +81,15 @@ class _NativeRequestState:
             all_token_ids=prompt + output,
             output_token_count=len(self.output_token_ids),
             last_output_token_id=self.output_token_ids[-1] if self.output_token_ids else None,
+            # A ledger tail can belong to an earlier segment. Only these ids
+            # were accepted with the payload being published now.
+            sampled_token_ids=list(sampled_token_ids or ()),
             additional_information=self.additional_information,
+            model_intermediate_buffer=self.model_intermediate_buffer,
             sampling_params=self.sampling_params,
             num_computed_tokens=self.num_computed_tokens,
             resumable=self.resumable,
+            aborted=self.aborted,
         )
         request.is_finished = lambda: finished
         return request
@@ -281,6 +286,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 external_req_id=external_req_id,
                 prompt_token_ids=list(getattr(request_data, "prompt_token_ids", None) or []),
                 additional_information=getattr(request_data, "additional_information", None),
+                model_intermediate_buffer=getattr(request_data, "model_intermediate_buffer", None),
                 sampling_params=getattr(request_data, "sampling_params", None),
                 num_computed_tokens=int(getattr(request_data, "num_computed_tokens", 0) or 0),
                 resumable=bool(getattr(request_data, "resumable", False)),
@@ -332,6 +338,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             if not active_req_ids:
                 return 0
             for req_id in active_req_ids:
+                self._native_requests[req_id].aborted = True
                 self._native_outputs_in_flight.pop(req_id, None)
                 self._native_terminal_pending.discard(req_id)
                 # Cancellation must not flush a partially accumulated utterance.
@@ -342,34 +349,6 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 sampled_token_ids=None,
                 terminal_req_ids=active_req_ids,
             )
-
-    def release_request_resources(self, request_ids: list[str]) -> None:
-        """Fence publications and apply the existing backend cleanup contract."""
-        if self._omni_connector is None:
-            return
-        # The scheduler's final runner step may follow the release RPC. Fence
-        # late publications with the existing abort lifecycle before reclaiming.
-        self.abort_requests(set(request_ids))
-        deadline = time.monotonic() + REQUEST_RESOURCE_RELEASE_TIMEOUT_S
-        from_stage = get_stage_connector_peer(self.model_config, self._stage_id, "from_stage")
-        completions: list[Future[None]] = []
-        with self._native_send_lock, self._lock:
-            for request_id in request_ids:
-                completion: Future[None] = Future()
-                completions.append(completion)
-                self._pending_save_reqs.setdefault(request_id, deque()).append(
-                    {
-                        "request_id": request_id,
-                        "release_prefix": f"{request_id}_{self._stage_id}_",
-                        "receive_prefix": f"{request_id}_{from_stage}_" if from_stage is not None else None,
-                        "release_completion": completion,
-                        "release_deadline": deadline,
-                    }
-                )
-                self._pending_save_counts[request_id] += 1
-        self._save_work_available.set()
-        for completion in completions:
-            completion.result(timeout=max(0, deadline - time.monotonic()))
 
     def complete_outputs(
         self,
@@ -591,7 +570,10 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             )
             entries.append(
                 (
-                    state.snapshot(include_token_history=include_token_history),
+                    state.snapshot(
+                        include_token_history=include_token_history,
+                        sampled_token_ids=sampled_by_req.get(req_id) if not state.finished else None,
+                    ),
                     payload,
                 )
             )

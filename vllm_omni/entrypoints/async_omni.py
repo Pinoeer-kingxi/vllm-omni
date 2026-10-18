@@ -14,6 +14,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import anyio
@@ -33,7 +34,7 @@ from vllm_omni.engine.messages import ErrorMessage
 from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S, AsyncOmniBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -131,6 +132,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
         submitted: asyncio.Future[None] | None = None,
+        entry_stage_id: int = 0,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -157,6 +159,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 Must have the same length as the number of stages.
                 If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
+            entry_stage_id: Stage the request is submitted to; > 0 bypasses
+                stage 0 and leaves the prompt raw for that stage. Streaming
+                prompts always enter at stage 0.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -187,7 +192,6 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         logger.debug(f"[AsyncOmni] generate() called for request {external_request_id}")
 
         input_stream_task: asyncio.Task | None = None
-        cleanup_complete = False
         try:
             _sleeping_tags = getattr(self, "_sleeping_tags", None)
             if _sleeping_tags:
@@ -261,6 +265,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
             # PD disaggregation: modify prefill-stage sampling params per request
             req_sp_list = list(sampling_params_list)
+            for index, params in enumerate(req_sp_list):
+                if isinstance(params, OmniDiffusionSamplingParams) and params.streaming_buffer_seconds is not None:
+                    self.validate_streaming_playback_request()
+                    req_sp_list[index] = replace(params, streaming_output_ack=True)
             pd_pair = self._get_pd_separation_pair()
             if pd_pair is not None:
                 p_id = pd_pair[0]
@@ -293,6 +301,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    entry_stage_id=entry_stage_id,
                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
             submit_ts = time.time()
@@ -320,8 +329,14 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 wall_start_ts,
             ):
                 yield output
+                metadata = (getattr(output, "multimodal_output", None) or {}).get("metadata", {})
+                stream = metadata.get("stream", {}) if isinstance(metadata, dict) else {}
+                chunk_index = stream.get("output_chunk_index") if isinstance(stream, dict) else None
+                if chunk_index is not None:
+                    await self._engine_core_rpc(
+                        "release_streaming_output", stage_ids=[0], args=(request_id, chunk_index)
+                    )
 
-            cleanup_complete = True
             logger.debug(f"[AsyncOmni] Request {request_id} completed")
 
         except (asyncio.CancelledError, GeneratorExit):
@@ -329,12 +344,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             # ASGI cancellation also affects subsequent awaits. Shield the
             # bounded engine abort before removing the local request state.
             with anyio.CancelScope(shield=True):
-                cleanup_complete = await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
+                await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
             self._record_request_failure_once(request_id, reason="stage_error")
-            cleanup_complete = await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
+            await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
         finally:
@@ -342,8 +357,6 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 input_stream_task.cancel()
             if admitting:
                 await self._release_generate_admission()
-            if request_id in self.request_states:
-                self.request_states[request_id].cleanup_pending = not cleanup_complete
             self._log_summary_and_cleanup(request_id)
 
     async def _release_generate_admission(self) -> None:
@@ -626,6 +639,20 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
         await self._abort(internal_ids, timeout=timeout)
 
+    async def update_streaming_playback(self, request_id: str, position_seconds: float) -> None:
+        """Forward external-session playback progress to the diffusion engine."""
+        self.validate_streaming_playback_request()
+        for state in list(self.request_states.values()):
+            if state.external_request_id == request_id:
+                await self._engine_core_rpc(
+                    "update_streaming_playback", stage_ids=[0], args=(state.request_id, position_seconds)
+                )
+
+    def validate_streaming_playback_request(self) -> None:
+        """Validate pacing topology before a realtime video request starts."""
+        if self.num_stages != 1 or self.engine.get_stage_metadata(0).stage_type != "diffusion":
+            raise ValueError("playback feedback requires single-stage diffusion")
+
     async def submit_interaction_async(
         self,
         request_id: str,
@@ -651,11 +678,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         if stage_meta.stage_type != "diffusion":
             raise ValueError("interaction requires a diffusion stage")
 
-        internal_ids = [
-            s.request_id
-            for s in self.request_states.values()
-            if s.external_request_id == request_id and not s.cleanup_pending
-        ]
+        internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id == request_id]
         if not internal_ids:
             raise ValueError(f"No active request for interaction: {request_id!r}")
         if len(internal_ids) > 1:

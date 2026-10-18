@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import asyncio
 import concurrent.futures
 import contextlib
 import importlib
@@ -16,9 +17,11 @@ import pytest
 from omegaconf import OmegaConf
 from vllm.v1.engine.utils import EngineZmqAddresses
 
+from tests.engine.test_orchestrator import FakeStageClient, _build_stage_pools
 from tests.helpers.mock import patch_hf_snapshot_download
 from vllm_omni.config.omni_config import BaseVllmOmniStageConfig, OmniStageRuntimeConfig
-from vllm_omni.config.stage_config import PipelineConfig, StagePipelineConfig
+from vllm_omni.config.stage_config import DeployConfig, PipelineConfig, StagePipelineConfig
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.engine import omni_engine_base as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -31,7 +34,8 @@ from vllm_omni.engine.stage_init_utils import (
     split_devices_for_replicas,
     stage_runtime_env,
 )
-from vllm_omni.engine.stage_runtime import StageRuntime
+from vllm_omni.engine.stage_runtime import DistStageRuntime, StageRuntime
+from vllm_omni.utils.forced_aligner import inject_forced_aligner_stage
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -315,7 +319,11 @@ def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
 
 
 @pytest.mark.parametrize("transitions", [None, ((0, 2),)])
-def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_to_runtime(monkeypatch, transitions):
+@pytest.mark.parametrize("with_aligner", [False, True])
+@pytest.mark.parametrize("distributed", [False, True])
+def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_to_runtime(
+    monkeypatch, transitions, with_aligner, distributed
+):
     import vllm_omni.engine.omni_engine_base as engine_mod
 
     engine = object.__new__(AsyncOmniEngine)
@@ -324,17 +332,22 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
         stages=tuple(StagePipelineConfig(stage_id=sid, model_stage="test", final_output=sid == 2) for sid in range(3)),
         stage_transitions=transitions,
     )
+    if with_aligner:
+        pipeline, _ = inject_forced_aligner_stage(
+            engine.pipeline_config, DeployConfig(), {"forced_aligner": "/models/Qwen3-ForcedAligner-0.6B"}
+        )
+        engine._set_pipeline_runtime_config(pipeline, None)
     engine.stage_configs = [
         BaseVllmOmniStageConfig(stage_pipeline_config=stage) for stage in engine.pipeline_config.stages
     ]
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
-    engine.single_stage_mode = False
+    engine.single_stage_mode = distributed
     engine.async_chunk = False
     engine.tokenizer = None
     engine._single_stage_id_filter = None
-    engine._omni_master_address = None
-    engine._omni_master_port = None
+    engine._omni_master_address = "127.0.0.1" if distributed else None
+    engine._omni_master_port = 30001 if distributed else None
     engine._omni_dp_size_local = 1
     engine._omni_heartbeat_timeout = 30.0
     engine._omni_lb_policy = "random"
@@ -344,20 +357,32 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     engine._parallel_stage_init = False
 
     captured: dict[str, object] = {}
-    runtime = types.SimpleNamespace(stage_pools=[], initialize=lambda: None)
+    create_runtime = engine_mod.create_stage_runtime
 
     def _capture_create_stage_runtime(**kwargs):
         captured.update(kwargs)
-        return runtime
+        return create_runtime(**kwargs)
 
     monkeypatch.setattr(engine_mod, "create_stage_runtime", _capture_create_stage_runtime)
+    monkeypatch.setattr(StageRuntime, "initialize", lambda self: None)
 
     engine._initialize_stages(stage_init_timeout=7)
 
     assert captured["stage_init_timeout"] == 7
     assert captured["log_stats"] is True
     assert captured["client_config"] is engine._client_config
-    assert captured["stage_transitions"] == transitions
+    assert captured["stage_transitions"] == engine.pipeline_config.stage_transitions
+    assert isinstance(engine._runtime, DistStageRuntime if distributed else StageRuntime)
+    expected_order = StageRouting.from_transitions(len(engine.stage_configs), engine.pipeline_config.stage_transitions)
+    assert engine._runtime._stage_routing == (expected_order if captured["stage_transitions"] is not None else None)
+    pools = _build_stage_pools([[FakeStageClient()] for _ in engine.stage_configs])
+    orchestrator = engine._create_orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    assert orchestrator._stage_routing == expected_order
 
 
 def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(monkeypatch):
@@ -1104,9 +1129,11 @@ def test_stage_runtime_launches_shared_engines_with_per_client_addresses(monkeyp
                     "output_address": f"ipc://stage{stage_id}-output-{client_index}",
                 }
 
-    assert events == (
-        [(event, stage_id) for event in ("enter", "exit") for stage_id in stage_ids] if client_count > 1 else expected
-    )
+    if client_count > 1:
+        assert events[: len(stage_ids)] == [("enter", stage_id) for stage_id in stage_ids]
+        assert sorted(events[len(stage_ids) :]) == [("exit", stage_id) for stage_id in stage_ids]
+    else:
+        assert events == expected
     assert not hasattr(stage_plans[0].replicas[0].stage_vllm_config.parallel_config, "_api_process_count")
     assert not hasattr(stage_plans[0].replicas[0].stage_vllm_config.parallel_config, "_api_process_rank")
     assert all(
@@ -1115,6 +1142,12 @@ def test_stage_runtime_launches_shared_engines_with_per_client_addresses(monkeyp
     )
     assert captured_launch_env == ["enabled" if stage_id == 0 else None for stage_id in stage_ids]
     assert os.environ.get("VLLM_OMNI_TEST_STAGE_RUNTIME_ENV") is None
+    # Pre-spawned replicas may wait for earlier members of their device group;
+    # the conservative multi-API handshake budget still covers every replica.
+    expected_handshake_timeout = runtime._stage_init_timeout * len(stage_ids) if client_count > 1 else None
+    assert [kwargs["handshake_timeout_s"] for kwargs in captured_launch_kwargs] == [expected_handshake_timeout] * len(
+        stage_ids
+    )
 
 
 @pytest.mark.parametrize("client_count", [1, 2])

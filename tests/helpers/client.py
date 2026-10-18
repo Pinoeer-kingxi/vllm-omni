@@ -136,6 +136,7 @@ class HttpResponse:
     success: bool
     error_message: str | None = None
     json_body: dict[str, Any] | list[Any] | None = None
+    content: bytes = b""
 
 
 @dataclass
@@ -365,6 +366,24 @@ def _merge_ws_expectation_kwargs(
     return cfg
 
 
+def _ws_error_code(jb: Mapping[str, Any]) -> Any:
+    """Read an error code from a WebSocket JSON frame.
+
+    Speech and video frames put ``code`` on the envelope. OpenAI Realtime nests
+    it under ``error`` (``{"type": "error", "error": {"code": "invalid_event"}}``).
+    The envelope wins when both differ; Realtime frames are expected to omit
+    top-level ``code`` (as in the Buildkite failure) so a stale envelope field
+    does not mask the nested code.
+    """
+    code = jb.get("code")
+    if code is not None:
+        return code
+    error = jb.get("error")
+    if isinstance(error, dict):
+        return error.get("code")
+    return None
+
+
 def _run_ws_expectations_from_request_config(cfg: dict[str, Any], resp: WebSocketJsonResponse) -> None:
     jb = resp.json_body
     want_type = cfg.get("ws_json_type")
@@ -372,7 +391,7 @@ def _run_ws_expectations_from_request_config(cfg: dict[str, Any], resp: WebSocke
         assert jb.get("type") == want_type, (jb, want_type)
     want_code = cfg.get("ws_error_code")
     if want_code is not None:
-        assert jb.get("code") == want_code, (jb, want_code)
+        assert _ws_error_code(jb) == want_code, (jb, want_code)
     err_message = cfg.get("err_message")
     if err_message is not None:
         assert_http_error(resp, err_message=err_message, websocket_json_message=True)
@@ -533,6 +552,7 @@ class OnlineOmniClient:
             success=ok,
             error_message=None if ok else (r.text[:8000] if r.text else None),
             json_body=payload,
+            content=r.content,
         )
 
     def send_health_http_request(

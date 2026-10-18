@@ -58,9 +58,11 @@ class _CodecPool:
     def get_bound_replica_id(self, request_id):
         return self.bound_replica
 
-    async def pick(self, request_id, *, request_state=None):
-        self.bound_replica = self.replica_id
+    async def pick(self, request_id, *, request_state):
         return self.replica_id
+
+    def schedule_release_request_resources(self, request_ids):
+        pass
 
     async def process_llm_raw_outputs(self, replica_id, raw, **kwargs):
         assert replica_id == self.replica_id
@@ -69,7 +71,10 @@ class _CodecPool:
 
 def _orchestrator(output_kind=RequestOutputKind.DELTA, *, registered=True, replica_id=2, final_stage_id=1):
     obj = Orchestrator.__new__(Orchestrator)
-    obj.stage_pools = [SimpleNamespace(final_output=False), _CodecPool(output_kind, registered, replica_id)]
+    obj.stage_pools = [
+        SimpleNamespace(final_output=False, schedule_release_request_resources=lambda request_ids: None),
+        _CodecPool(output_kind, registered, replica_id),
+    ]
     obj._stage_routing = StageRouting.from_transitions(len(obj.stage_pools))
     obj.request_states = {"r": OrchestratorRequestState(request_id="r", final_stage_id=final_stage_id)}
     obj.output_async_queue = asyncio.Queue()
@@ -78,10 +83,11 @@ def _orchestrator(output_kind=RequestOutputKind.DELTA, *, registered=True, repli
     obj._running_counter = None
     obj._abort_request_ids = AsyncMock(return_value=[])
     obj._release_request_bindings = Mock()
-    obj._release_stage_transfer_resources = AsyncMock()
+    obj._release_stage_transfer_resources = Mock()
     obj._finish_raw_terminal_requests = AsyncMock()
 
     async def process(stage, replica, raw, terminals):
+        assert isinstance(terminals, set)
         await obj._route_upstream_first_audio(stage, replica, raw)
         return await obj.stage_pools[stage].process_llm_raw_outputs(replica, raw)
 
@@ -137,27 +143,6 @@ def _messages(obj):
 def _audio(output):
     audio = output.outputs[0].multimodal_output["audio"]
     return torch.cat(audio) if isinstance(audio, list) else audio
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("suffix_overtook", [False, True])
-async def test_first_audio_uses_configured_codec_and_keeps_chunk_order(suffix_overtook):
-    obj = _orchestrator(final_stage_id=2)
-    codec = obj.stage_pools[1]
-    obj.stage_pools = [obj.stage_pools[0], SimpleNamespace(final_output=False), codec]
-    obj._stage_routing = StageRouting.from_transitions(3, ((0, 2),))
-    if suffix_overtook:
-        await _codec_output(obj, _raw(required=True, samples=(20, 21)), stage=2)
-        await _codec_output(obj, _raw(required=True, terminal=True, samples=(30, 31)), stage=2)
-        assert obj.output_async_queue.empty()
-    await obj._route_upstream_first_audio(0, 0, _raw(first=True, samples=(10, 11)))
-    if not suffix_overtook:
-        await _codec_output(obj, _raw(required=True, samples=(20, 21)), stage=2)
-        await _codec_output(obj, _raw(required=True, terminal=True, samples=(30, 31)), stage=2)
-    messages = _messages(obj)
-    assert [_audio(message.engine_outputs).tolist() for message in messages] == [[10, 11], [20, 21], [30, 31]]
-    assert all(message.stage_id == 2 for message in messages)
-    assert messages[-1].finished
 
 
 @pytest.mark.asyncio
@@ -266,20 +251,57 @@ async def test_first_audio_waits_for_codec_registration_and_ignores_duplicates()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_first_audio_flush_uses_set_with_real_raw_terminal_handlers(terminal):
+    obj = _orchestrator()
+    req_state = obj.request_states["r"]
+    codec_output = _raw(required=True, terminal=terminal, samples=(30, 31))
+    await _codec_output(obj, codec_output)
+    assert len(req_state.pending_first_audio_outputs) == 1
+    assert obj.output_async_queue.empty()
+
+    # Exercise request-id collection and iteration in the production handlers.
+    obj._prom_metrics = None
+    obj._stat_logger = None
+    obj._handle_kv_ready_raw_outputs = AsyncMock()
+    obj._apply_raw_terminal_stage_finish = AsyncMock(return_value=terminal)
+    obj._report_duplex_session_request_error = AsyncMock()
+    obj._process_llm_stage_outputs = Orchestrator._process_llm_stage_outputs.__get__(obj)
+    obj._finish_raw_terminal_requests = AsyncMock(wraps=Orchestrator._finish_raw_terminal_requests.__get__(obj))
+
+    await obj._route_upstream_first_audio(0, 0, _raw(first=True, samples=(10, 11)))
+
+    obj._finish_raw_terminal_requests.assert_awaited_once()
+    call = obj._finish_raw_terminal_requests.await_args
+    assert call is not None
+    stage, replica, terminals = call.args
+    assert (stage, replica) == (1, 2)
+    assert isinstance(terminals, set)
+    assert terminals == ({"r"} if terminal else set())
+    assert req_state.pending_first_audio_outputs == []
+    messages = _messages(obj)
+    assert [_audio(message.engine_outputs).tolist() for message in messages] == [[10, 11], [30, 31]]
+    assert messages[-1].finished is terminal
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("processing_failed", [False, True])
 async def test_prewarm_flushes_first_audio_after_successful_submission(mocker, processing_failed):
     obj = _orchestrator(registered=False, final_stage_id=2 if processing_failed else 1)
-    if processing_failed:
-        later_pool = SimpleNamespace(submit_initial=AsyncMock())
-        obj.stage_pools.append(later_pool)
-        obj._stage_routing = StageRouting.from_transitions(len(obj.stage_pools))
     req_state = obj.request_states["r"]
     req_state.sampling_params_list = [None] * (req_state.final_stage_id + 1)
+    if processing_failed:
+        later_pool = SimpleNamespace(
+            submit_initial=mocker.AsyncMock(), schedule_release_request_resources=lambda request_ids: None
+        )
+        obj.stage_pools.append(later_pool)
+        obj._stage_routing = StageRouting.from_transitions(len(obj.stage_pools))
     await obj._route_upstream_first_audio(0, 0, _raw(first=True, samples=(10, 11)))
     pool = obj.stage_pools[1]
     pool.stage_type = "llm"
     pool.stage_vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_config=None))
     obj.stage_pools[0].get_bound_replica_id = lambda request_id: 0
+    obj.stage_pools[0].pick = mocker.AsyncMock(return_value=0)
     obj._stage_receives_async_chunks = lambda stage: True
     obj._build_payload_sender_info = Mock(return_value={})
     obj._on_stage_submitted = Mock()
@@ -429,3 +451,24 @@ async def test_invalid_first_audio_reports_error_and_releases_request(audio, cod
     obj._release_request_bindings.assert_called_once_with(["r"])
     await obj._route_upstream_first_audio(0, 0, _raw(first=True))
     assert obj.output_async_queue.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix_overtook", [False, True])
+async def test_first_audio_uses_configured_codec_and_keeps_chunk_order(suffix_overtook):
+    obj = _orchestrator(final_stage_id=2)
+    codec = obj.stage_pools[1]
+    obj.stage_pools = [obj.stage_pools[0], SimpleNamespace(final_output=False), codec]
+    obj._stage_routing = StageRouting.from_transitions(3, ((0, 2),))
+    if suffix_overtook:
+        await _codec_output(obj, _raw(required=True, samples=(20, 21)), stage=2)
+        await _codec_output(obj, _raw(required=True, terminal=True, samples=(30, 31)), stage=2)
+        assert obj.output_async_queue.empty()
+    await obj._route_upstream_first_audio(0, 0, _raw(first=True, samples=(10, 11)))
+    if not suffix_overtook:
+        await _codec_output(obj, _raw(required=True, samples=(20, 21)), stage=2)
+        await _codec_output(obj, _raw(required=True, terminal=True, samples=(30, 31)), stage=2)
+    messages = _messages(obj)
+    assert [_audio(message.engine_outputs).tolist() for message in messages] == [[10, 11], [20, 21], [30, 31]]
+    assert all(message.stage_id == 2 for message in messages)
+    assert messages[-1].finished

@@ -88,6 +88,7 @@ class FakeOutputProcessor:
 class FakeInputProcessor:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.renderer = SimpleNamespace(mm_processor_cache=None)
 
     def process_inputs(self, **kwargs):
         self.calls.append(kwargs)
@@ -100,7 +101,7 @@ class FakeInputProcessor:
 
 
 class FakePrewarmPool:
-    """Single-replica pool double that binds on selection or submission."""
+    """Single-replica pool double that binds before advertising its sender."""
 
     stage_type = "llm"
 
@@ -115,12 +116,12 @@ class FakePrewarmPool:
         )
         self.submitted: list[Any] = []
 
-    async def submit_initial(self, request_id, _req_state, request, prompt_text=None):
-        self.submitted.append(request)
+    async def pick(self, request_id, *, request_state):
         self._bound_request_ids.add(request_id)
         return 0
 
-    async def pick(self, request_id, *, request_state=None):
+    async def submit_initial(self, request_id, _req_state, request, prompt_text=None):
+        self.submitted.append(request)
         self._bound_request_ids.add(request_id)
         return 0
 
@@ -197,6 +198,7 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
         sampling_params_list=[SamplingParams(max_tokens=1), SamplingParams(max_tokens=1)],
         final_stage_id=1,
     )
+    orchestrator.request_states[req_state.request_id] = req_state
 
     await orchestrator._forward_to_next_stage("req-text", 0, _request_output("req-text"), req_state)
 
@@ -213,6 +215,10 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payload_sender_info", [None, {"host": "10.0.0.2", "zmq_port": 52099}])
 async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> None:
+    import torch
+
+    from vllm_omni.engine.serialization import deserialize_additional_information
+
     orchestrator = object.__new__(Orchestrator)
     stage0 = FakePrewarmPool("sender")
     stage1 = FakePrewarmPool("sender")
@@ -223,13 +229,17 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
     orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator._emit_tx_edge = lambda **_kwargs: None
     orchestrator._on_stage_submitted = MagicMock()
+    max_frames = [256]
+    prompt = {
+        "prompt_token_ids": [1, 2],
+        "additional_information": {"codes": {"ref": torch.arange(6).reshape(3, 2)}, "max_new_frames": max_frames},
+    }
     req_state = OrchestratorRequestState(
         request_id="req-prewarm",
-        prompt={"prompt_token_ids": [1, 2]},
+        prompt=prompt,
         sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
         final_stage_id=2,
     )
-
     orchestrator.request_states = {req_state.request_id: req_state}
 
     prewarmed = await orchestrator._prewarm_async_chunk_stages(
@@ -237,6 +247,12 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
         SimpleNamespace(prompt_token_ids=[1, 2], resumable=True),
         req_state,
     )
+    max_frames.append(512)
+    info = deserialize_additional_information(stage2.submitted[0].additional_information)
+    assert torch.equal(info["codes"]["ref"], torch.arange(6).reshape(3, 2))
+    assert info["max_new_frames"] == [256]
+    assert set(stage2.submitted[0].prompt_token_ids) == {0}
+    assert prompt["prompt_token_ids"] == [1, 2]
 
     assert prewarmed is True
     assert stage1.submitted == []
@@ -266,6 +282,7 @@ async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> Non
     the turn-based Orchestrator base.
     """
     orchestrator = object.__new__(DuplexOrchestrator)
+    orchestrator.replica_placement = None
     stage0 = FakePrewarmPool("sender")
     stage1 = FakePrewarmPool("receiver")  # would receive chunks if role alone decided
     stage1.stage_client = SimpleNamespace(custom_process_input_func=lambda *a, **k: None)
@@ -280,7 +297,6 @@ async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> Non
         sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
         final_stage_id=2,
     )
-
     orchestrator.request_states = {req_state.request_id: req_state}
 
     prewarmed = await orchestrator._prewarm_async_chunk_stages(

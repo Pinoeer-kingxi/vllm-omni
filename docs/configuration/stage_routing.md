@@ -47,6 +47,8 @@ remains `None`. Typed and compatibility launch configurations use the same
 extended pipeline.
 
 Requests execute a prefix of the configured route ending at `final_stage_id`.
+If the model bypasses its initial stages for a request, execution starts at that
+request's admitted entry stage within the prefix.
 Requested output stages must occur in that prefix and declare final outputs;
 they must include the endpoint. Streaming updates retain the admitted endpoint
 and output stages. Public sampling arrays retain one slot per registered stage,
@@ -81,11 +83,11 @@ Normal and empty terminal outputs share the same completion condition: all
 selected outputs have finished, and non-streaming async requests also wait for
 every submitted stage. The endpoint's terminal output is retained until then,
 so delayed upstream usage and stop reasons arrive before completion.
-Requests use the existing
-[request cleanup contract](../design/module/engine_orchestration.md#request-cleanup).
-Changing a route does not change the selected backend's physical-release
-guarantees. Legacy V1 full-payload and native KV transfer retain their existing
-cleanup paths; NIXL ownership changes are reviewed separately.
+Cleanup retains the existing per-replica batched, best-effort resource release.
+Abort acknowledgement does not certify physical release of transport buffers.
+Changing a route does not strengthen a backend's release guarantees. Legacy V1
+full-payload and native KV transfer retain their existing cleanup paths; NIXL
+ownership changes are reviewed separately.
 
 This first implementation supports static routes for turn-based requests.
 Branches, joins, loops and token-dependent decisions need a separate execution

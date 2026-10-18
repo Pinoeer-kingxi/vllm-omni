@@ -6,14 +6,30 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
+from vllm.v1.request import RequestStatus
 
-from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc, _bind_first_audio_sink
+from vllm_omni.engine.stage_engine_core_proc import (
+    StageEngineCoreProc,
+    _bind_first_audio_sink,
+    _extend_handshake_timeout,
+)
 from vllm_omni.worker_v2.first_audio_sender import supports_in_process_first_audio
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_ordered_abort_supports_scheduler_without_overflow_fences(mocker):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    engine.scheduler = mocker.Mock(spec=Scheduler)
+
+    engine._handle_client_request(EngineCoreRequestType.ABORT, ["request"])
+
+    engine.scheduler.finish_requests.assert_called_once_with(["request"], RequestStatus.FINISHED_ABORTED)
 
 
 class WrappedUniProcExecutor(UniProcExecutor):
@@ -45,39 +61,6 @@ def test_decoder_capability_matches_sink_binding(mocker, backend, executor_class
     assert supports_in_process_first_audio(executor.vllm_config) is expected
     assert _bind_first_audio_sink(executor, mocker.Mock(), mocker.Mock()) is expected
     assert runner.model_state.set_first_audio_sink.call_count == int(expected)
-
-
-@pytest.mark.parametrize("has_plane", [False, True])
-def test_native_resource_release_reaches_worker_owned_plane(mocker, has_plane):
-    from vllm_omni.worker.mixins import OmniWorkerMixin
-
-    plane = mocker.Mock() if has_plane else None
-    worker = SimpleNamespace(model_runner=SimpleNamespace(_omni_data_plane=plane))
-    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
-    engine.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(use_v2_model_runner=True, supports_native_mrv2_data_plane=True)
-    )
-    engine.model_executor = mocker.Mock()
-    engine.model_executor.collective_rpc.side_effect = lambda method, args: getattr(OmniWorkerMixin, method)(
-        worker, *args
-    )
-    engine.omni_release_request_resources(["external"])
-    engine.model_executor.collective_rpc.assert_called_once_with("omni_release_request_resources", args=(["external"],))
-    if has_plane:
-        plane.release_request_resources.assert_called_once_with(["external"])
-
-
-def test_legacy_resource_release_reaches_scheduler_adapter(mocker):
-    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
-    engine.vllm_config = SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=False))
-    adapter = mocker.Mock()
-    engine.scheduler = SimpleNamespace(chunk_transfer_adapter=adapter)
-    engine.omni_release_request_resources(["external"])
-    adapter.release_request_resources.assert_called_once()
-    args, kwargs = adapter.release_request_resources.call_args
-    assert args == ("external",)
-    assert kwargs["deadline"] > 0
-    adapter.release_request_resources.return_value.result.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -152,3 +135,12 @@ def test_first_audio_binding_preserves_talker_marker():
     assert outputs.get_nowait()[1].outputs[0].multimodal_output[FIRST_AUDIO_KEY]
     executor.vllm_config.parallel_config.tensor_parallel_size = 2
     assert not module._bind_first_audio_sink(executor, outputs, scheduler)
+
+
+@pytest.mark.parametrize(("timeout_s", "expected_minutes"), [(900.0, 15), (901.0, 16), (60.0, 5)])
+def test_handshake_wait_is_extended_but_never_shortened(monkeypatch, timeout_s, expected_minutes) -> None:
+    import vllm.v1.engine.core as engine_core_module
+
+    monkeypatch.setattr(engine_core_module, "HANDSHAKE_TIMEOUT_MINS", 5)
+    _extend_handshake_timeout(timeout_s)
+    assert engine_core_module.HANDSHAKE_TIMEOUT_MINS == expected_minutes
