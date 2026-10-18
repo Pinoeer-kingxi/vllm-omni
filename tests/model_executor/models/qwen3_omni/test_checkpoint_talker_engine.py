@@ -638,8 +638,8 @@ def test_full_checkpoint_request_end_history_matches_cache_off(
                 output.prefill_stats is not None and output.prefill_stats.num_cached_tokens > 0 for output in outputs
             )
         entry = runner._pending_full_payload_send[rid]
-        assert "codes.audio" not in entry[0] and "codes.audio" not in entry[1]
-        assert entry[4] is not None and not entry[4].retired
+        assert "codes.audio" not in entry.chunks and "codes.audio" not in entry.latest
+        assert entry.progress is not None and not entry.progress.retired
         assert rid not in captured
         # The actual scheduler's zero-token finished step triggers flush before
         # removing runner state. No direct call to the materializer or flush.
@@ -721,10 +721,10 @@ def test_full_checkpoint_request_end_terminal_cleanup(talker_engine, terminal_ki
         expected[len(state.prompt_token_ids) :] = torch.stack(state.talker_codec_inputs[:count])
     engine.step_fn()
     assert rid not in runner.requests and rid not in runner._pending_full_payload_send
-    # Existing full-payload transport flushes same-owner partial output on abort;
-    # it has no reliable abort bit. Preserve that behavior without adding a
-    # terminal primary's next-input code or failing the engine during cleanup.
-    torch.testing.assert_close(captured[rid][0]["codes.audio"].cpu(), expected.cpu(), rtol=0, atol=0)
+    if terminal_kind == "abort-after-recompute":
+        assert rid not in captured, "cancelled output must not reach the transport"
+    else:
+        torch.testing.assert_close(captured[rid][0]["codes.audio"].cpu(), expected.cpu(), rtol=0, atol=0)
     torch.manual_seed(321)
     following, _, _, _ = _generate(engine, f"after-{rid}")
     engine.step_fn()
