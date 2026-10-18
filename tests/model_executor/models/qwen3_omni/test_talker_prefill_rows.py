@@ -861,7 +861,7 @@ def test_admission_counts_and_embedding_segments_share_the_same_layout():
     ]
     assert sum(part.num_rows for part in parts) == 21
     assert compute_talker_prompt_ids_length(prompt) == 21
-    assert _compute_talker_prompt_ids_length({"ids": {"prompt": prompt, "all": sequence}}, device="cpu") == 21
+    assert _compute_talker_prompt_ids_length({"ids": {"prompt": prompt, "all": sequence}}) == 21
 
 
 @pytest.mark.parametrize(
@@ -889,6 +889,50 @@ def _fixed_payload(model, text_count=3, *, assistant_only=False, value_offset=0)
         },
         SimpleNamespace(request_id="source", prompt_token_ids=prompt, all_token_ids=sequence),
     )
+
+
+@pytest.mark.parametrize("fixed_plan", [False, True])
+@pytest.mark.parametrize("preface_tokens", [0, 2])
+def test_prefill_excludes_tool_call_from_bootstrap_and_decode_tail(fixed_plan, preface_tokens):
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.model_executor.models.qwen3_omni.tool_speech import TOOL_CALL_START_TOKEN_ID
+    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import thinker2talker_full_payload
+    from vllm_omni.request import OmniRequest
+
+    model = _model()
+    model.config.talker_config.accept_hidden_layer = 6
+    prompt, sequence, embeddings, hidden, *_ = _case(4, assistant_only=True)
+    tool_offset = len(prompt) + preface_tokens
+    sequence[tool_offset] = TOOL_CALL_START_TOKEN_ID
+    request = OmniRequest(
+        request_id="tool", prompt_token_ids=prompt, sampling_params=SamplingParams(max_tokens=4), pooling_params=None
+    )
+    request.append_output_token_ids(sequence[len(prompt) :])
+    payload = thinker2talker_full_payload(
+        SimpleNamespace(_get_model_config=lambda: SimpleNamespace(hf_config=model.config)),
+        {
+            "hidden_states.layer_0": embeddings,
+            "hidden_states.layer_6": hidden,
+            "embed.tts_pad": torch.full((1, 1, WIDTH), 50, dtype=torch.bfloat16),
+            "embed.tts_bos": torch.full((1, 1, WIDTH), 60, dtype=torch.bfloat16),
+            "embed.tts_eos": torch.full((1, 1, WIDTH), 70, dtype=torch.bfloat16),
+        },
+        request,
+    )
+    assert payload is not None
+    assert payload["meta"]["talker_prefill_plan"] == [("assistant", 0, tool_offset)]
+    prompt_ids = payload["meta"]["next_stage_prompt_ids"]
+    if not fixed_plan:
+        payload["meta"].pop("talker_prefill_plan")
+    actual_ids, actual, update = model.talker_preprocess(
+        torch.tensor(prompt_ids), None, _omni_is_prefill=True, _omni_num_computed_tokens=0, **payload
+    )
+    assert actual_ids[-1] == (sequence[3] if preface_tokens else model.config.tts_pad_token_id)
+    first_text = embeddings[3] if preface_tokens else torch.zeros(WIDTH, dtype=torch.bfloat16)
+    torch.testing.assert_close(actual[-1], first_text + 6, rtol=0, atol=0)
+    expected_tail = torch.cat((embeddings[4:tool_offset], payload["embed"]["tts_eos"][0]))
+    torch.testing.assert_close(update["hidden_states"]["trailing_text"], expected_tail, rtol=0, atol=0)
 
 
 def _fixed_expected(payload, model):

@@ -187,10 +187,12 @@ def checkpoint_code2wav(talker_engine):
     decoder = decoder.to(device="cuda", dtype=torch.bfloat16).eval()
     snapshot = Path(os.environ["VLLM_OMNI_TEST_QWEN3_MODEL"])
     weights = {}
-    with safe_open(snapshot / "model-00015-of-00015.safetensors", framework="pt", device="cpu") as handle:
-        for key in handle.keys():
-            if key.startswith("code2wav."):
-                weights[key] = handle.get_tensor(key)
+    weight_map = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
+    for filename in sorted({filename for key, filename in weight_map.items() if key.startswith("code2wav.")}):
+        with safe_open(snapshot / filename, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                if key.startswith("code2wav."):
+                    weights[key] = handle.get_tensor(key)
     assert decoder.load_weights(weights.items()) == set(dict(decoder.named_parameters()))
     decoder.precompute_snake_caches()
     return decoder
@@ -200,13 +202,16 @@ def checkpoint_code2wav(talker_engine):
 def _decode_emitted_codes(decoder, request, outputs):
     payload = talker2code2wav_full_payload(None, {"codes.audio": _emitted_codes(outputs)}, request)
     assert payload is not None
-    codes = torch.tensor(payload["codes"]["audio"], device="cuda", dtype=torch.long).reshape(1, 16, -1)
-    # Preserve the existing full-payload packer's length-cap behavior: it
-    # tail-aligns against all sampled IDs, retaining one bootstrap zero row
-    # plus the 17 executed generated inputs. Do not silently trim the oracle.
+    codes = torch.tensor(payload["codes"]["audio"], device="cuda", dtype=torch.long).reshape(
+        1, decoder.config.num_quantizers, -1
+    )
+    # Length-cap termination retains one bootstrap row and N-1 generated inputs.
     assert codes.shape[2] == request.num_output_tokens
     assert not torch.count_nonzero(codes[:, :, 0])
-    torch.testing.assert_close(codes[0, :, 1:].cpu().T, _emitted_codes(outputs)[-17:].cpu(), rtol=0, atol=0)
+    executed = _emitted_codes(outputs)
+    torch.testing.assert_close(
+        codes[0, :, 1:].cpu().T, executed[executed.shape[0] - (codes.shape[2] - 1) :].cpu(), rtol=0, atol=0
+    )
     waveform = decoder.chunked_decode(codes, chunk_size=300, left_context_size=25)[0].detach().cpu()
     assert waveform.numel() > 0 and torch.isfinite(waveform).all()
     assert torch.count_nonzero(waveform) and waveform.abs().max() <= 1

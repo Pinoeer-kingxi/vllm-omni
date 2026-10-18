@@ -52,16 +52,6 @@ def _hidden_last(payload: dict[str, Any], *, device: torch.device, dtype: torch.
     return hidden.to(device=device, dtype=dtype).reshape(1, 1, -1)
 
 
-def _append_codes(state: Any, codes: torch.Tensor) -> None:
-    if codes.ndim != 1 or codes.dtype != torch.long:
-        raise ValueError("Talker pending codec producer returned an invalid code tensor")
-    history = _codec_history(state)
-    if history and (history[-1].device != codes.device or history[-1].numel() != codes.numel()):
-        raise ValueError("Talker local codec history changed device or width")
-    history.append(codes)
-    state.talker_codec_inputs = history
-
-
 def _validate_history_frontier(state: Any, *, spec_groups: int) -> list[torch.Tensor]:
     history = _codec_history(state)
     tokens = _accepted_output_tokens(state)
@@ -169,7 +159,7 @@ def install_pending_talker_primary(
         raise ValueError("Talker pending codec producer returned an invalid code width")
     if codes.dtype != torch.long:
         raise ValueError("Talker pending codec producer returned an invalid code tensor")
-    _append_codes(state, codes)
+    _codec_history(state).append(codes)
     state.talker_next_input_position = pending_position
     state.talker_next_input_embedding = embedding
 
