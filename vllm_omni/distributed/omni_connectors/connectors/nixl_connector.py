@@ -278,11 +278,6 @@ class NixlConnector(OmniConnectorBase):
                 memory_type = self._resolve_memory_type(tensor)
                 grouped_tensors.setdefault(memory_type, []).append((tensor_index, tensor))
 
-            # Normalization and producer kernels may still be writing CUDA
-            # storage. Native READs do not inherit PyTorch stream dependencies.
-            for device in {tensor.device for tensor in tensors if tensor.device.type == "cuda" and tensor.numel()}:
-                torch.accelerator.synchronize(device)
-
             with self._state_lock:
                 previous = self._pending.get(put_key)
                 if previous is not None and (previous.claims or previous.releasing is not None):
@@ -1192,6 +1187,9 @@ class NixlConnector(OmniConnectorBase):
     @staticmethod
     def _normalize_tensor_payload(payload: Any) -> tuple[list[torch.Tensor], list[dict[str, Any]]]:
         tensors = [payload] if isinstance(payload, torch.Tensor) else list(payload)
+        # A contiguous copy must read completed writes, including on other streams.
+        for device in {tensor.device for tensor in tensors if tensor.device.type == "cuda" and tensor.numel()}:
+            torch.accelerator.synchronize(device)
         normalized: list[torch.Tensor] = []
         specs: list[dict[str, Any]] = []
         for tensor in tensors:
@@ -1205,6 +1203,10 @@ class NixlConnector(OmniConnectorBase):
                     "size": contiguous.numel() * contiguous.element_size(),
                 }
             )
+        for device in {
+            tensor.device for tensor in tensors if tensor.device.type == "cuda" and not tensor.is_contiguous()
+        }:
+            torch.cuda.current_stream(device).synchronize()
         return normalized, specs
 
     def _allocate_tensor_from_spec(self, spec: dict[str, Any], kind: str | None) -> torch.Tensor:

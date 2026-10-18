@@ -384,12 +384,17 @@ def test_native_reader_exit_reclaims_only_its_prefix_and_allows_key_reuse():
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
 @pytest.mark.skipif(not _native_nixl_available(1), reason="requires NIXL and CUDA")
-def test_native_publication_waits_for_cuda_producer_stream():
+@pytest.mark.parametrize("strided", [False, True])
+def test_native_publication_waits_for_cuda_producer_stream(strided):
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
 
     current_omni_platform.set_device(0)
     with closing(NixlConnector({"role": "sender", "host": "127.0.0.1"})) as producer:
-        payload = torch.zeros(32, device="cuda:0")
+        payload = torch.zeros(64 if strided else 32, device="cuda:0")
+        if strided:
+            payload = payload[::2]
+            # Cold allocation can otherwise hide a missing writer fence.
+            payload.contiguous()
         torch.accelerator.synchronize()
         stream = torch.cuda.Stream(device=0)
         with torch.cuda.stream(stream):

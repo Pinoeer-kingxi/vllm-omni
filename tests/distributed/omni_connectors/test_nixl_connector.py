@@ -371,32 +371,42 @@ def test_completed_context_reused_only_after_last_chunk_and_with_fresh_generatio
 
 def test_cuda_payload_ready_before_registration_and_publication(producer, monkeypatch):
     devices = [torch.device(name) for name in ("cuda:0", "cuda:0", "cuda:1", "cpu")]
+    synchronized: list[torch.device] = []
+    copied: list[torch.device] = []
+
+    def contiguous():
+        assert set(synchronized) == {torch.device("cuda:0"), torch.device("cuda:1")}
+        return torch.ones(4)
+
     tensors = [
         types.SimpleNamespace(
             device=device,
             numel=lambda: 4,
-            element_size=lambda: 4,
-            get_device=lambda device=device: device.index,
-            data_ptr=lambda: 1024,
+            is_contiguous=lambda: False,
+            detach=lambda: types.SimpleNamespace(contiguous=contiguous),
         )
         for device in devices
     ]
-    specs = [{"shape": [4], "dtype": "torch.float32", "device": str(device), "size": 16} for device in devices]
-    monkeypatch.setattr(producer, "_normalize_tensor_payload", lambda data: (tensors, specs))
-    synchronized: list[torch.device] = []
     monkeypatch.setattr(torch.accelerator, "synchronize", synchronized.append)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda device: types.SimpleNamespace(synchronize=lambda: copied.append(device)),
+    )
+    normalized, _ = producer._normalize_tensor_payload(tensors)
     agent = _FakeNixlAgent("ready-gpu-storage")
     register = agent.register_memory
 
     def register_ready(descs, backends=None):
         assert len(synchronized) == 2
         assert set(synchronized) == {torch.device("cuda:0"), torch.device("cuda:1")}
+        assert set(copied) == set(synchronized)
         assert producer._published == {}
         register(descs, backends)
 
     monkeypatch.setattr(agent, "register_memory", register_ready)
     monkeypatch.setattr(producer, "_agent_factory", lambda: agent)
-    assert producer.put("0", "2", "req_0_0", torch.ones(4))[0]
+    assert producer.put("0", "2", "req_0_0", normalized)[0]
     assert "req_0_0" in producer._published
 
 

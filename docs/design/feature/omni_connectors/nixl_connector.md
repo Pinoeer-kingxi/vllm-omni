@@ -211,6 +211,8 @@ prefixes: put P95 increased from 0.238 ms on the base to 1554.224 ms, with 315
 additional threads. This fixture performs no payload READ or model inference.
 The lifecycle fixes retain the per-prefix context policy and device-wide CUDA
 readiness fence; they do not establish that this publication overhead is resolved.
+The fence precedes normalization so a contiguous copy cannot read unfinished
+producer writes. Any copy launched by normalization completes before publication.
 Payloads can be written on non-current streams, so narrowing that fence requires
 an explicit producer-readiness contract rather than assuming the current stream.
 
