@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import AbortRequestMessage, ErrorMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
@@ -103,6 +104,7 @@ def _make_orchestrator(num_stages: int = 2) -> Orchestrator:
     orch._cfg_tracker = CfgCompanionTracker()
     orch.request_states = {}
     orch.stage_pools = [_FakePool("llm"), _FakePool("diffusion")][:num_stages]
+    orch._stage_routing = StageRouting.from_transitions(len(orch.stage_pools))
     orch.output_async_queue = asyncio.Queue()
     orch.async_chunk = False
     orch.duplex_control_plane = None

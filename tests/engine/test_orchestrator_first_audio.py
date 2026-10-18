@@ -10,6 +10,7 @@ import torch
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import FinishReason
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
@@ -69,6 +70,7 @@ class _CodecPool:
 def _orchestrator(output_kind=RequestOutputKind.DELTA, *, registered=True, replica_id=2, final_stage_id=1):
     obj = Orchestrator.__new__(Orchestrator)
     obj.stage_pools = [SimpleNamespace(final_output=False), _CodecPool(output_kind, registered, replica_id)]
+    obj._stage_routing = StageRouting.from_transitions(len(obj.stage_pools))
     obj.request_states = {"r": OrchestratorRequestState(request_id="r", final_stage_id=final_stage_id)}
     obj.output_async_queue = asyncio.Queue()
     obj._cfg_tracker = CfgCompanionTracker()
@@ -138,11 +140,33 @@ def _audio(output):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("suffix_overtook", [False, True])
+async def test_first_audio_uses_configured_codec_and_keeps_chunk_order(suffix_overtook):
+    obj = _orchestrator(final_stage_id=2)
+    codec = obj.stage_pools[1]
+    obj.stage_pools = [obj.stage_pools[0], SimpleNamespace(final_output=False), codec]
+    obj._stage_routing = StageRouting.from_transitions(3, ((0, 2),))
+    if suffix_overtook:
+        await _codec_output(obj, _raw(required=True, samples=(20, 21)), stage=2)
+        await _codec_output(obj, _raw(required=True, terminal=True, samples=(30, 31)), stage=2)
+        assert obj.output_async_queue.empty()
+    await obj._route_upstream_first_audio(0, 0, _raw(first=True, samples=(10, 11)))
+    if not suffix_overtook:
+        await _codec_output(obj, _raw(required=True, samples=(20, 21)), stage=2)
+        await _codec_output(obj, _raw(required=True, terminal=True, samples=(30, 31)), stage=2)
+    messages = _messages(obj)
+    assert [_audio(message.engine_outputs).tolist() for message in messages] == [[10, 11], [20, 21], [30, 31]]
+    assert all(message.stage_id == 2 for message in messages)
+    assert messages[-1].finished
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", list(RequestOutputKind))
 @pytest.mark.parametrize("suffix_overtook", [False, True])
 async def test_single_stage_first_audio_obeys_output_kind_and_terminal_order(kind, suffix_overtook):
     obj = _orchestrator(kind, final_stage_id=0)
     obj.stage_pools = [obj.stage_pools[1]]
+    obj._stage_routing = StageRouting.from_transitions(len(obj.stage_pools))
     suffix = _raw(required=True, samples=(20, 21))
     terminal = _raw(required=True, terminal=True, samples=(30, 31))
     if suffix_overtook:
@@ -169,6 +193,7 @@ async def test_single_stage_first_audio_obeys_output_kind_and_terminal_order(kin
 async def test_single_stage_cancellation_discards_overtaking_terminal_and_late_first_audio():
     obj = _orchestrator(final_stage_id=0)
     obj.stage_pools = [obj.stage_pools[1]]
+    obj._stage_routing = StageRouting.from_transitions(len(obj.stage_pools))
     await _codec_output(obj, _raw(required=True, terminal=True), stage=0)
     assert obj.request_states["r"].pending_first_audio_outputs
     await obj._cleanup_request_ids(["r"], abort=True)
@@ -180,6 +205,7 @@ async def test_single_stage_cancellation_discards_overtaking_terminal_and_late_f
 async def test_single_stage_first_audio_processing_failure_releases_waiting_terminal():
     obj = _orchestrator(final_stage_id=0)
     obj.stage_pools = [obj.stage_pools[1]]
+    obj._stage_routing = StageRouting.from_transitions(len(obj.stage_pools))
     await _codec_output(obj, _raw(required=True, terminal=True), stage=0)
     obj.stage_pools[0].process_llm_raw_outputs = AsyncMock(side_effect=RuntimeError("processing failed"))
     await obj._route_upstream_first_audio(0, 2, _raw(first=True))
@@ -246,6 +272,7 @@ async def test_prewarm_flushes_first_audio_after_successful_submission(mocker, p
     if processing_failed:
         later_pool = SimpleNamespace(submit_initial=AsyncMock())
         obj.stage_pools.append(later_pool)
+        obj._stage_routing = StageRouting.from_transitions(len(obj.stage_pools))
     req_state = obj.request_states["r"]
     req_state.sampling_params_list = [None] * (req_state.final_stage_id + 1)
     await obj._route_upstream_first_audio(0, 0, _raw(first=True, samples=(10, 11)))
@@ -321,6 +348,7 @@ async def test_later_aligner_receives_full_codec_waveform():
 
     obj = _orchestrator(RequestOutputKind.CUMULATIVE, final_stage_id=2)
     obj.stage_pools.append(SimpleNamespace(final_output=True))
+    obj._stage_routing = StageRouting.from_transitions(len(obj.stage_pools))
     await obj._route_upstream_first_audio(0, 0, _raw(first=True, samples=(10, 11)))
     await _codec_output(obj, _raw(required=True, terminal=True, samples=(20, 21)))
     messages = _messages(obj)

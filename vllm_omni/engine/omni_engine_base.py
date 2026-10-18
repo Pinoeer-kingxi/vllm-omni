@@ -377,6 +377,7 @@ class OmniEngineBase:
             single_stage_mode=self.single_stage_mode,
             stage_init_timeout=stage_init_timeout,
             async_chunk=self.async_chunk,
+            stage_transitions=self.pipeline_config.stage_transitions if self.pipeline_config is not None else None,
             tokenizer=self.tokenizer,
             parallel_stage_init=self._parallel_stage_init,
             single_stage_id_filter=self._single_stage_id_filter,
@@ -453,6 +454,7 @@ class OmniEngineBase:
                 output_async_queue=self.output_queue.async_q,
                 rpc_async_queue=self.rpc_output_queue.async_q,
                 stage_pools=self.stage_pools,
+                stage_transitions=self.pipeline_config.stage_transitions if self.pipeline_config is not None else None,
                 async_chunk=self.async_chunk,
                 pd_config=pd_config,
                 membership_controller=membership_controller,
@@ -882,6 +884,7 @@ class OmniEngineBase:
         config_path: str | None,
     ) -> None:
         """Initialize engine-wide settings resolved from pipeline metadata."""
+        self.pipeline_config = pipeline_config
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
         self._event_driven_orch_default = _event_driven_orch_default_for_pipeline(
             pipeline_config.model_type if pipeline_config is not None else None

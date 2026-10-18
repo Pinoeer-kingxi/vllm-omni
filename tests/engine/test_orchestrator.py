@@ -21,6 +21,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
@@ -430,6 +431,7 @@ def _build_harness(
     async_chunk: bool = False,
     log_stats: bool = False,
     stage_pools: list[StagePool] | None = None,
+    stage_transitions: tuple[tuple[int, int], ...] | None = None,
 ) -> OrchestratorFixture:
     """Build an Orchestrator test harness.
 
@@ -464,6 +466,7 @@ def _build_harness(
                 rpc_async_queue=rpc_queue.async_q,
                 stage_pools=stage_pools,
                 async_chunk=async_chunk,
+                stage_transitions=stage_transitions,
                 log_stats=log_stats,
             )
             ready_future.set_result((orchestrator, request_queue, output_queue, rpc_queue))
@@ -1525,6 +1528,7 @@ async def test_handle_streaming_update_unknown_request_is_dropped() -> None:
     orchestrator.async_chunk = False
     orchestrator.request_states = {}
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     add_request_calls: list[str] = []
 
     async def record_add_request(msg) -> None:
@@ -1607,6 +1611,7 @@ async def test_add_request_attaches_native_kv_ticket_before_dispatch(mocker, nat
 def test_native_handoff_uses_bound_replica_and_reports_missing_binding(mocker) -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [mocker.Mock()]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator.stage_pools[0].get_bound_client.return_value = None
     req_state = SimpleNamespace(native_kv_transfer_id="xfer-req")
     output = SimpleNamespace(kv_transfer_params={"num_transfer_tokens": 4})
@@ -1671,6 +1676,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
         )
     }
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
 
     await orchestrator._handle_streaming_update(
         StageSubmissionMessage(
@@ -1715,6 +1721,7 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
     req_state.stage_submit_ts[0] = time.time()
     orchestrator.request_states = {"req-stream": req_state}
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     routed: list[Any] = []
 
     async def record_route(_stage_id, _replica_id, _output, _req_state, stage_metrics):
@@ -2116,6 +2123,7 @@ async def test_abort_retry_does_not_repeat_successful_stage_abort():
     second = _Pool(fail_once=True)
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [first, second]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator.request_states = {}
 
     with pytest.raises(RuntimeError, match="stage abort failed"):
@@ -2146,6 +2154,7 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
         stage_pools=[],
     )
     orchestrator.stage_pools = pools
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator.request_states["stuck"] = OrchestratorRequestState(request_id="stuck", final_stage_id=1)
     mocker.patch.object(orchestrator, "_handle_kv_ready_raw_outputs", new_callable=mocker.AsyncMock)
     cleanup = mocker.patch.object(orchestrator, "_cleanup_request_ids", new_callable=mocker.AsyncMock)

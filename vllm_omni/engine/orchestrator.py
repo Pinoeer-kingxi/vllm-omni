@@ -34,6 +34,7 @@ from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
 from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS, FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
@@ -362,6 +363,7 @@ class OrchestratorBase:
         stage_pools: list[StagePool],
         *,
         async_chunk: bool = False,
+        stage_transitions: tuple[tuple[int, int], ...] | None = None,
         pd_config: dict[str, Any] | None = None,
         membership_controller: MembershipController | None = None,
         running_counter: OmniRequestCounter | None = None,
@@ -379,6 +381,7 @@ class OrchestratorBase:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+        self._stage_routing = StageRouting.from_transitions(self.num_stages, stage_transitions)
         self.log_stats = log_stats
         self._prom_metrics = prom_metrics
         self._stage_replica_waiting: dict[tuple[int, int], int] = {}
@@ -748,7 +751,7 @@ class OrchestratorBase:
             if (state := self.request_states.get(request_id)) is not None
             for output in state.pending_abort_outputs
         ]
-        abort_outputs.sort(key=lambda output: output.stage_id)
+        abort_outputs.sort(key=lambda output: self._stage_routing.stage_order.index(output.stage_id))
         last_index_by_req: dict[str, int] = {}
         for index, output_msg in enumerate(abort_outputs):
             last_index_by_req[output_msg.request_id] = index
@@ -2128,10 +2131,10 @@ class OrchestratorBase:
             await self._publish_final_output(req_state, pending)
 
     def _request_stage_path(self, req_state: OrchestratorRequestState) -> tuple[int, ...]:
-        return tuple(range(req_state.final_stage_id + 1))
+        return self._stage_routing.path_to(req_state.final_stage_id)
 
     def _next_request_stage(self, stage_id: int, req_state: OrchestratorRequestState) -> int | None:
-        return stage_id + 1 if stage_id < req_state.final_stage_id else None
+        return self._stage_routing.next_stage(stage_id, req_state.final_stage_id)
 
     def _stage_receives_async_chunks(self, stage_id: int) -> bool:
         """Whether a stage's connector supplies its runtime inputs."""
@@ -3133,7 +3136,7 @@ class Orchestrator(OrchestratorBase):
 
     def _native_mrv2_receiver_stage(self, final_stage_id: int) -> int | None:
         """First downstream stage up to ``final_stage_id`` that receives on MRv2's native data plane."""
-        for stage_id in range(1, min(final_stage_id, len(self.stage_pools) - 1) + 1):
+        for stage_id in self._stage_routing.path_to(final_stage_id)[1:]:
             vllm_config = getattr(self.stage_pools[stage_id], "stage_vllm_config", None)
             model_config = getattr(vllm_config, "model_config", None)
             if uses_native_mrv2_data_plane(
@@ -3163,9 +3166,7 @@ class Orchestrator(OrchestratorBase):
             )
             return
         try:
-            if type(final_stage_id) is not int or not 0 <= final_stage_id < self.num_stages:
-                raise ValueError(f"Final stage {final_stage_id!r} is not reachable from stage 0")
-            stage_path = tuple(range(final_stage_id + 1))
+            stage_path = self._stage_routing.path_to(final_stage_id)
             if any(type(sid) is not int for sid in output_stage_ids):
                 raise ValueError("Requested output stage IDs must be integers")
             final_output_stage_ids = set(output_stage_ids)

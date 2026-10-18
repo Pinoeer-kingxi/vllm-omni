@@ -14,6 +14,7 @@ import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
@@ -219,6 +220,7 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
     if payload_sender_info is not None:
         stage1.stage_client.get_payload_sender_info = MagicMock(return_value=payload_sender_info)
     orchestrator.stage_pools = [stage0, stage1, stage2]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator._emit_tx_edge = lambda **_kwargs: None
     orchestrator._on_stage_submitted = MagicMock()
     req_state = OrchestratorRequestState(
@@ -269,6 +271,7 @@ async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> Non
     stage1.stage_client = SimpleNamespace(custom_process_input_func=lambda *a, **k: None)
     stage2 = FakePrewarmPool("receiver")
     orchestrator.stage_pools = [stage0, stage1, stage2]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator._emit_tx_edge = lambda **_kwargs: None
     orchestrator._on_stage_submitted = MagicMock()
     req_state = OrchestratorRequestState(
@@ -305,6 +308,7 @@ async def test_async_route_forwards_to_outgoing_only_stage() -> None:
     stage0 = SimpleNamespace(final_output=False)
     stage1 = FakePrewarmPool("sender")
     orchestrator.stage_pools = [stage0, stage1]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator._forward_to_next_stage = AsyncMock()
     req_state = OrchestratorRequestState(
         request_id="req-route",
@@ -330,6 +334,7 @@ async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
         cleanup_parent=lambda _request_id: [],
     )
     orchestrator.stage_pools = [SimpleNamespace(final_output=True)]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator.output_async_queue = asyncio.Queue()
     orchestrator._cleanup_request_ids = AsyncMock()
 

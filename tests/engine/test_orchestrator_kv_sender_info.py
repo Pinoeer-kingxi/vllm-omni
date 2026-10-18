@@ -11,6 +11,7 @@ import pytest
 from vllm import SamplingParams
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
@@ -356,6 +357,7 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
 
     orchestrator.num_stages = 2
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator._cfg_tracker = CfgCompanionTracker()
 
     params = OmniDiffusionSamplingParams()
@@ -386,6 +388,7 @@ def test_diffusion_resubmission_preserves_sender_endpoints():
     diffusion_pool = StagePool(1, diffusion_stage)
     orchestrator.num_stages = 2
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator._cfg_tracker = CfgCompanionTracker()
     state = OrchestratorRequestState(
         request_id="streaming",
@@ -417,6 +420,7 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
 
     orchestrator.num_stages = 3
     orchestrator.stage_pools = [source_pool, previous_pool, diffusion_pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator._cfg_tracker = CfgCompanionTracker()
 
     params = OmniDiffusionSamplingParams()
@@ -453,6 +457,7 @@ def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
 
     orchestrator.num_stages = 2
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator._cfg_tracker = CfgCompanionTracker()
     orchestrator.output_async_queue = _AsyncQueue()
     orchestrator.request_states = {}
@@ -489,6 +494,7 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
     diffusion_pool = StagePool(1, diffusion_stage)
 
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator.num_stages = 2
 
     req_state = OrchestratorRequestState(
@@ -532,6 +538,7 @@ def test_prewarm_submits_bound_payload_endpoint_for_concurrent_replicas():
         pick=AsyncMock(side_effect=lambda key, **kwargs: {"a": 7, "b": 1}[key]),
     )
     orchestrator.stage_pools = [source, target]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator._stage_receives_async_chunks = lambda stage: True
     orchestrator._record_duplex_stage_submission = lambda *args: None
     orchestrator._emit_tx_edge = lambda **kwargs: None
@@ -599,6 +606,7 @@ async def test_async_pipeline_defers_sync_stage_until_audio_finishes(mocker):
         ),
     )
     orchestrator.stage_pools = [audio_pool, aligner_pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     state = OrchestratorRequestState(
         request_id="aligned",
         prompt={"additional_information": {"text": ["Hello world"]}},
