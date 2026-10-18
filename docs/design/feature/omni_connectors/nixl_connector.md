@@ -192,6 +192,13 @@ Producer `close()` applies the same ordering to all pending contexts.
 claims; a deadline reports failure while retaining resources still owned locally.
 Native context destruction is synchronous and has no universal hard deadline.
 
+After all stages finish, the orchestrator's existing best-effort release RPC
+reaches the native MRv2 worker, rather than the scheduler's V1 chunk adapter.
+The worker stops remaining publication under its output lock, then retires the
+request's unconsumed prefixes outside that lock. Late output batches cannot
+publish after request state is removed. The release is also enabled for native
+full-payload stages; the V1 release path is unchanged.
+
 The lease reaper owns expiry cleanup. A failed expired release retains its source
 ownership, keeps metadata unpublished and retries after a 100 ms backoff. Failure
 of one payload does not stop the reaper or reject another request's publication.

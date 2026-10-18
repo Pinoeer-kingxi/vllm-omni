@@ -1134,6 +1134,155 @@ def consumer(nixl_connector_cls):
 
 
 @pytest.fixture
+def native_release_engine(producer, consumer, mocker, request):
+    from vllm import SamplingParams
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.executor.uniproc_executor import UniProcExecutor
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
+
+    from tests.worker.test_omni_connector_mixin import _make_model_config
+    from vllm_omni.core.sched.output import OmniNewRequestData
+    from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+    from vllm_omni.worker.gpu_ar_worker import GPUARWorker
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+    from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
+
+    stage_id, async_chunk = getattr(request, "param", (0, True))
+    suffix = "async_chunk" if async_chunk else "full_payload"
+    config = _make_model_config(
+        async_chunk=async_chunk,
+        custom_func=f"vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_{suffix}",
+    )
+    config.stage_id = stage_id
+    config.model_stage = "talker"
+    connector = producer if config.stage_id == 0 else consumer
+    producer.config.update(codec_chunk_frames=1, initial_codec_chunk_frames=1, codec_left_context_frames=0)
+    mocker.patch.object(OmniRunnerDataPlane, "_create_connector", return_value=connector)
+    plane = OmniRunnerDataPlane(mocker.Mock(model_config=config), config)
+    request_data = OmniNewRequestData(
+        req_id="internal",
+        external_req_id="release-target",
+        prompt_token_ids=[1],
+        mm_features=[],
+        sampling_params=SamplingParams(max_tokens=32),
+        pooling_params=None,
+        block_ids=([],),
+        num_computed_tokens=0,
+        lora_request=None,
+    )
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner._omni_data_plane = plane
+    worker = GPUARWorker.__new__(GPUARWorker)
+    worker.model_runner = runner
+    wrapper = WorkerWrapperBase()
+    wrapper.worker = worker
+    executor = UniProcExecutor.__new__(UniProcExecutor)
+    executor.driver_worker = wrapper
+    core = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    core.model_executor = executor
+    core.scheduler = mocker.Mock(spec=Scheduler)
+    core.scheduler._native_data_plane = True
+    core.scheduler.chunk_transfer_adapter = None
+    try:
+        yield plane, core, request_data
+    finally:
+        plane.close()
+
+
+@pytest.mark.parametrize("worker_finished", [False, True])
+def test_engine_release_reclaims_native_terminal_publications(producer, native_release_engine, worker_finished):
+    plane, core, request = native_release_engine
+    plane.register_request(request)
+    assert (
+        plane.complete_outputs(
+            req_ids=["internal"],
+            inter_stage_outputs=[{"codes": {"audio": torch.ones((1, 16), dtype=torch.long)}}],
+            sampled_token_ids=[[21]],
+        )
+        == 1
+    )
+    if worker_finished:
+        assert plane.abort_requests({"internal"}) == 1
+    assert "release-target_0_0" in producer._pending
+    producer.put("0", "1", "survivor_0_0", torch.ones(1))
+    survivor = producer._pending["survivor_0_0"]
+
+    core.omni_release_request_resources(["release-target"])
+    assert producer._pending == {"survivor_0_0": survivor}
+    assert not plane._native_requests
+    assert plane.complete_outputs(req_ids=["internal"], inter_stage_outputs=None, sampled_token_ids=[[22]]) == 0
+    core.omni_release_request_resources(["release-target"])
+    assert producer._pending == {"survivor_0_0": survivor}
+
+
+@pytest.mark.parametrize("native_release_engine", [(1, True)], indirect=True)
+def test_engine_release_cancels_receive_before_model_slot(native_release_engine):
+    from vllm_omni.core.sched.output import OmniChunkRecvHandle
+
+    plane, core, _ = native_release_engine
+    plane.register_receivers([OmniChunkRecvHandle(request_id="internal", external_req_id="release-target")])
+    assert "internal" in plane._pending_load_reqs
+
+    core.omni_release_request_resources(["release-target"])
+
+    assert not plane._pending_load_reqs and not plane._request_ids_mapping
+
+
+@pytest.mark.parametrize("native_release_engine", [(0, False)], indirect=True)
+@pytest.mark.parametrize("worker_finished", [False, True])
+def test_engine_release_reclaims_native_full_payload(producer, native_release_engine, worker_finished):
+    plane, core, request = native_release_engine
+    plane.register_request(request)
+    assert (
+        plane.complete_outputs(
+            req_ids=["internal"],
+            inter_stage_outputs=[{"codes": {"audio": torch.ones((1, 16), dtype=torch.long)}}],
+            sampled_token_ids=[[21]],
+        )
+        == 0
+    )
+    if worker_finished:
+        assert plane.request_terminal({"internal"}) == 1
+
+    core.omni_release_request_resources(["release-target"])
+
+    assert not producer._pending and not plane._native_requests
+    assert not plane._pending_full_payload_send
+
+
+def test_engine_retirement_allows_queued_native_output(producer, native_release_engine, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from dataclasses import replace
+
+    plane, core, request = native_release_engine
+    plane.register_request(request)
+    entered, resume = threading.Event(), threading.Event()
+    cleanup_prefix = producer.cleanup_prefix
+
+    def blocked_cleanup(prefix):
+        entered.set()
+        assert resume.wait(5)
+        return cleanup_prefix(prefix)
+
+    monkeypatch.setattr(producer, "cleanup_prefix", blocked_cleanup)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cleanup = executor.submit(core.omni_release_request_resources, ["release-target"])
+        try:
+            assert entered.wait(2)
+            plane.register_request(replace(request, req_id="survivor", external_req_id="survivor"))
+            plane.enqueue_outputs(
+                req_ids=["survivor"],
+                inter_stage_outputs=[{"codes": {"audio": torch.ones((1, 16), dtype=torch.long)}}],
+                sampled_token_ids=[[21]],
+            )
+            executor.submit(plane.drain_outputs).result(timeout=2)
+            assert "survivor_0_0" in producer._pending
+        finally:
+            resume.set()
+            cleanup.result(timeout=2)
+
+
+@pytest.fixture
 def metadata_receive_timeout(consumer, monkeypatch, mocker):
     """Fail socket receives for claim queries, leaving completion ACKs real."""
     original_get_socket = consumer._get_req_socket

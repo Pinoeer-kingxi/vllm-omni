@@ -39,6 +39,29 @@ async def _settle(pool: StagePool) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "async_chunk,use_v2,native,expected",
+    [(False, False, False, False), (True, False, False, True), (False, True, True, True), (False, True, False, False)],
+)
+async def test_release_includes_native_full_payload_but_preserves_legacy_gate(
+    mocker, async_chunk, use_v2, native, expected
+) -> None:
+    config = mocker.Mock(
+        model_config=mocker.Mock(
+            async_chunk=async_chunk, use_v2_model_runner=use_v2, supports_native_mrv2_data_plane=native
+        )
+    )
+    replica = _Replica()
+    pool = StagePool(0, [replica], stage_vllm_config=config)
+
+    pool.schedule_release_request_resources(["request"])
+    await _settle(pool)
+
+    assert replica.calls == ([["request"]] if expected else [])
+    assert not pool._pending_releases and not pool._release_flushers
+
+
+@pytest.mark.asyncio
 async def test_hung_replica_does_not_delay_healthy_replica_batches(monkeypatch, make_pool) -> None:
     hung, healthy = _Replica(hang=True), _Replica()
     pool = make_pool(hung, healthy)
