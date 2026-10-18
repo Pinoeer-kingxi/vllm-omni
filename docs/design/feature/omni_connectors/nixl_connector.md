@@ -216,10 +216,12 @@ an explicit producer-readiness contract rather than assuming the current stream.
 
 ## Validation
 
-The native CUDA smoke test requires NIXL and at least two visible CUDA devices:
+The mixed-device smoke requires NIXL and two visible CUDA devices. Select
+`-m 'cuda and cards_1'` to run only the single-GPU lifetime regressions.
 
 ```bash
 UCX_RCACHE_MAX_UNRELEASED=1024 pytest -o addopts='' -q -s \
+  -m cuda --run-level=advanced_model \
   tests/distributed/omni_connectors/test_nixl_connector_native.py
 ```
 
