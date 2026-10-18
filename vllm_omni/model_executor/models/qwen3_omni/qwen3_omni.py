@@ -1438,9 +1438,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         plan = row_plan
         sequence_ids = None
         if plan is None or identity_ids is None:
-            sequence_ids = (
-                thinker_result_ids_cpu if thinker_result_ids_cpu is not None else thinker_result_ids
-            ).reshape(-1).tolist()
+            source_ids = thinker_result_ids_cpu if thinker_result_ids_cpu is not None else thinker_result_ids
+            sequence_ids = source_ids.reshape(-1).tolist()
         if plan is None:
             if input_ids is None:
                 raise ValueError("Talker prefill requires prompt IDs or a fixed row plan")
