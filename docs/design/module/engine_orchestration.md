@@ -138,7 +138,7 @@ RPCs (`sleep` / `wake_up` / `pause_scheduler` / `resume_scheduler`) must
 propagate worker exceptions rather than returning `{"supported": False}`.
 When a request has multiple final output stages, only the last abort message
 is request-terminal. Output-processor abort state is committed only after the
-physical EngineCore abort succeeds.
+physical EngineCore abort succeeds or a natural terminal confirms stage completion.
 An abort failure still attempts the other stages and replicas. The request
 remains closed to admission while unacknowledged stages drain; their natural
 terminals permit cleanup without publishing a normal completion. Correlated
