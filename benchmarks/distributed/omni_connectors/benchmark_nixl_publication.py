@@ -5,6 +5,7 @@
 
 import argparse
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -100,7 +101,7 @@ def main(args):
             "gpu": current_omni_platform.get_device_name(0),
             "scope": "Native registrations and control messages; no payload READ or model inference",
         }
-    source_path = Path(__import__(NixlConnector.__module__, fromlist=["__file__"]).__file__)
+    source_path = Path(inspect.getfile(NixlConnector))
     result["source_sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
     with Path(args.output).open("x") as output:
         output.write(json.dumps(result, indent=2) + "\n")

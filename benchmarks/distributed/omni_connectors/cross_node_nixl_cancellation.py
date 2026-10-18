@@ -5,6 +5,7 @@
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import platform
@@ -27,7 +28,7 @@ def main(args):
     else:
         config.update(role="receiver", sender_host=args.host, sender_zmq_port=args.port)
     connector = NixlConnector(config)
-    path = Path(__import__(NixlConnector.__module__, fromlist=["__file__"]).__file__)
+    path = Path(inspect.getfile(NixlConnector))
     report = {
         "role": args.role,
         "connector_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),

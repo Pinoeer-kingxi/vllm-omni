@@ -1501,9 +1501,9 @@ def test_overlapping_gets_keep_shared_remote_agent_until_last_release(
     monkeypatch.setattr(
         consumer._agent,
         "check_xfer_state",
-        lambda handle: "PROC"
-        if defer_second and second_handle and handle is second_handle[0] and not drained.is_set()
-        else "DONE",
+        lambda handle: (
+            "PROC" if defer_second and second_handle and handle is second_handle[0] and not drained.is_set() else "DONE"
+        ),
     )
     for index in range(2):
         assert producer.put("0", "1", f"overlap_0_{index}", torch.arange(4) + index)[0]

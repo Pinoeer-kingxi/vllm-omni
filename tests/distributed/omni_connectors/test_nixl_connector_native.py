@@ -19,7 +19,7 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.data_entry_keys import EmbeddingsStruct, HiddenStatesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.parallel]
+pytestmark = [pytest.mark.core_model, pytest.mark.parallel]
 
 
 def _native_nixl_available(min_devices: int = 2) -> bool:
@@ -257,6 +257,7 @@ def _consumer(
         connector.close()
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
 @pytest.mark.skipif(not _native_nixl_available(), reason="requires NIXL and at least two CUDA devices")
 @pytest.mark.parametrize("payload_kind", ["generic", "h3_ref2va", "h3_fl2va", "h3_t2va"])
 @pytest.mark.parametrize("direct", [False, True])
