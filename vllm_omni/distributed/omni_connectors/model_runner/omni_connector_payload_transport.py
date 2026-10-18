@@ -19,6 +19,7 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
+    _FullPayloadEntry,
     _OmniConnectorRuntimeMixin,
     logger,
     should_accumulate_full_payload_output,
@@ -617,28 +618,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         return result
 
     @staticmethod
-    def _new_full_payload_accumulator(output: dict[str, Any]):
-        chunks: dict[str, list[torch.Tensor]] = {}
-        latest: dict[str, Any] = {}
-        rows: dict[str, int] = {}
-        for k, v in output.items():
-            if _is_full_payload_row_tensor(k, v):
-                chunks[k] = [v]
-                rows[k] = int(v.shape[0])
-            else:
-                latest[k] = v
-        return chunks, latest, rows
-
-    @staticmethod
-    def _materialize_full_payload_entry(entry):
-        if len(entry) == 2:
-            return entry
-        chunks, latest, _rows, request = entry[:4]
-        output = dict(latest)
-        for k, tensors in chunks.items():
+    def _materialize_full_payload_entry(entry: _FullPayloadEntry) -> tuple[dict[str, Any], Any]:
+        output = dict(entry.latest)
+        for k, tensors in entry.chunks.items():
             if tensors:
                 output[k] = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
-        return output, request
+        return output, entry.request
 
     def _resolve_full_payload_replace_keys(self) -> frozenset[str]:
         """Per-model REPLACE-key set for the full-payload accumulator.
@@ -725,19 +710,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             return
         replace_keys = self._resolve_full_payload_replace_keys()
         existing = self._pending_full_payload_send.get(req_id)
-        existing_owner = existing[4] if existing is not None and len(existing) > 4 else None
-        if existing_owner is not owner:
-            existing = None
-
-        if existing is None:
-            chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
-            self._pending_full_payload_send[req_id] = (chunks, latest, rows, request, owner)
-            return
-
-        if len(existing) == 2:
-            chunks, latest, rows = self._new_full_payload_accumulator(existing[0])
+        if existing is None or existing.progress is not owner:
+            chunks: dict[str, list[torch.Tensor]] = {}
+            latest: dict[str, Any] = {}
         else:
-            chunks, latest, rows, _ = existing[:4]
+            chunks, latest = existing.chunks, existing.latest
 
         for k, v in pooler_output.items():
             if v is None:
@@ -749,26 +726,21 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 latest.pop(k, None)
                 if _is_full_payload_row_tensor(k, v):
                     chunks[k] = [v]
-                    rows[k] = int(v.shape[0])
                 else:
                     chunks.pop(k, None)
-                    rows.pop(k, None)
                     latest[k] = v
                 continue
             if _is_full_payload_row_tensor(k, v):
                 if k in chunks and chunks[k] and v.shape[1:] == chunks[k][0].shape[1:]:
                     chunks[k].append(v)
-                    rows[k] += int(v.shape[0])
                 else:
                     latest.pop(k, None)
                     chunks[k] = [v]
-                    rows[k] = int(v.shape[0])
             else:
                 chunks.pop(k, None)
-                rows.pop(k, None)
                 latest[k] = v
 
-        self._pending_full_payload_send[req_id] = (chunks, latest, rows, request, owner)
+        self._pending_full_payload_send[req_id] = _FullPayloadEntry(chunks, latest, request, owner)
 
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
@@ -786,7 +758,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
             if entry is not None:
-                owner = entry[4] if len(entry) > 4 else None
+                owner = entry.progress
                 if owner is not None and owner.retired:
                     continue
                 to_send[req_id] = self._materialize_full_payload_entry(entry)

@@ -10,7 +10,7 @@ import os
 import threading
 from collections import defaultdict, deque
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 from vllm.logger import init_logger
@@ -29,12 +29,20 @@ logger = init_logger("vllm_omni.worker.omni_connector_model_runner_mixin")
 if TYPE_CHECKING:
     from vllm_omni.config.model import OmniModelConfig
     from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
+    from vllm_omni.core.prefix_cache.interface import PrefixCacheRequestProgress
     from vllm_omni.distributed.omni_connectors.connectors.base import (
         OmniConnectorBase,
     )
     from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
         OmniKVTransferManager,
     )
+
+
+class _FullPayloadEntry(NamedTuple):
+    chunks: dict[str, list[torch.Tensor]]
+    latest: dict[str, Any]
+    request: Any
+    progress: PrefixCacheRequestProgress | None
 
 
 def needs_omni_connector(model_config: Any) -> bool:
@@ -142,7 +150,7 @@ class _OmniConnectorRuntimeMixin:
     _local_stage_payload_cache: dict[str, dict[str, Any]]
     _local_request_metadata: dict[str, dict[str, Any]]
     _chunk_stream_completed: set[str]
-    _pending_full_payload_send: dict[str, tuple[Any, ...]]
+    _pending_full_payload_send: dict[str, _FullPayloadEntry]
     _kv_sent_req_ids: list[str]
     _kv_pending_transfers: dict[str, dict[str, Any]]
     _kv_active_transfers: set[str]
@@ -302,7 +310,7 @@ class _OmniConnectorRuntimeMixin:
 
         # -- full_payload_mode: accumulate latest pooler_output per request,
         #    send only when the request finishes (next-cycle flush) --
-        self._pending_full_payload_send: dict[str, tuple[Any, ...]] = {}
+        self._pending_full_payload_send: dict[str, _FullPayloadEntry] = {}
 
         # -- KV sent accumulator --
         self._kv_sent_req_ids: list[str] = []

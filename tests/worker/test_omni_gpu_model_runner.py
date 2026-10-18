@@ -813,7 +813,8 @@ def test_accumulate_full_payload_output_keeps_misaligned_all_zero_qwen3_omni_cod
 def test_accumulate_full_payload_output_preserves_incremental_aligned_all_zero_qwen3_omni_codec_rows():
     runner = _make_full_payload_accumulation_runner()
     request = SimpleNamespace(output_token_ids=[0, 1])
-    runner._pending_full_payload_send["r1"] = (
+    runner.accumulate_full_payload_output(
+        "r1",
         {"codes.audio": torch.ones((1, 3), dtype=torch.long)},
         request,
     )
