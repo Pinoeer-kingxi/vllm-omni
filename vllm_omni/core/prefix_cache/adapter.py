@@ -43,8 +43,7 @@ class PrefixCacheRequestOwner:
 class PrefixCacheRequestEvent:
     req_id: str
     kind: PrefixCacheEventKind
-    # Current supported hits are prefixes [0, hit_end). Arbitrary ranges
-    # and resume delivery watermarks belong to the follow-up items.
+    # KV hits are prefixes [0, hit_end); delivery watermarks belong to the manager.
     hit_end: int = 0
     block_ids: tuple[tuple[int, ...], ...] = ()
     scheduled_tokens: int = 0

@@ -205,7 +205,9 @@ receiving scheduler's owner, not by an owner supplied in a remote payload.
 ### Qwen3-Omni Talker identity scope
 
 Talker input identity uses the same row plan as embedding assembly, including
-the nine bootstrap rows. A validated conditioning digest includes current
+the nine bootstrap rows. The source plan stops the final assistant span before
+`<tool_call>`, so tool arguments never become bootstrap or decode text.
+A validated conditioning digest includes current
 Thinker conditioning, speaker and processed-media provenance, and is combined
 with the original opaque caller salt before block hashes are rebuilt.
 Complete prompt-only blocks may be shared; blocks containing generated tokens

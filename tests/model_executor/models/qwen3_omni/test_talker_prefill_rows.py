@@ -416,14 +416,21 @@ def _fixed_payload(model, text_count=3, *, assistant_only=False, value_offset=0)
 @pytest.mark.parametrize("fixed_plan", [False, True])
 @pytest.mark.parametrize("preface_tokens", [0, 2])
 def test_prefill_excludes_tool_call_from_bootstrap_and_decode_tail(fixed_plan, preface_tokens):
+    from vllm.sampling_params import SamplingParams
+
     from vllm_omni.model_executor.models.qwen3_omni.tool_speech import TOOL_CALL_START_TOKEN_ID
     from vllm_omni.model_executor.stage_input_processors.qwen3_omni import thinker2talker_full_payload
+    from vllm_omni.request import OmniRequest
 
     model = _model()
     model.config.talker_config.accept_hidden_layer = 6
     prompt, sequence, embeddings, hidden, *_ = _case(4, assistant_only=True)
     tool_offset = len(prompt) + preface_tokens
     sequence[tool_offset] = TOOL_CALL_START_TOKEN_ID
+    request = OmniRequest(
+        request_id="tool", prompt_token_ids=prompt, sampling_params=SamplingParams(max_tokens=4), pooling_params=None
+    )
+    request.append_output_token_ids(sequence[len(prompt) :])
     payload = thinker2talker_full_payload(
         SimpleNamespace(_get_model_config=lambda: SimpleNamespace(hf_config=model.config)),
         {
@@ -433,7 +440,7 @@ def test_prefill_excludes_tool_call_from_bootstrap_and_decode_tail(fixed_plan, p
             "embed.tts_bos": torch.full((1, 1, WIDTH), 60, dtype=torch.bfloat16),
             "embed.tts_eos": torch.full((1, 1, WIDTH), 70, dtype=torch.bfloat16),
         },
-        SimpleNamespace(request_id="tool", prompt_token_ids=prompt, all_token_ids=sequence),
+        request,
     )
     assert payload is not None
     assert payload["meta"]["talker_prefill_plan"] == [("assistant", 0, tool_offset)]
