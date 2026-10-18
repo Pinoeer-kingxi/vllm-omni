@@ -74,6 +74,7 @@ from vllm_omni.model_executor.models.qwen3_omni.talker_input_plan import (
     read_talker_prefill_plan,
     talker_prefill_token_ids,
 )
+from vllm_omni.model_executor.models.qwen3_omni.tool_speech import spoken_span_end
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
 from vllm_omni.platforms import current_omni_platform
@@ -1312,8 +1313,8 @@ class Qwen3OmniMoeForConditionalGeneration(
                     im_start_index + first, im_start_index + last, multimodal_mask, thinker_hidden, thinker_embed
                 )
                 talker_input_embeds.append(talker_user_part)
-            # Take assistant output (for now)
             else:
+                segment_end_index = spoken_span_end(result_ids.reshape(-1).tolist(), im_start_index, segment_end_index)
                 talker_assistant_embeds, trailing_text_hidden = self._get_talker_assistant_parts(
                     im_start_index,
                     segment_end_index,
