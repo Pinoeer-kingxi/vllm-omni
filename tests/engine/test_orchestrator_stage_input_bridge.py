@@ -46,7 +46,7 @@ class FakeStageClient:
         self.next_inputs = list(next_inputs or [])
         self.add_request_calls: list[tuple[Any, ...]] = []
         self.decoded_source_tokens: str | None = None
-        self._engine_core_outputs = queue.Queue()
+        self._engine_core_outputs: queue.Queue[Any] = queue.Queue()
 
     async def add_request_async(self, *args, **_kwargs) -> None:
         self.add_request_calls.append(args)
@@ -99,7 +99,7 @@ class FakeInputProcessor:
 
 
 class FakePrewarmPool:
-    """Single-replica pool double that binds requests only on submission."""
+    """Single-replica pool double that binds on selection or submission."""
 
     stage_type = "llm"
 
@@ -116,6 +116,10 @@ class FakePrewarmPool:
 
     async def submit_initial(self, request_id, _req_state, request, prompt_text=None):
         self.submitted.append(request)
+        self._bound_request_ids.add(request_id)
+        return 0
+
+    async def pick(self, request_id, *, request_state=None):
         self._bound_request_ids.add(request_id)
         return 0
 
@@ -224,6 +228,8 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
         final_stage_id=2,
     )
 
+    orchestrator.request_states = {req_state.request_id: req_state}
+
     prewarmed = await orchestrator._prewarm_async_chunk_stages(
         "req-prewarm",
         SimpleNamespace(prompt_token_ids=[1, 2], resumable=True),
@@ -232,7 +238,7 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
 
     assert prewarmed is True
     assert stage1.submitted == []
-    assert stage1.get_bound_client("req-prewarm") is None
+    assert stage1.get_bound_client("req-prewarm") is stage1.stage_client
     assert len(stage2.submitted) == 1
     assert stage2.get_bound_client("req-prewarm") is stage2.stage_client
     assert stage2.submitted[0].payload_sender_info == payload_sender_info
@@ -271,6 +277,8 @@ async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> Non
         sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
         final_stage_id=2,
     )
+
+    orchestrator.request_states = {req_state.request_id: req_state}
 
     prewarmed = await orchestrator._prewarm_async_chunk_stages(
         "req-prewarm-custom",
@@ -340,7 +348,7 @@ async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
 
     await orchestrator._route_output(0, 0, output, req_state, None)
 
-    assert req_state.finished_final_output_stage_ids == set()
+    assert req_state.finished_stage_ids == set()
     orchestrator._cleanup_request_ids.assert_not_awaited()
     routed = orchestrator.output_async_queue.get_nowait()
     assert routed.finished is False

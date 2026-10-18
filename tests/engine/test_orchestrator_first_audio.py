@@ -57,6 +57,10 @@ class _CodecPool:
     def get_bound_replica_id(self, request_id):
         return self.bound_replica
 
+    async def pick(self, request_id, *, request_state=None):
+        self.bound_replica = self.replica_id
+        return self.replica_id
+
     async def process_llm_raw_outputs(self, replica_id, raw, **kwargs):
         assert replica_id == self.replica_id
         return self.output_processor.process_outputs(raw.outputs, raw.timestamp).request_outputs
@@ -72,6 +76,7 @@ def _orchestrator(output_kind=RequestOutputKind.DELTA, *, registered=True, repli
     obj._running_counter = None
     obj._abort_request_ids = AsyncMock(return_value=[])
     obj._release_request_bindings = Mock()
+    obj._release_stage_transfer_resources = AsyncMock()
     obj._finish_raw_terminal_requests = AsyncMock()
 
     async def process(stage, replica, raw, terminals):
@@ -238,6 +243,9 @@ async def test_first_audio_waits_for_codec_registration_and_ignores_duplicates()
 @pytest.mark.parametrize("processing_failed", [False, True])
 async def test_prewarm_flushes_first_audio_after_successful_submission(mocker, processing_failed):
     obj = _orchestrator(registered=False, final_stage_id=2 if processing_failed else 1)
+    if processing_failed:
+        later_pool = SimpleNamespace(submit_initial=AsyncMock())
+        obj.stage_pools.append(later_pool)
     req_state = obj.request_states["r"]
     req_state.sampling_params_list = [None] * (req_state.final_stage_id + 1)
     await obj._route_upstream_first_audio(0, 0, _raw(first=True, samples=(10, 11)))
@@ -260,8 +268,6 @@ async def test_prewarm_flushes_first_audio_after_successful_submission(mocker, p
     pool.submit_initial = submit
     if processing_failed:
         pool.process_llm_raw_outputs = AsyncMock(side_effect=RuntimeError("processing failed"))
-        later_pool = SimpleNamespace(submit_initial=AsyncMock())
-        obj.stage_pools.append(later_pool)
     submitted = await obj._prewarm_async_chunk_stages("r", SimpleNamespace(prompt_token_ids=[0]), req_state)
     assert submitted is not processing_failed
     messages = _messages(obj)
@@ -314,6 +320,7 @@ async def test_later_aligner_receives_full_codec_waveform():
     from vllm_omni.model_executor.stage_input_processors.forced_aligner import code2wav2aligner
 
     obj = _orchestrator(RequestOutputKind.CUMULATIVE, final_stage_id=2)
+    obj.stage_pools.append(SimpleNamespace(final_output=True))
     await obj._route_upstream_first_audio(0, 0, _raw(first=True, samples=(10, 11)))
     await _codec_output(obj, _raw(required=True, terminal=True, samples=(20, 21)))
     messages = _messages(obj)

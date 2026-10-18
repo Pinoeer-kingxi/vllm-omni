@@ -137,6 +137,20 @@ physical EngineCore abort succeeds.
 Changes that cross into stage runtime or public error behavior require review
 from that contract's owners.
 
+### Request cleanup
+
+Cleanup closes request admission before stopping stages and releasing transport
+resources. Queued release markers follow pending publications. Backends exposing
+`wait_for_cleanup` confirm their ownership drain; other backends retain their
+existing physical-release contract. V1 async chunks use the scheduler adapter,
+while native MRv2 payloads use the worker data plane.
+
+Terminal success and abort acknowledgement wait for cleanup. A failed release
+reports a request-scoped error and retains the closed state and public request-ID
+mapping for retry. Concurrent callers join the same cleanup operation; cancelling
+a joining caller does not cancel its owner. CFG ownership remains registered
+until the parent and companions finish cleanup.
+
 ## Promotion gate
 
 - Reconcile current names and boundaries after #5441 merges, closes, or is

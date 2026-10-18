@@ -5,6 +5,7 @@ import asyncio
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from vllm import SamplingParams
@@ -366,6 +367,7 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
     )
 
     output = SimpleNamespace(request_id="req-1", finished=True)
+    sender_pool.select_replica_id("req-1")
     asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-1", sender_pool.stage_id, output, req_state))
 
     assert diffusion_stage.calls[0]["request_id"] == "req-1"
@@ -392,6 +394,7 @@ def test_diffusion_resubmission_preserves_sender_endpoints():
         final_stage_id=1,
     )
     output = SimpleNamespace(request_id="streaming", finished=True)
+    sender_pool.select_replica_id("streaming")
 
     async def forward_twice():
         await orchestrator._forward_to_next_stage("streaming", 0, output, state)
@@ -425,6 +428,8 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
     )
 
     output = SimpleNamespace(request_id="req-3", finished=True)
+    source_pool.select_replica_id("req-3")
+    previous_pool.select_replica_id("req-3")
     asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-3", previous_pool.stage_id, output, req_state))
 
     assert diffusion_stage.calls[0]["kv_sender_info"] == {
@@ -494,6 +499,8 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
     )
 
     stage0_request = SimpleNamespace(prompt_token_ids=[1, 2, 3])
+    orchestrator.request_states = {req_state.request_id: req_state}
+    sender_pool.select_replica_id(req_state.request_id)
     asyncio.run(Orchestrator._prewarm_async_chunk_stages(orchestrator, "req-2", stage0_request, req_state))
 
     assert diffusion_stage.calls[0]["request_id"] == "req-2"
@@ -522,6 +529,7 @@ def test_prewarm_submits_bound_payload_endpoint_for_concurrent_replicas():
         stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(hf_config=None, max_model_len=64)),
         submit_initial=submit,
         get_bound_replica_id=lambda key: {"a": 7, "b": 1}[key],
+        pick=AsyncMock(side_effect=lambda key, **kwargs: {"a": 7, "b": 1}[key]),
     )
     orchestrator.stage_pools = [source, target]
     orchestrator._stage_receives_async_chunks = lambda stage: True
@@ -535,17 +543,21 @@ def test_prewarm_submits_bound_payload_endpoint_for_concurrent_replicas():
     orchestrator._dispatch_or_fail_request = dispatch
 
     async def run():
+        orchestrator.request_states = {
+            key: OrchestratorRequestState(
+                request_id=key,
+                prompt={},
+                sampling_params_list=[SamplingParams(), SamplingParams()],
+                final_stage_id=1,
+            )
+            for key in endpoints
+        }
         await asyncio.gather(
             *[
                 orchestrator._prewarm_async_chunk_stages(
                     key,
                     SimpleNamespace(prompt_token_ids=[1]),
-                    OrchestratorRequestState(
-                        request_id=key,
-                        prompt={},
-                        sampling_params_list=[SamplingParams(), SamplingParams()],
-                        final_stage_id=1,
-                    ),
+                    orchestrator.request_states[key],
                 )
                 for key in endpoints
             ]
@@ -595,6 +607,10 @@ async def test_async_pipeline_defers_sync_stage_until_audio_finishes(mocker):
         final_output_stage_ids={0, 1},
     )
 
+    orchestrator.request_states = {state.request_id: state}
+    orchestrator._cleanup_request_ids.side_effect = lambda ids: [
+        orchestrator.request_states.pop(request_id, None) for request_id in ids
+    ]
     await orchestrator._prewarm_async_chunk_stages(
         "aligned", mocker.Mock(spec=OmniEngineCoreRequest, prompt_token_ids=[1, 2]), state
     )
