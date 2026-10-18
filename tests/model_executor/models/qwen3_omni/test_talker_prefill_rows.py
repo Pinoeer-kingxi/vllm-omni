@@ -861,7 +861,7 @@ def test_admission_counts_and_embedding_segments_share_the_same_layout():
     ]
     assert sum(part.num_rows for part in parts) == 21
     assert compute_talker_prompt_ids_length(prompt) == 21
-    assert _compute_talker_prompt_ids_length({"ids": {"prompt": prompt, "all": sequence}}, device="cpu") == 21
+    assert _compute_talker_prompt_ids_length({"ids": {"prompt": prompt, "all": sequence}}) == 21
 
 
 @pytest.mark.parametrize(
