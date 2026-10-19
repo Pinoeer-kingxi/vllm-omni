@@ -9,6 +9,7 @@ import asyncio
 import time as _time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
@@ -30,6 +31,7 @@ from vllm_omni.engine.stage_client import (
     StagePoolDiffusionClient,
     StagePoolLLMClient,
 )
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
 from vllm_omni.metrics import (
     count_audio_frames,
@@ -55,8 +57,7 @@ class StageUnavailableError(RuntimeError):
 
     Deliberately a ``RuntimeError`` subclass (not ``EngineDeadError``): no
     engine died at the raise site — the stage's replica set is empty or the
-    chosen slot was evicted, or prior transport cleanup fences the request ID.
-    These are routing/capacity conditions and, in
+    chosen slot was evicted, which is a routing/capacity condition and, in
     distributed mode, recoverable. Dispatch guards catch exactly this type so
     unrelated ``RuntimeError``s keep failing fast, and existing
     ``EngineDeadError`` handlers (teardown-on-dead, poll-path eviction) are
@@ -1068,8 +1069,9 @@ class StagePool:
         if req_state.closing:
             raise RequestClosedError(request_id)
         if any(request_id in pending for pending in self._pending_releases.values()):
-            raise StageUnavailableError(
-                f"stage {self.stage_id} prior transport release for {request_id} is pending or its outcome is unknown"
+            raise OmniClientError(
+                f"stage {self.stage_id} prior transport release for {request_id} is pending or its outcome is unknown",
+                status_code=HTTPStatus.CONFLICT.value,
             )
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         # Direct engine callers may provide plain vLLM SamplingParams.

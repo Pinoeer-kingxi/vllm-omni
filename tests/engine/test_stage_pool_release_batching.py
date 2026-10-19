@@ -8,7 +8,8 @@ from vllm import SamplingParams
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.orchestrator import OrchestratorRequestState
-from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.errors import OmniClientError
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -28,7 +29,7 @@ class _Replica:
         self.admitted: list[str] = []
 
     async def add_request_async(self, request, **kwargs):
-        self.admitted.append(request.request_id)
+        self.admitted.append(request.external_req_id)
 
     async def call_utility_async(self, method, request_ids):
         assert method == "omni_release_request_resources"
@@ -52,7 +53,7 @@ async def _settle(pool: StagePool) -> None:
 async def _submit(pool: StagePool, request_id: str, replica_id: int = 0) -> int:
     params = SamplingParams(max_tokens=2, detokenize=False)
     request = OmniEngineCoreRequest(
-        request_id=request_id,
+        request_id=f"{request_id}-internal",
         prompt_token_ids=[1, 2],
         mm_features=None,
         sampling_params=params,
@@ -77,8 +78,9 @@ async def test_reused_id_requires_queued_release_on_every_replica(make_pool, dif
     await asyncio.wait_for(old.started.wait(), timeout=2)
     pool.schedule_release_request_resources(["reused"])
     try:
-        with pytest.raises(StageUnavailableError, match="release.*pending"):
+        with pytest.raises(OmniClientError, match="release.*pending") as exc:
             await _submit(pool, "reused", replica_id=int(different_replica))
+        assert exc.value.status_code == 409
         assert not old.admitted and not other.admitted
         assert not pool.output_processor.request_states
     finally:
@@ -100,8 +102,9 @@ async def test_unknown_release_blocks_only_its_id_without_retry(make_pool, monke
     await _settle(pool)
     replica.fail = False
     replica.gate.set()
-    with pytest.raises(StageUnavailableError, match="release.*unknown"):
+    with pytest.raises(OmniClientError, match="release.*unknown") as exc:
         await _submit(pool, "reused")
+    assert exc.value.status_code == 409
     assert not pool.output_processor.request_states
     assert await _submit(pool, "healthy") == 0
     pool.schedule_release_request_resources(["reused", "healthy"])
@@ -118,8 +121,9 @@ async def test_reused_id_requires_inflight_release(make_pool):
     pool.schedule_release_request_resources(["reused"])
     await asyncio.wait_for(replica.started.wait(), timeout=2)
     try:
-        with pytest.raises(StageUnavailableError, match="release.*pending"):
+        with pytest.raises(OmniClientError, match="release.*pending") as exc:
             await _submit(pool, "reused")
+        assert exc.value.status_code == 409
         assert not pool.output_processor.request_states
     finally:
         replica.gate.set()
