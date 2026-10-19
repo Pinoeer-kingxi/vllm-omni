@@ -18,12 +18,16 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
-from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
+from tests.helpers.fixtures import ipc
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheEventKind, PrefixCacheSchedulerAdapter
 from vllm_omni.core.prefix_cache.group_view import FullAttentionGroupView
 from vllm_omni.core.prefix_cache.interface import HIDDEN_KEY, PrefixCacheConfig
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+executor_roundtrip = ipc.executor_roundtrip
 
 BLOCK_SIZE = 4
 NUM_BLOCKS = 16
@@ -31,7 +35,7 @@ STEP_BUDGET = 8
 PROMPT = list(range(10, 30))
 
 
-def _scheduler(model_path: str) -> Scheduler:
+def _scheduler(model_path: str, scheduler_cls: type[Scheduler] = Scheduler) -> Scheduler:
     model = ModelConfig(model=model_path, dtype="float16", max_model_len=64, skip_tokenizer_init=True)
     scheduler = SchedulerConfig(
         max_num_seqs=4,
@@ -62,7 +66,7 @@ def _scheduler(model_path: str) -> Scheduler:
     )
     cache.num_gpu_blocks = NUM_BLOCKS
     register_all_kvcache_specs(config)
-    instance = Scheduler(
+    instance = scheduler_cls(
         vllm_config=config,
         kv_cache_config=kv_config,
         block_size=BLOCK_SIZE,
@@ -73,8 +77,8 @@ def _scheduler(model_path: str) -> Scheduler:
     return instance
 
 
-def _request(req_id: str) -> Request:
-    sampling = SamplingParams(ignore_eos=True, max_tokens=8)
+def _request(req_id: str, *, max_tokens: int = 8) -> Request:
+    sampling = SamplingParams(ignore_eos=True, max_tokens=max_tokens)
     sampling.update_from_generation_config({}, 2)
     return Request(
         request_id=req_id,
@@ -154,7 +158,7 @@ class _CPUCacheRun:
 
 
 @pytest.fixture
-def cpu_run(tmp_path, monkeypatch):
+def cpu_run(tmp_path, monkeypatch, request):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     model_path = tmp_path / "model"
     GPT2Config(
@@ -168,13 +172,78 @@ def cpu_run(tmp_path, monkeypatch):
         architectures=["GPT2LMHeadModel"],
     ).save_pretrained(model_path)
     init_none_hash(sha256)
-    run = _CPUCacheRun(_scheduler(str(model_path)))
+    run = _CPUCacheRun(_scheduler(str(model_path), getattr(request, "param", Scheduler)))
     yield run
     run.close()
 
 
 def _positions(delivered, req_id):
     return [int(row) for row in delivered[req_id][:, 0].tolist()]
+
+
+@pytest.mark.parametrize("cpu_run", [OmniARScheduler, OmniGenerationScheduler], indirect=True)
+@pytest.mark.parametrize("running", [False, True], ids=["waiting", "running"])
+@pytest.mark.parametrize(
+    "status, expected",
+    [
+        (RequestStatus.FINISHED_ABORTED, PrefixCacheEventKind.ABORTED),
+        (RequestStatus.FINISHED_ERROR, PrefixCacheEventKind.ABORTED),
+        (RequestStatus.FINISHED_IGNORED, PrefixCacheEventKind.ABORTED),
+        (RequestStatus.FINISHED_STOPPED, PrefixCacheEventKind.FINISHED),
+        (RequestStatus.FINISHED_LENGTH_CAPPED, PrefixCacheEventKind.FINISHED),
+    ],
+)
+def test_scheduler_terminal_classification_reaches_adapter(cpu_run, running, status, expected, executor_roundtrip):
+    scheduler = cpu_run.scheduler
+    adapter = PrefixCacheSchedulerAdapter()
+    victim, healthy = _request("victim"), _request("healthy")
+    scheduler.add_request(victim)
+    if running:
+        initial = scheduler.schedule()
+        assert initial.num_scheduled_tokens["victim"] > 0
+        adapter.translate_step(initial)
+    assert scheduler.finish_requests(victim.request_id, status) == [victim]
+    scheduler.add_request(healthy)
+    output = scheduler.schedule()
+    output = executor_roundtrip(output)
+    step = adapter.translate_step(output)
+    terminal = [event for event in step.events if event.req_id == victim.request_id]
+    assert len(terminal) == 1
+    assert terminal[0].kind is expected
+    assert terminal[0].owner == victim._omni_prefix_cache_owner
+    assert output.num_scheduled_tokens["healthy"] > 0
+    assert victim.request_id not in scheduler.requests
+    assert not any(event.req_id == victim.request_id for event in adapter.translate_step(scheduler.schedule()).events)
+
+
+@pytest.mark.parametrize("cpu_run", [OmniARScheduler], indirect=True)
+def test_normal_model_output_completion_is_not_discarded(cpu_run, executor_roundtrip):
+    scheduler = cpu_run.scheduler
+    adapter = PrefixCacheSchedulerAdapter()
+    request = _request("normal", max_tokens=1)
+    scheduler.add_request(request)
+    for _ in range(4):
+        output = scheduler.schedule()
+        adapter.translate_step(output)
+        sampled = [42] if request.num_computed_tokens >= request.num_prompt_tokens else []
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[sampled],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        if request.is_finished():
+            break
+    assert request.status is RequestStatus.FINISHED_LENGTH_CAPPED
+    terminal = executor_roundtrip(scheduler.schedule())
+    assert terminal.finished_req_ids == {request.request_id}
+    assert not terminal.discarded_req_ids
+    assert adapter.translate_step(terminal).events[0].kind is PrefixCacheEventKind.FINISHED
 
 
 def _preempt(run, request):
