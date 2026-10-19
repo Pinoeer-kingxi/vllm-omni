@@ -107,8 +107,8 @@ class OmniChunkRecvHandle:
     """Minimal identifier carried from scheduler to runner for input-receive
     registration.
 
-    Carries routing fields and the receiving scheduler's immutable content
-    owner, not the full Request. Concrete typing keeps msgspec serialization
+    Carries request identifiers, the bound producer endpoint and the receiving
+    scheduler's immutable content owner, not the full Request. Concrete typing keeps msgspec serialization
     deterministic across IPC (default, PD-disagg, multi-node executor variants)
     and avoids the ``list[Any]`` fallback path. The owner is echoed in receive
     notifications; it is not supplied by the remote producer's payload.
