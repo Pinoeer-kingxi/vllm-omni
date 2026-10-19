@@ -375,7 +375,7 @@ class _OmniConnectorRuntimeMixin:
             except Exception:
                 pass
 
-    def cleanup_finished_request(self, req_id: str) -> None:
+    def cleanup_finished_request(self, req_id: str, *, discard_payload: bool = False) -> None:
         """Clean up per-request state after a request is fully finished.
 
         Call this when a request is freed from the model runner to prevent
@@ -399,6 +399,8 @@ class _OmniConnectorRuntimeMixin:
         # flush is idempotent when the entry has already been flushed by the
         # scheduler-driven path, but this cleanup path runs for every request,
         # so skip it entirely when the request never accumulated a payload.
+        if discard_payload:
+            self._pending_full_payload_send.pop(req_id, None)
         if req_id in self._pending_full_payload_send:
             try:
                 self.flush_full_payload_outputs({req_id})

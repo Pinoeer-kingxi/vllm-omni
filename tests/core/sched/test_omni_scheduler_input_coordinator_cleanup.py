@@ -26,6 +26,7 @@ class FakeInputCoordinator:
 
 class DummyRequest:
     request_id = "req-free"
+    status = RequestStatus.FINISHED_STOPPED
     client_index = 0
     additional_information = None
 
@@ -81,6 +82,7 @@ def test_ar_free_request_cleans_input_coordinator_on_normal_free() -> None:
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler._prefix_cache_next_admission = 0
     scheduler._prefix_cache_pending_terminal_owners = {}
+    scheduler._discarded_req_ids = set()
     scheduler.input_coordinator = coordinator
     scheduler.chunk_transfer_adapter = None
     scheduler._omits_kv_transfer_cache = {"req-free": (1, True, False)}
