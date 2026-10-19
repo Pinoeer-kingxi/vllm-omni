@@ -48,6 +48,7 @@ def test_runner_admission_keeps_provenance_out_of_client_payloads(monkeypatch, m
     )
     scheduled = OmniNewRequestData.from_request(request, ([1],))
     runner = object.__new__(OmniGPUModelRunner)
+    runner.model = torch.nn.Module()
     old_state = SimpleNamespace(processed_media_provenance="old", talker_codec_inputs=[torch.tensor([9, 9, 9])])
     runner.requests = {"r": old_state} if replace_existing else {}
     runner.model_intermediate_buffer = {}
