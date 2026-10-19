@@ -11,6 +11,7 @@ from vllm.sampling_params import SamplingParams
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
 from vllm_omni.worker.talker_history import (
     bind_talker_history,
+    build_request_end_talker_codes,
     collect_pending_talker_primary,
     install_pending_talker_primary,
     preprocess_talker_history,
@@ -45,6 +46,51 @@ def _state(owner, *, output_tokens=None, max_tokens=8):
 
 def _payload():
     return {"hidden_states": {"last": torch.full((4,), 3, dtype=torch.bfloat16)}, "meta": {}}
+
+
+@pytest.mark.parametrize(
+    ("accepted", "history", "expected_generated"),
+    [
+        ([7, 8, 9], [[1, 2, 3], [4, 5, 6]], [[1, 2, 3], [4, 5, 6]]),
+        ([7, 8, 9], [[1, 2, 3], [4, 5, 6], [7, 8, 9]], [[1, 2, 3], [4, 5, 6]]),
+        ([], [], []),
+    ],
+    ids=["terminal-n-minus-one", "abort-after-recompute-n", "zero-accepted"],
+)
+def test_request_end_snapshot_uses_terminal_frontier_without_aliasing(mocker, accepted, history, expected_generated):
+    owner = PrefixCacheRequestOwner(88)
+    state = _state(owner, output_tokens=accepted)
+    state.talker_codec_inputs = [torch.tensor(row, dtype=torch.long) for row in history]
+    snapshot = build_request_end_talker_codes(_model(mocker), state, owner=owner)
+
+    assert snapshot.shape == (len(state.prompt_token_ids) + len(expected_generated), 3)
+    assert snapshot.dtype == torch.long
+    assert torch.count_nonzero(snapshot[: len(state.prompt_token_ids)]) == 0
+    if expected_generated:
+        torch.testing.assert_close(
+            snapshot[len(state.prompt_token_ids) :],
+            torch.tensor(expected_generated, dtype=torch.long),
+            rtol=0,
+            atol=0,
+        )
+    if history and expected_generated:
+        snapshot[-1].fill_(99)
+        assert state.talker_codec_inputs[len(expected_generated) - 1].tolist() == expected_generated[-1]
+
+
+@pytest.mark.parametrize(
+    ("accepted", "history", "owner", "message"),
+    [
+        ([7, 8], [], PrefixCacheRequestOwner(88), "missing"),
+        ([7], [[1, 2, 3], [4, 5, 6]], PrefixCacheRequestOwner(88), "ahead"),
+        ([7], [[1, 2, 3]], PrefixCacheRequestOwner(89), "owner"),
+    ],
+)
+def test_request_end_snapshot_fails_closed_on_invalid_frontier(mocker, accepted, history, owner, message):
+    state = _state(PrefixCacheRequestOwner(88), output_tokens=accepted)
+    state.talker_codec_inputs = [torch.tensor(row, dtype=torch.long) for row in history]
+    with pytest.raises(ValueError, match=message):
+        build_request_end_talker_codes(_model(mocker), state, owner=owner)
 
 
 def test_pending_primary_materializes_before_first_recompute_chunk(monkeypatch, mocker):
