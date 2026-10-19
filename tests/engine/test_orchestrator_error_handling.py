@@ -598,7 +598,7 @@ async def test_pending_release_rejects_reuse_without_failing_the_stage(mocker):
             started.set()
             await gate.wait()
 
-    stage = GatedReleaseStage()
+    stage = GatedReleaseStage(final_output=True)
     config = mocker.Mock(model_config=mocker.Mock(async_chunk=True, max_model_len=64))
     pools = _build_stage_pools([[stage]], stage_vllm_configs=[config])
     orchestrator, queues = _build_bare_orchestrator(pools)
