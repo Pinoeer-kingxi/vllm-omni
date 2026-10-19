@@ -18,8 +18,10 @@ import pytest
 import torch
 from vllm import SamplingParams
 from vllm.v1.request import Request
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_native_mrv2_data_plane,
@@ -116,6 +118,7 @@ def test_chunk_registration_ready_and_terminal_lifecycle():
     req = _make_request("internal", status=RequestStatus.WAITING)
     req.external_req_id = "external"
     req.payload_sender_info = {"host": "10.0.0.1", "zmq_port": 51424}
+    req._omni_prefix_cache_owner = PrefixCacheRequestOwner(1, 2)
     waiting = MockQueue([req])
     coord.process_pending_chunks(waiting, [], set(), set())
     assert req.status == RequestStatus.WAITING_FOR_CHUNK
@@ -123,6 +126,9 @@ def test_chunk_registration_ready_and_terminal_lifecycle():
     assert isinstance(handle, OmniChunkRecvHandle)
     assert (handle.request_id, handle.external_req_id) == ("internal", "external")
     assert handle.payload_sender_info == req.payload_sender_info
+    restored = MsgpackDecoder(OmniChunkRecvHandle).decode(MsgpackEncoder().encode(handle))
+    assert restored.payload_sender_info == req.payload_sender_info
+    assert restored.input_owner == req._omni_prefix_cache_owner
     coord.restore_queues(waiting, [])
     coord.process_pending_chunks(waiting, [], {"internal"}, set())
     assert req.status == RequestStatus.WAITING
