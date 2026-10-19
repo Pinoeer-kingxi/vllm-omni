@@ -31,6 +31,11 @@ dimensions proportionally when preserving the aspect ratio.
 Both input and output geometry must fit the server's admission limits;
 requesting a smaller output does not bypass the input limit.
 
+![Standalone Load Video, remote SeedVR2 and Save Video workflow](images/seedvr2-standalone-workflow.png)
+
+The native ComfyUI screenshot displays the saved output from the recorded
+vLLM 0.31.0 GPU run.
+
 The node submits one asynchronous whole-clip job through `/v1/videos`, polls its
 status and downloads the completed MP4. `timeout_seconds` bounds an HTTP request
 and the polling/download phase (default 1,800 seconds). ComfyUI **Stop** interrupts
@@ -111,6 +116,11 @@ The template saves both videos under `video/H3-source` and
 `video/H3-SeedVR2-restored` for comparison. The existing local
 [WF-07](wf07-h3-upscale.md) remains available.
 
+![Remote H3 and SeedVR2 services with source and restored video previews](images/seedvr2-h3-remote-workflow.png)
+
+The previews display the model-generated source and restored clips from the
+recorded vLLM 0.30.0 run.
+
 This template uses base H3, 50 steps, 24 FPS, 4.458 seconds and an explicit
 448×256 canvas; H3 resolves duration onto its own frame lattice. SeedVR2 requests
 896×512 output. A generated H3 clip exceeds the default single-GPU SeedVR2
@@ -160,6 +170,16 @@ Stop reported interruption in **0.14 seconds**, deleted the remote job (DELETE
 six frames, exact **30000/1001 FPS** and **48 kHz mono AAC**, passed full FFmpeg
 decode and Chromium playback, and had identical decoded RGB frames. The full
 ComfyUI CPU suite at that commit passed all **108 tests**.
+
+A temporary integration merge of this PR (`cff22b63`) with main `8f546e01`
+was also checked on vLLM 0.31.0. All **120 ComfyUI CPU tests** and applicable
+pre-commit hooks passed. Both templates loaded and serialized in the native
+browser UI, including the model dropdown. On one RTX A6000, the audio sample
+completed Load Video → Restore → Save before and after Stop; outputs retained
+six frames, exact **30000/1001 FPS** and **48 kHz mono AAC**, with full FFmpeg
+decode and browser playback passing. Stop reported interruption in **0.097 seconds**,
+deleted the remote job and skipped Save Video. The full H3 chain was not rerun
+for this integration check.
 
 SeedVR2 uses `seedvr2_ema_3b_fp16.safetensors`, `ema_vae_fp16.safetensors` and
 `pos_emb.pt`; hashes and layout are maintained in the
