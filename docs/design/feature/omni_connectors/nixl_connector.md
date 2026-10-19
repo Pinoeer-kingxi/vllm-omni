@@ -199,7 +199,8 @@ request's unconsumed prefixes outside that lock. Late output batches cannot
 publish after request state is removed. The release is also enabled for native
 full-payload stages; the V1 release path is unchanged.
 
-Stage admission rejects reuse of a stage request ID while its previous release
+Stage admission rejects reuse of a stage request ID with a request-scoped 409
+error while its previous release
 is queued, in flight or unconfirmed on any replica. A successful release permits
 reuse. RPC failures and timeouts leave that ID fenced until the stage pool is
 restarted: their outcome is unknown, so they are not automatically retried against
