@@ -643,6 +643,7 @@ class NixlConnector(OmniConnectorBase):
             # socket in the context is closed.
             self._safe_call(self._zmq_ctx.destroy, 0)
             self._zmq_ctx = None
+        self._agent = None
 
     def health(self) -> dict[str, Any]:
         return {

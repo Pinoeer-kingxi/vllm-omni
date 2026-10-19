@@ -451,6 +451,31 @@ def test_native_ready_event_does_not_wait_for_unrelated_stream():
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
 @pytest.mark.skipif(not _native_nixl_available(1), reason="requires NIXL and CUDA")
+def test_native_close_releases_agents_before_connector_gc():
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
+
+    current_omni_platform.set_device(0)
+    producer = NixlConnector({"role": "sender", "host": "127.0.0.1"})
+    receiver = NixlConnector({"role": "receiver", "receive_device": "cuda:0"})
+    agents = (weakref.ref(producer._agent), weakref.ref(receiver._agent))
+    try:
+        expected = torch.arange(32, device="cuda:0")
+        assert producer.put("0", "2", "close-owner_0_0", expected)[0]
+        received = _get_payload(receiver, "close-owner_0_0", producer._published["close-owner_0_0"])
+        assert received is not None
+        torch.testing.assert_close(received[0], expected, rtol=0, atol=0)
+    finally:
+        receiver.close()
+        producer.close()
+    assert all(agent() is None for agent in agents)
+    assert producer._closed and receiver._closed
+    producer.close()
+    receiver.close()
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@pytest.mark.skipif(not _native_nixl_available(1), reason="requires NIXL and CUDA")
 def test_native_close_keeps_inflight_get_completion_ack(monkeypatch):
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
 
@@ -461,6 +486,7 @@ def test_native_close_keeps_inflight_get_completion_ack(monkeypatch):
     reader_config = {"role": "receiver", "receive_device": "cuda:0", "metadata_query_timeout_ms": 5000}
     with closing(NixlConnector({"role": "sender", "host": "127.0.0.1"})) as producer:
         with closing(NixlConnector(reader_config)) as receiver:
+            agent = weakref.ref(receiver._agent)
             wait = receiver._wait_for_transfer
 
             def observe(handle, key):
@@ -479,6 +505,7 @@ def test_native_close_keeps_inflight_get_completion_ack(monkeypatch):
                 assert entered.wait(30)
                 assert producer._pending["close-live_0_0"].claims
                 receiver.close()
+                assert agent() is receiver._agent and agent() is not None
                 assert receiver._close_thread is not None
                 resume.set()
                 worker.join(10)
@@ -488,6 +515,7 @@ def test_native_close_keeps_inflight_get_completion_ack(monkeypatch):
                 receiver._close_thread.join(10)
                 assert not receiver._close_thread.is_alive()
                 assert receiver._closed and receiver._zmq_ctx is None
+                assert agent() is None
                 assert not receiver._active_gets and not receiver._deferred_transfers
                 assert not producer._pending and not producer._registered_descs
             finally:

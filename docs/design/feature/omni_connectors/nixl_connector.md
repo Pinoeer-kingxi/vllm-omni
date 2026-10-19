@@ -210,7 +210,9 @@ lease; only the final owner disconnects it, including when a READ is deferred.
 A consumer with unfinished local transfers retains a strong
 reference to its connector and resources after `close()` returns. Permanently
 stuck local transfers can retain resources until process exit. Closing connectors
-reject new work and report unhealthy. Only trusted
+reject new work and report unhealthy. Once control threads and local READ ownership
+are drained, `close()` releases its main native agent even if the connector object
+remains referenced. Deferred close retains that agent until cleanup completes. Only trusted
 peers may access this unauthenticated control plane. Both endpoints must use the
 claim-aware protocol; rolling compatibility with older GET_META clients is not
 provided. Legacy externally-owned metadata without a generation is accepted only

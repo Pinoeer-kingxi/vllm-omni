@@ -1647,6 +1647,16 @@ def test_close_stops_lease_reaper(nixl_connector_cls):
     assert connector._lease_thread is None
 
 
+@pytest.mark.parametrize("role", ["sender", "receiver"])
+def test_close_releases_native_agent_while_connector_remains_alive(nixl_connector_cls, role):
+    connector = nixl_connector_cls({"role": role, "host": "127.0.0.1"})
+    agent = weakref.ref(connector._agent)
+    connector.close()
+    assert agent() is None
+    assert connector._closed and connector._agent is None
+    connector.close()
+
+
 def test_failed_listener_initialization_can_release_partial_resources(producer, nixl_connector_cls):
     connector = nixl_connector_cls.__new__(nixl_connector_cls)
     with pytest.raises(RuntimeError, match="failed to bind handshake socket"):
@@ -1667,6 +1677,7 @@ def test_close_keeps_active_get_completion_and_cleanup_alive(
     resume = threading.Event()
     state = ["PROC"]
     received = []
+    agent = consumer._agent
 
     def wait(handle, key):
         entered.set()
@@ -1707,6 +1718,7 @@ def test_close_keeps_active_get_completion_and_cleanup_alive(
         assert entered.wait(5)
         context = consumer._zmq_ctx
         consumer.close()
+        assert consumer._agent is agent
         assert consumer._close_thread is not None
         assert consumer._zmq_ctx is context and not context.closed
         assert consumer in _RETAINED_PRODUCERS
@@ -1730,7 +1742,8 @@ def test_close_keeps_active_get_completion_and_cleanup_alive(
         assert not consumer._close_thread.is_alive()
         assert consumer._closed and consumer._zmq_ctx is None
         assert not consumer._active_gets and not consumer._deferred_transfers
-        assert not consumer._agent.registered
+        assert not agent.registered
+        assert consumer._agent is None
         assert consumer not in _RETAINED_PRODUCERS
         assert not producer._pending and not producer._registered_descs
     finally:
@@ -1972,6 +1985,8 @@ def test_close_returns_without_releasing_active_dma(nixl_connector_cls, poll_rai
     connector = nixl_connector_cls({"role": "receiver"})
     released = []
 
+    agent = connector._agent
+
     def check_state(handle):
         if poll_raises:
             raise RuntimeError("device unavailable")
@@ -2012,8 +2027,8 @@ def test_close_returns_without_releasing_active_dma(nixl_connector_cls, poll_rai
         assert cleanup_thread is not None
         connector.close()
         assert connector._close_thread is cleanup_thread
-        connector._agent.check_xfer_state = lambda handle: "DONE"
-        connector._agent.release_xfer_handle = lambda handle: released.append(("handle", handle))
+        agent.check_xfer_state = lambda handle: "DONE"
+        agent.release_xfer_handle = lambda handle: released.append(("handle", handle))
         cleanup_thread.join(timeout=2.0)
         assert not cleanup_thread.is_alive()
         assert connector._closed
@@ -2021,8 +2036,8 @@ def test_close_returns_without_releasing_active_dma(nixl_connector_cls, poll_rai
         assert not transfer.tensors
         assert connector not in _RETAINED_PRODUCERS
     finally:
-        connector._agent.check_xfer_state = lambda handle: "DONE"
-        connector._agent.release_xfer_handle = lambda handle: released.append(("handle", handle))
+        agent.check_xfer_state = lambda handle: "DONE"
+        agent.release_xfer_handle = lambda handle: released.append(("handle", handle))
         closing.join(timeout=2.0)
         connector.close()
 
