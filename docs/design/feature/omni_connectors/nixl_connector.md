@@ -199,6 +199,14 @@ request's unconsumed prefixes outside that lock. Late output batches cannot
 publish after request state is removed. The release is also enabled for native
 full-payload stages; the V1 release path is unchanged.
 
+Stage admission rejects reuse of a stage request ID while its previous release
+is queued, in flight or unconfirmed on any replica. A successful release permits
+reuse. RPC failures and timeouts leave that ID fenced until the stage pool is
+restarted: their outcome is unknown, so they are not automatically retried against
+a potentially newer admission. Other request IDs can still enter and be released.
+This applies to direct engine admissions; `AsyncOmni.generate()` already assigns
+a unique stage request ID to each call, even when the user's ID is reused.
+
 The lease reaper owns expiry cleanup. A failed expired release retains its source
 ownership, keeps metadata unpublished and retries after a 100 ms backoff. Failure
 of one payload does not stop the reaper or reject another request's publication.
@@ -343,8 +351,10 @@ and UCX logs showing the selected RMA lane; configured environment variables
 alone do not establish the transport or GPUDirect support. A zero process exit
 and empty connector records do not override UCX request-pool warnings.
 
-These are connector fixtures, not full-model serving qualification. The revised
-source still needs full-model cancellation integration, native UCX cleanup and
-real cross-node RDMA cancellation checks before those gaps can be closed.
+These connector fixtures do not replace full-model serving qualification. Local
+model checks cover normal completion, public cancellation after audio output,
+sequential ID reuse and shutdown. Native error-cancel cleanup and real cross-node
+RDMA cancellation still require separate validation; draining a READ is not proof
+of error-cancel cleanup.
 
 For more details, refer to the [NIXL repository](https://github.com/ai-dynamo/nixl).
