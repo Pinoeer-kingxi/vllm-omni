@@ -655,6 +655,9 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
     args = parser.parse_args(["serve", server_case.served_model, "--omni", "--port", str(port)])
 
     def run_server():
+        # libgomp is not fork-safe: once the parent has used OpenMP, a parallel
+        # op in this forked child segfaults. Keep the child's torch ops inline.
+        torch.set_num_threads(1)
         try:
             cmd.cmd(args)
         except Exception:
